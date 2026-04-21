@@ -40,7 +40,7 @@
 #define WIFI_SSID             "wifi"
 #define WIFI_PASS             "password"
 #define WIFI_RETRY_ATTEMPTS   5
-#define WIFI_RECONNECT_MS     30000
+#define WIFI_RECONNECT_MS     30000 
 
 
 /* ============================================================
