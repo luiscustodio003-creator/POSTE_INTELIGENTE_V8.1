@@ -6,37 +6,7 @@
    AUTORES    : Luis Custódio | Tiago Moreno
    PLATAFORMA : ESP32 (ESP-IDF v5.x)
 
-   MUDANÇA ARQUITECTURAL v3.1 → v4.0:
-   ─────────────────────────────────────
-   A FSM deixa de ler o radar directamente.
-   Passa a ser puramente event-driven: consome system_event_t
-   da queue do event_manager.
-
-   ANTES (v3.x):
-     state_machine_update() → radar_read_data_cached() → decide
-     sm_on_radar_detect()   → chamada directa de radar_manager
-
-   DEPOIS (v4.0):
-     sm_process_event(VEHICLE_DETECTED, vel, id, eta)  → reage
-     sm_process_event(VEHICLE_APPROACHING, vel, id, eta) → reage
-     sm_process_event(VEHICLE_PASSED, vel, id)         → reage
-
-   COMPATIBILIDADE:
-   ─────────────────
-   - sm_on_radar_detect() mantém-se como shim de compatibilidade
-     durante a migração, chamando sm_process_event() internamente.
-   - on_tc_inc_received(), on_prev_passed_received(), on_spd_received()
-     mantêm-se como callbacks UDP (não mudam nesta fase).
-   - A leitura de radar, filtros de distância/velocidade e detecção
-     de obstáculo foram REMOVIDOS deste ficheiro — passam a ser
-     responsabilidade de tracking_manager e event_manager.
-
-   PIPELINE NOVO:
-   ──────────────
-     radar_manager → tracking_manager → event_manager → [queue]
-                                                            │
-                                          state_machine ←──┘
-                                          (sm_process_event)
+  
 ============================================================ */
 
 #include "state_machine.h"
@@ -375,7 +345,7 @@ void sm_process_event(sm_event_type_t type,
                     s_state == STATE_MASTER ||
                     s_state == STATE_AUTONOMO) {
                     s_state = STATE_LIGHT_ON;
-                    dali_fade_up(vel);
+                    //dali_fade_up(vel);
                 }
                 s_acender_em_ms = 0;
             } else {
@@ -568,7 +538,10 @@ void state_machine_init(void)
 ============================================================ */
 
 void state_machine_update(bool comm_ok, bool is_master,bool radar_teve_frame)
+
 {
+    ESP_LOGI(TAG, "UPDATE inicio");
+    
     uint64_t agora = _agora_ms();
 
     /* ── PASSO 1: Simulador (modo sem radar físico) ───────── */

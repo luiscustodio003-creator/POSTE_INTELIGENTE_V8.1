@@ -322,13 +322,16 @@ void tracking_manager_update(const radar_data_t *data)
                 break;
 
             case TRK_STATE_EXITED:
-                    ESP_LOGI(TAG, "[ID %u] EXITED — event_passed=%d",
-                            sl->pub.id, sl->pub.event_passed_pending);
-                    if (!sl->pub.event_passed_pending) {
-                        ESP_LOGD(TAG, "[ID %u] Slot libertado", sl->pub.id);
-                        _limpar_slot(sl);
-                    }
-                    break;
+                ESP_LOGI(TAG, "[ID %u] EXITED check — event_passed=%d occupied=%d agora=%llu last=%llu",
+                         sl->pub.id, sl->pub.event_passed_pending,
+                         sl->occupied, agora, sl->last_seen_ms);
+                if (!sl->pub.event_passed_pending ||
+                    (agora - sl->last_seen_ms) > 5000ULL) {
+                    if (sl->pub.event_passed_pending)
+                        ESP_LOGW(TAG, "[ID %u] Slot libertado por timeout", sl->pub.id);
+                    _limpar_slot(sl);
+                }
+                break;
         }
     }
 
@@ -390,7 +393,7 @@ void tracking_manager_clear_events(uint16_t vehicle_id)
     xSemaphoreGive(s_mutex);
 
     for (int s = 0; s < TRK_MAX_VEHICLES; s++) {
-        if (s_slots[s].pub.id == vehicle_id) {
+        if (s_slots[s].occupied && s_slots[s].pub.id == vehicle_id) {
             s_slots[s].pub.event_detected_pending  = false;
             s_slots[s].pub.event_approach_pending  = false;
             s_slots[s].pub.event_passed_pending    = false;

@@ -152,6 +152,16 @@ void dali_safe_mode(void) { dali_set_brightness(LIGHT_SAFE_MODE); }
 ============================================================ */
 void dali_fade_up(float vel_kmh)
 {
+    /* Se já está no máximo não faz nada — evita chamadas redundantes ao LEDC */
+    portENTER_CRITICAL(&s_mux);
+    uint8_t brilho_actual = s_brightness;
+    portEXIT_CRITICAL(&s_mux);
+
+    if (brilho_actual >= LIGHT_MAX) {
+        ESP_LOGD(TAG, "Fade UP ignorado — já em %d%%", LIGHT_MAX);
+        return;
+    }
+
     uint32_t t_ms;
     if      (vel_kmh >= 80.0f) t_ms = 300;
     else if (vel_kmh >= 50.0f) t_ms = 500;
