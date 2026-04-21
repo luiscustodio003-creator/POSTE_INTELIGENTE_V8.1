@@ -6,18 +6,7 @@
    AUTORES    : Luis Custódio | Tiago Moreno
    PLATAFORMA : ESP32 (ESP-IDF v5.x)
 
-   ALTERAÇÕES v1.0 → v1.1:
-   ─────────────────────────
-   - Adicionada detecção de obstáculo estático no PASSO 3:
-       speed_kmh_max  — actualizado a cada frame associado
-       obstaculo_frames — incrementado quando parado na zona
-       event_obstaculo_pending — disparado após OBSTACULO_MIN_FRAMES
-     Condição anti-falso-positivo: só dispara se o objecto
-     teve velocidade > MIN_DETECT_KMH antes de parar
-     (exclui sinais, postes e outros objectos fixos).
-   - tracking_manager_clear_events() actualizado para limpar
-     event_obstaculo_pending.
-   - Versão do log actualizada para v1.1.
+   
 ============================================================ */
 
 #include "tracking_manager.h"
@@ -333,11 +322,13 @@ void tracking_manager_update(const radar_data_t *data)
                 break;
 
             case TRK_STATE_EXITED:
-                if (!sl->pub.event_passed_pending) {
-                    ESP_LOGD(TAG, "[ID %u] Slot libertado", sl->pub.id);
-                    _limpar_slot(sl);
-                }
-                break;
+                    ESP_LOGI(TAG, "[ID %u] EXITED — event_passed=%d",
+                            sl->pub.id, sl->pub.event_passed_pending);
+                    if (!sl->pub.event_passed_pending) {
+                        ESP_LOGD(TAG, "[ID %u] Slot libertado", sl->pub.id);
+                        _limpar_slot(sl);
+                    }
+                    break;
         }
     }
 
