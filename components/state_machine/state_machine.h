@@ -47,7 +47,8 @@ typedef enum {
 typedef enum {
     SM_EVT_VEHICLE_DETECTED = 0,
     SM_EVT_VEHICLE_APPROACHING,
-    SM_EVT_VEHICLE_PASSED,
+    SM_EVT_VEHICLE_PASSED,       /* saiu pela frente → aguarda B */
+    SM_EVT_VEHICLE_RECUOU,       /* saiu por trás → T=0 imediato */
     SM_EVT_VEHICLE_LOCAL,
     SM_EVT_VEHICLE_OBSTACULO,   /* Objecto parado na zona — activar STATE_OBSTACULO */
 } sm_event_type_t;

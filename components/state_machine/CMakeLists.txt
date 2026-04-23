@@ -9,6 +9,7 @@ idf_component_register(
         radar_manager
         display_manager
         system_monitor
+        udp_manager
         config
         freertos
         esp_timer

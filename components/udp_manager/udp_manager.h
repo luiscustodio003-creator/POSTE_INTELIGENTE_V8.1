@@ -7,28 +7,7 @@
    Estudantes: Luis Custodio | Tiago Moreno
    Plataforma: ESP32 (ESP-IDF v5.x)
 
-   Alterações v3.4 → v4.0:
-   ─────────────────────────
-   1. TC_INC e SPD incluem x_mm (posição lateral do alvo em mm).
-      Garante continuidade visual do ponto no canvas entre postes.
-      Retro-compatível: se campo ausente no pacote, usa 0 (centro).
-
-   2. Assinaturas dos callbacks actualizadas:
-      on_tc_inc_received(speed, x_mm)
-      on_spd_received(speed, eta_ms, x_mm)
-
-   3. udp_task_run() exposta como símbolo público para
-      xTaskCreatePinnedToCore() em udp_manager_task_start().
-
-   4. udp_manager_task_start() — cria task no Core 0.
-
-   Protocolo v4.0 (texto simples, separado por ':'):
-   ───────────────────────────────────────────────────
-   DISCOVER:<id>:<pos>
-   STATUS:<id>:<estado>
-   TC_INC:<id>:<vel>:<x_mm>
-   SPD:<id>:<vel>:<eta_ms>:<dist_m>:<x_mm>
-   MASTER_CLAIM:<id>
+   
 ============================================================ */
 #ifndef UDP_MANAGER_H
 #define UDP_MANAGER_H
@@ -85,6 +64,9 @@ void on_master_claim_received(int from_id);
 void udp_task_run(void *arg);
 
 int udp_manager_get_socket(void);
+
+bool udp_manager_send_discover_ack(const char *ip);
+void udp_manager_send_ping(const char *ip);
 
 #endif /* UDP_MANAGER_H */
 

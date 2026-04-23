@@ -1,12 +1,22 @@
 /* ============================================================
    MÓDULO     : tracking_manager
    FICHEIRO   : tracking_manager.c — Implementação
-   VERSÃO     : 1.1  |  2026-04-20
+   VERSÃO     : 1.3  |  2026-04-23
    PROJECTO   : Poste Inteligente v8
    AUTORES    : Luis Custódio | Tiago Moreno
    PLATAFORMA : ESP32 (ESP-IDF v5.x)
 
-   
+   ALTERAÇÕES v1.2 → v1.3:
+   ─────────────────────────
+   - event_recuou_pending adicionado — quando objecto recua e sai
+     do radar, T decrementa imediatamente sem aguardar poste B.
+   - TRK_STATE_COASTING: distingue saída pela frente (PASSED)
+     de saída por trás (RECUOU) com base em speed_signed.
+   - tracking_manager_clear_events(): limpa event_recuou_pending
+     nos dois loops (buffer público e slot interno).
+   - TRK_STATE_EXITED: timeout de segurança verifica ambos
+     event_passed_pending e event_recuou_pending.
+   - Corrigido: chaveta de fecho em falta no TRK_STATE_COASTING.
 ============================================================ */
 
 #include "tracking_manager.h"
@@ -30,13 +40,13 @@ typedef struct {
     uint64_t last_seen_ms;
 } trk_slot_t;
 
-/* ── Estado interno do módulo ─────────────────────────────── */
 static trk_slot_t        s_slots[TRK_MAX_VEHICLES];
 static tracked_vehicle_t s_pub[TRK_MAX_VEHICLES];
 static uint8_t           s_pub_count = 0;
 static SemaphoreHandle_t s_mutex     = NULL;
 static uint16_t          s_next_id   = 1;
 static trk_stats_t       s_stats     = {0};
+
 
 /* ── Utilitários privados ─────────────────────────────────── */
 
@@ -45,7 +55,8 @@ static uint64_t _agora_ms(void)
     return (uint64_t)(esp_timer_get_time() / 1000ULL);
 }
 
-static float _distancia_alvos(const trk_slot_t *slot,const radar_vehicle_t *target)
+static float _distancia_alvos(const trk_slot_t *slot,
+                               const radar_vehicle_t *target)
 {
     float dx = slot->pub.x_mm - (float)target->x_mm;
     float dy = slot->pub.y_mm - (float)target->y_mm;
@@ -58,11 +69,8 @@ static float _calcular_velocidade_suavizada(trk_slot_t *slot, float vel_raw)
     slot->speed_win_idx = (slot->speed_win_idx + 1) % TRK_SPEED_WINDOW;
     if (slot->speed_win_filled < TRK_SPEED_WINDOW)
         slot->speed_win_filled++;
-
-    /* Guarda contra divisão por zero — não deve acontecer mas protege */
     if (slot->speed_win_filled == 0)
         return vel_raw;
-
     float soma = 0.0f;
     for (uint8_t i = 0; i < slot->speed_win_filled; i++)
         soma += slot->speed_window[i];
@@ -114,7 +122,8 @@ void tracking_manager_init(void)
     memset(&s_stats, 0, sizeof(s_stats));
     s_next_id = 1;
 
-    ESP_LOGI(TAG, "tracking_manager v1.1 inicializado");
+    ESP_LOGI(TAG, "tracking_manager v1.3 inicializado | slots=%d",
+             TRK_MAX_VEHICLES);
 }
 
 
@@ -132,7 +141,6 @@ void tracking_manager_update(const radar_data_t *data)
 
 
     /* ── PASSO 1: Associação nearest-neighbour ────────────── */
-
     for (int t = 0; t < data->count; t++) {
         const radar_vehicle_t *alvo = &data->targets[t];
 
@@ -143,9 +151,9 @@ void tracking_manager_update(const radar_data_t *data)
         int   melhor_slot = -1;
 
         for (int s = 0; s < TRK_MAX_VEHICLES; s++) {
-            if (!s_slots[s].occupied)                          continue;
-            if (slot_associado[s])                             continue;
-            if (s_slots[s].pub.state == TRK_STATE_EXITED)     continue;
+            if (!s_slots[s].occupied)                     continue;
+            if (slot_associado[s])                        continue;
+            if (s_slots[s].pub.state == TRK_STATE_EXITED) continue;
 
             float d = _distancia_alvos(&s_slots[s], alvo);
             if (d < melhor_dist) {
@@ -155,19 +163,19 @@ void tracking_manager_update(const radar_data_t *data)
         }
 
         if (melhor_slot >= 0) {
-            slot_associado[melhor_slot]                  = true;
-            s_slots[melhor_slot].last_seen_ms            = agora;
-            s_slots[melhor_slot].pub.x_mm                = (float)alvo->x_mm;
-            s_slots[melhor_slot].pub.y_mm                = (float)alvo->y_mm;
-            s_slots[melhor_slot].pub.distance_m          = alvo->distance;
-            s_slots[melhor_slot].pub.speed_signed        = alvo->speed_signed;
-            s_slots[melhor_slot].pub.speed_kmh           =
-                _calcular_velocidade_suavizada(&s_slots[melhor_slot], alvo->speed);
-            s_slots[melhor_slot].pub.lost_frames         = 0;
+            slot_associado[melhor_slot]           = true;
+            s_slots[melhor_slot].last_seen_ms     = agora;
+            s_slots[melhor_slot].pub.x_mm         = (float)alvo->x_mm;
+            s_slots[melhor_slot].pub.y_mm         = (float)alvo->y_mm;
+            s_slots[melhor_slot].pub.distance_m   = alvo->distance;
+            s_slots[melhor_slot].pub.speed_signed = alvo->speed_signed;
+            s_slots[melhor_slot].pub.speed_kmh    =
+                _calcular_velocidade_suavizada(&s_slots[melhor_slot],
+                                              alvo->speed);
+            s_slots[melhor_slot].pub.lost_frames  = 0;
             s_slots[melhor_slot].pub.total_frames++;
-            s_slots[melhor_slot].pub.active              = true;
+            s_slots[melhor_slot].pub.active       = true;
 
-            /* Actualiza velocidade máxima registada */
             if (s_slots[melhor_slot].pub.speed_kmh >
                 s_slots[melhor_slot].pub.speed_kmh_max)
                 s_slots[melhor_slot].pub.speed_kmh_max =
@@ -180,7 +188,6 @@ void tracking_manager_update(const radar_data_t *data)
             for (int s = 0; s < TRK_MAX_VEHICLES; s++) {
                 if (!s_slots[s].occupied) {
                     _limpar_slot(&s_slots[s]);
-
                     s_slots[s].occupied           = true;
                     s_slots[s].last_seen_ms       = agora;
                     s_slots[s].pub.state          = TRK_STATE_TENTATIVE;
@@ -196,11 +203,9 @@ void tracking_manager_update(const radar_data_t *data)
                     s_slots[s].speed_window[0]    = alvo->speed;
                     s_slots[s].speed_win_filled   = 1;
                     s_slots[s].speed_win_idx      = 1;
-
-                    slot_associado[s] = true;
-                    slot_criado       = true;
-
-                    ESP_LOGD(TAG, "[NOVO] Tentativo @ (%.0f,%.0f) %.1f km/h",
+                    slot_associado[s]             = true;
+                    slot_criado                   = true;
+                    ESP_LOGD(TAG, "[NOVO] Tentativo (%.0f,%.0f) %.1f km/h",
                              s_slots[s].pub.x_mm, s_slots[s].pub.y_mm,
                              s_slots[s].pub.speed_kmh);
                     break;
@@ -214,17 +219,16 @@ void tracking_manager_update(const radar_data_t *data)
 
 
     /* ── PASSO 2: Slots não associados → COASTING ─────────── */
-
     for (int s = 0; s < TRK_MAX_VEHICLES; s++) {
-        if (!s_slots[s].occupied)                         continue;
-        if (slot_associado[s])                            continue;
-        if (s_slots[s].pub.state == TRK_STATE_EXITED)    continue;
+        if (!s_slots[s].occupied)                      continue;
+        if (slot_associado[s])                         continue;
+        if (s_slots[s].pub.state == TRK_STATE_EXITED)  continue;
 
         s_slots[s].pub.active = false;
         s_slots[s].pub.lost_frames++;
 
         if (s_slots[s].pub.state != TRK_STATE_COASTING)
-            ESP_LOGD(TAG, "[ID %u] → COASTING (lost=%u)",
+            ESP_LOGD(TAG, "[ID %u] → COASTING lost=%u",
                      s_slots[s].pub.id, s_slots[s].pub.lost_frames);
 
         s_slots[s].pub.state = TRK_STATE_COASTING;
@@ -232,7 +236,6 @@ void tracking_manager_update(const radar_data_t *data)
 
 
     /* ── PASSO 3: Progressão de estados e eventos ─────────── */
-
     for (int s = 0; s < TRK_MAX_VEHICLES; s++) {
         if (!s_slots[s].occupied) continue;
 
@@ -242,63 +245,62 @@ void tracking_manager_update(const radar_data_t *data)
 
             case TRK_STATE_TENTATIVE:
                 if (slot_associado[s]) sl->pub.confirm_frames++;
-
                 if (sl->pub.confirm_frames >= TRK_CONFIRM_FRAMES) {
                     sl->pub.id    = s_next_id++;
                     sl->pub.state = TRK_STATE_CONFIRMED;
                     sl->pub.event_detected_pending = true;
                     s_stats.total_vehicles_tracked++;
-
-                    ESP_LOGI(TAG, "[ID %u] CONFIRMED @ (%.0f,%.0f) %.1f km/h dist=%.1fm",
+                    ESP_LOGI(TAG,
+                             "[ID %u] CONFIRMED (%.0f,%.0f) %.1f km/h dist=%.1fm",
                              sl->pub.id, sl->pub.x_mm, sl->pub.y_mm,
                              sl->pub.speed_kmh, sl->pub.distance_m);
                 }
                 break;
 
             case TRK_STATE_CONFIRMED:
-                /* Detecção de obstáculo: parado na zona após ter tido movimento */
-                if (sl->pub.speed_kmh <= OBSTACULO_SPEED_MAX_KMH &&
-                    sl->pub.distance_m <= (float)RADAR_DETECT_M  &&
+                /* Detecção de obstáculo — parado na zona após ter tido movimento */
+                if (sl->pub.speed_kmh  <= OBSTACULO_SPEED_MAX_KMH &&
+                    sl->pub.distance_m <= (float)RADAR_DETECT_M   &&
                     sl->pub.speed_kmh_max > MIN_DETECT_KMH) {
                     sl->pub.obstaculo_frames++;
                     if (sl->pub.obstaculo_frames >= OBSTACULO_MIN_FRAMES &&
                         !sl->pub.event_obstaculo_pending) {
                         sl->pub.event_obstaculo_pending = true;
-                        ESP_LOGW(TAG, "[ID %u] OBSTACULO — parado %u frames na zona",
+                        ESP_LOGW(TAG, "[ID %u] OBSTACULO — parado %u frames",
                                  sl->pub.id, sl->pub.obstaculo_frames);
                     }
                 } else {
                     sl->pub.obstaculo_frames = 0;
                 }
-
-                /* Transita para APPROACHING se a aproximar-se */
+                /* Transita para APPROACHING se se aproxima */
                 if (sl->pub.speed_signed <= AFASTAR_THRESHOLD_KMH) {
-                    sl->pub.state = TRK_STATE_APPROACHING;
+                    sl->pub.state              = TRK_STATE_APPROACHING;
                     sl->pub.event_approach_pending = true;
                     sl->pub.eta_ms = _calcular_eta(sl->pub.distance_m,
                                                    sl->pub.speed_kmh);
-                    ESP_LOGI(TAG, "[ID %u] APPROACHING vel=%.1f km/h dist=%.1fm ETA=%lums",
+                    ESP_LOGI(TAG,
+                             "[ID %u] APPROACHING %.1f km/h dist=%.1fm ETA=%lums",
                              sl->pub.id, sl->pub.speed_kmh,
-                             sl->pub.distance_m, (unsigned long)sl->pub.eta_ms);
+                             sl->pub.distance_m,
+                             (unsigned long)sl->pub.eta_ms);
                 }
                 break;
 
             case TRK_STATE_APPROACHING:
-                /* Detecção de obstáculo: parou a aproximar-se mas ficou na zona */
-                if (sl->pub.speed_kmh <= OBSTACULO_SPEED_MAX_KMH &&
-                    sl->pub.distance_m <= (float)RADAR_DETECT_M  &&
+                /* Detecção de obstáculo em aproximação */
+                if (sl->pub.speed_kmh  <= OBSTACULO_SPEED_MAX_KMH &&
+                    sl->pub.distance_m <= (float)RADAR_DETECT_M   &&
                     sl->pub.speed_kmh_max > MIN_DETECT_KMH) {
                     sl->pub.obstaculo_frames++;
                     if (sl->pub.obstaculo_frames >= OBSTACULO_MIN_FRAMES &&
                         !sl->pub.event_obstaculo_pending) {
                         sl->pub.event_obstaculo_pending = true;
-                        ESP_LOGW(TAG, "[ID %u] OBSTACULO — parado %u frames na zona",
+                        ESP_LOGW(TAG, "[ID %u] OBSTACULO — parado %u frames",
                                  sl->pub.id, sl->pub.obstaculo_frames);
                     }
                 } else {
                     sl->pub.obstaculo_frames = 0;
                 }
-
                 /* Actualiza ETA ou volta a CONFIRMED se inverteu */
                 if (sl->pub.speed_signed <= AFASTAR_THRESHOLD_KMH) {
                     sl->pub.eta_ms = _calcular_eta(sl->pub.distance_m,
@@ -314,21 +316,38 @@ void tracking_manager_update(const radar_data_t *data)
                 if (sl->pub.lost_frames >= TRK_LOST_FRAMES) {
                     sl->pub.state  = TRK_STATE_EXITED;
                     sl->pub.eta_ms = 0;
-                    if (sl->pub.id > 0)
-                        sl->pub.event_passed_pending = true;
-                    ESP_LOGI(TAG, "[ID %u] EXITED após %u frames perdidos",
-                             sl->pub.id, sl->pub.lost_frames);
+                    if (sl->pub.id > 0) {
+                        /* Distingue saída pela frente de saída por trás.
+                           speed_signed <= AFASTAR_THRESHOLD → aproximava-se
+                             → PASSED: aguarda confirmação do poste B.
+                           speed_signed > AFASTAR_THRESHOLD → afastava-se
+                             → RECUOU: T decrementa imediatamente. */
+                        if (sl->pub.speed_signed <= AFASTAR_THRESHOLD_KMH) {
+                            sl->pub.event_passed_pending = true;
+                            ESP_LOGI(TAG,
+                                     "[ID %u] EXITED pela frente — aguarda B",
+                                     sl->pub.id);
+                        } else {
+                            sl->pub.event_recuou_pending = true;
+                            ESP_LOGI(TAG,
+                                     "[ID %u] EXITED por trás — T=0 imediato",
+                                     sl->pub.id);
+                        }
+                    }
                 }
                 break;
 
             case TRK_STATE_EXITED:
-                ESP_LOGI(TAG, "[ID %u] EXITED check — event_passed=%d occupied=%d agora=%llu last=%llu",
-                         sl->pub.id, sl->pub.event_passed_pending,
-                         sl->occupied, agora, sl->last_seen_ms);
-                if (!sl->pub.event_passed_pending ||
+                /* Liberta slot se ambos os eventos foram consumidos
+                   OU após 5s de timeout de segurança. */
+                if ((!sl->pub.event_passed_pending &&
+                     !sl->pub.event_recuou_pending) ||
                     (agora - sl->last_seen_ms) > 5000ULL) {
-                    if (sl->pub.event_passed_pending)
-                        ESP_LOGW(TAG, "[ID %u] Slot libertado por timeout", sl->pub.id);
+                    if (sl->pub.event_passed_pending ||
+                        sl->pub.event_recuou_pending)
+                        ESP_LOGW(TAG,
+                                 "[ID %u] Slot libertado por timeout",
+                                 sl->pub.id);
                     _limpar_slot(sl);
                 }
                 break;
@@ -337,7 +356,6 @@ void tracking_manager_update(const radar_data_t *data)
 
 
     /* ── PASSO 4: Estatísticas ────────────────────────────── */
-
     uint8_t activos = 0;
     for (int s = 0; s < TRK_MAX_VEHICLES; s++) {
         if (s_slots[s].occupied &&
@@ -348,7 +366,6 @@ void tracking_manager_update(const radar_data_t *data)
 
 
     /* ── PASSO 5: Cópia thread-safe para buffer público ───── */
-
     _copiar_para_publico();
 }
 
@@ -363,12 +380,10 @@ bool tracking_manager_get_vehicles(tracked_vehicle_t *out,
         if (out_count) *out_count = 0;
         return false;
     }
-
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     memcpy(out, s_pub, s_pub_count * sizeof(tracked_vehicle_t));
     *out_count = s_pub_count;
     xSemaphoreGive(s_mutex);
-
     return (*out_count > 0);
 }
 
@@ -380,6 +395,7 @@ void tracking_manager_clear_events(uint16_t vehicle_id)
 {
     if (!s_mutex) return;
 
+    /* Limpa buffer público */
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     for (int i = 0; i < s_pub_count; i++) {
         if (s_pub[i].id == vehicle_id) {
@@ -387,17 +403,20 @@ void tracking_manager_clear_events(uint16_t vehicle_id)
             s_pub[i].event_approach_pending  = false;
             s_pub[i].event_passed_pending    = false;
             s_pub[i].event_obstaculo_pending = false;
+            s_pub[i].event_recuou_pending    = false;
             break;
         }
     }
     xSemaphoreGive(s_mutex);
 
+    /* Limpa slot interno — guarda occupied para não limpar slot errado */
     for (int s = 0; s < TRK_MAX_VEHICLES; s++) {
         if (s_slots[s].occupied && s_slots[s].pub.id == vehicle_id) {
             s_slots[s].pub.event_detected_pending  = false;
             s_slots[s].pub.event_approach_pending  = false;
             s_slots[s].pub.event_passed_pending    = false;
             s_slots[s].pub.event_obstaculo_pending = false;
+            s_slots[s].pub.event_recuou_pending    = false;
             break;
         }
     }
@@ -420,14 +439,12 @@ void tracking_manager_get_stats(trk_stats_t *out)
 void tracking_manager_reset(void)
 {
     memset(s_slots, 0, sizeof(s_slots));
-
     if (s_mutex) {
         xSemaphoreTake(s_mutex, portMAX_DELAY);
         memset(s_pub, 0, sizeof(s_pub));
         s_pub_count = 0;
         xSemaphoreGive(s_mutex);
     }
-
     s_stats.current_active = 0;
     ESP_LOGW(TAG, "Tracking resetado — todos os slots limpos");
 }

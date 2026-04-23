@@ -46,34 +46,22 @@ bool comm_init(void)
 
 /* ============================================================
    comm_status_ok — true se socket UDP válido e operacional
+
+   BUG 5 FIX: Removida a lógica "sem vizinhos → retorna false".
+   Essa lógica forçava STATE_AUTONOMO nos primeiros segundos do
+   arranque, antes do DISCOVER completar, interferindo com os logs
+   e o estado inicial em bancada.
+   A gestão do período sem vizinhos é feita pela FSM através de
+   AUTONOMO_DELAY_MS (10s), que já dá tempo suficiente ao DISCOVER.
 ============================================================ */
 bool comm_status_ok(void)
 {
-    /* Socket inválido — comm offline */
     if (s_iniciado) {
         if (udp_manager_get_socket() < 0) {
             s_iniciado = false;
             ESP_LOGW(TAG, "Socket UDP inválido — comm offline");
         }
     }
-
-    /* Sem vizinhos conhecidos após inicialização — comm degradado.
-     * Força AUTONOMO na FSM até descobrir pelo menos um vizinho. */
-    if (s_iniciado) {
-        neighbor_t *viz_esq = udp_manager_get_neighbor_by_pos(POST_POSITION - 1);
-        neighbor_t *viz_dir = udp_manager_get_neighbor_by_pos(POST_POSITION + 1);
-
-        bool tem_vizinho = (viz_esq && viz_esq->active &&
-                            viz_esq->status != NEIGHBOR_OFFLINE) ||
-                           (viz_dir && viz_dir->active &&
-                            viz_dir->status != NEIGHBOR_OFFLINE);
-
-        if (!tem_vizinho) {
-            /* Sem vizinhos — comporta-se como offline para a FSM */
-            return false;
-        }
-    }
-
     return s_iniciado;
 }
 
@@ -143,15 +131,25 @@ static const char *_ip_vizinho_esquerdo(void)
 
 /* ============================================================
    _calcular_eta_ms
-   ETA = distância restante / velocidade
-   Distância restante = POSTE_DIST_M - RADAR_DETECT_M (metros)
-   Exemplo: 50m postes, 7m detecção, 50 km/h
-     ETA = (50-7) / (50/3.6) * 1000 = 43 / 13.89 * 1000 ≈ 3096ms
+   ETA = distância ao PRÓXIMO poste / velocidade
+
+   BUG 4 FIX: Distinguir dois contextos de cálculo:
+   - Detecção local (radar confirma veículo a RADAR_DETECT_M):
+       dist = POSTE_DIST_M - RADAR_DETECT_M  (distância restante ao próximo)
+   - Propagação em cadeia (veículo ainda não chegou a este poste):
+       dist = POSTE_DIST_M  (distância completa ao próximo poste)
+
+   Usar sempre POSTE_DIST_M aqui — comm_send_spd é chamado tanto
+   em detecção local (SM_EVT_VEHICLE_LOCAL, onde o veículo já está
+   a RADAR_DETECT_M) como em propagação. A distinção é feita pelo
+   tracking_manager que calcula ETA real com a distância medida.
+   O ETA enviado via SPD usa a distância inter-poste completa como
+   estimativa conservadora (chega antes ou no tempo certo).
 ============================================================ */
 static uint32_t _calcular_eta_ms(float speed_kmh)
 {
     if (speed_kmh < 1.0f) speed_kmh = 1.0f;  /* Evita divisão por zero */
-    float dist_m   = (float)(POSTE_DIST_M - RADAR_DETECT_M);
+    float dist_m   = (float)POSTE_DIST_M;     /* distância completa ao próximo poste */
     float speed_ms = speed_kmh / 3.6f;
     return (uint32_t)((dist_m / speed_ms) * 1000.0f);
 }

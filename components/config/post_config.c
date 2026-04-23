@@ -86,51 +86,37 @@ static void _persist_name(const char *name)
 /* ============================================================
    post_config_init
    ------------------------------------------------------------
-   Abre o namespace NVS e carrega ID e nome do poste.
-   Se os valores não existirem (primeiro flash), usa os
-   defaults de system_config.h e guarda-os na NVS para
-   que arranques futuros não dependam do system_config.h.
+   Carrega ID e nome do poste a partir de system_config.h,
+   que é sempre a fonte de verdade.
+
+   NOTA: A NVS foi removida como fonte de leitura de ID/nome.
+   O problema era que ao flashar um novo firmware com POSTE_ID=1
+   numa placa que tinha sido usada com POSTE_ID=3, a NVS retornava
+   o valor antigo (3) e o display mostrava o poste errado.
+   Agora os valores de system_config.h são sempre aplicados em RAM
+   e escritos na NVS (para referência futura ou recuperação).
 
    Pré-requisito: nvs_flash_init() já chamado em app_main().
 ============================================================ */
 void post_config_init(void)
 {
+    /* Fonte de verdade: sempre system_config.h */
+    s_post.id = POSTE_ID;
+    strncpy(s_post.name, POSTE_NAME, sizeof(s_post.name) - 1);
+    s_post.name[sizeof(s_post.name) - 1] = '\0';
+
+    ESP_LOGI(TAG, "Config: ID=%d  Nome=%s  (fonte: system_config.h)",
+             s_post.id, s_post.name);
+
+    /* Persiste na NVS para referência — erros de NVS não são fatais */
     nvs_handle_t handle;
-    esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &handle);
-
-    if (err == ESP_OK) {
-
-        /* ── ID ── */
-        uint32_t id_lido;
-        if (nvs_get_u32(handle, "post_id", &id_lido) != ESP_OK) {
-            s_post.id = POSTE_ID;
-            nvs_set_u32(handle, "post_id", (uint32_t)s_post.id);
-            ESP_LOGI(TAG, "ID não encontrado na NVS — a usar default: %d", s_post.id);
-        } else {
-            s_post.id = (uint8_t)id_lido;
-        }
-
-        /* ── NOME ── */
-        size_t nome_len = sizeof(s_post.name);
-        if (nvs_get_str(handle, "post_name", s_post.name, &nome_len) != ESP_OK) {
-            strncpy(s_post.name, POSTE_NAME, sizeof(s_post.name) - 1);
-            s_post.name[sizeof(s_post.name) - 1] = '\0';
-            nvs_set_str(handle, "post_name", s_post.name);
-            ESP_LOGI(TAG, "Nome não encontrado na NVS — a usar default: %s", s_post.name);
-        }
-
+    if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &handle) == ESP_OK) {
+        nvs_set_u32(handle, "post_id",   (uint32_t)s_post.id);
+        nvs_set_str(handle, "post_name", s_post.name);
         nvs_commit(handle);
         nvs_close(handle);
-
-        ESP_LOGI(TAG, "Config carregada: ID=%d  Nome=%s", s_post.id, s_post.name);
-
     } else {
-        /* NVS inacessível — usa defaults em RAM sem persistir */
-        s_post.id = POSTE_ID;
-        strncpy(s_post.name, POSTE_NAME, sizeof(s_post.name) - 1);
-        s_post.name[sizeof(s_post.name) - 1] = '\0';
-        ESP_LOGW(TAG, "NVS inacessível — defaults: ID=%d  Nome=%s",
-                 s_post.id, s_post.name);
+        ESP_LOGW(TAG, "NVS inacessível — config apenas em RAM");
     }
 }
 

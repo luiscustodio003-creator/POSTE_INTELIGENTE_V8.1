@@ -100,11 +100,15 @@ static void radar_task(void *arg)
         bool ok = radar_read_data(&dados, NULL);
 
         /* ── 2. Alimenta tracking_manager (v4.0) ─────────────── */
-        /* Chamar SEMPRE — mesmo com ok=false ou count=0.
-           O tracking avança lost_frames dos slots em COASTING,
-           garantindo que veículos que saíram são declarados EXITED
-           mesmo quando o radar não retorna frame válido.          */
-        tracking_manager_update(&dados);
+        /* BUG 6 FIX: só chamar update quando o frame é válido.
+           Com ok=false (falha UART, frame corrompido), passar dados
+           com count=0 avançava lost_frames de todos os slots em COASTING,
+           podendo declarar EXITED prematuramente por ruído na UART.
+           Com ok=true e count=0 (frame válido mas sem alvos), o update
+           é chamado normalmente — lost_frames avança correctamente. */
+        if (ok) {
+            tracking_manager_update(&dados);
+        }
 
         /* ── 3. Notifica fsm_task sobre saúde do radar ───────── */
         /* true  = frame válido COM alvos → radar activo e com dados

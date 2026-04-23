@@ -59,7 +59,7 @@ static bool           s_radar_ok        = true;
 static int            s_radar_fail_cnt  = 0;
 static int            s_radar_ok_cnt    = 0;
 static bool           s_right_online    = true;
-static bool           s_radar_degradado = false;
+/* s_radar_degradado removido — era escrito mas nunca lido (BUG E fix) */
 
 static uint64_t s_last_detect_ms   = 0;
 static uint64_t s_left_offline_ms  = 0;
@@ -245,10 +245,11 @@ void on_tc_inc_received(float speed, int16_t x_mm)
     sim_notificar_chegada(speed, x_mm);
 #endif
 
-    if (s_right_online) {
-        comm_send_tc_inc(speed, x_mm);
-        comm_send_spd(speed, x_mm);
-    }
+    /* BUG 1 FIX: NÃO propagar TC_INC+SPD ao vizinho direito aqui.
+       A propagação ocorre APENAS quando o radar LOCAL confirma
+       a chegada do veículo (SM_EVT_VEHICLE_LOCAL ou SM_EVT_VEHICLE_DETECTED).
+       Propagar aqui causava activação de todos os postes à frente
+       antes do veículo entrar no raio de qualquer radar. */
 }
 
 void on_prev_passed_received(void)
@@ -257,7 +258,10 @@ void on_prev_passed_received(void)
     if (s_Tc > 0) s_Tc--;
     s_acender_em_ms = 0;
     ESP_LOGI(TAG, "[PASSED] T=%d Tc=%d", s_T, s_Tc);
-    comm_notify_prev_passed(s_last_speed);
+    /* BUG 2 FIX: NÃO propagar o PASSED para o vizinho esquerdo.
+       O PASSED para aqui — cada nó só emite PASSED quando o SEU
+       próprio radar confirma que o veículo saiu (SM_EVT_VEHICLE_PASSED).
+       Propagar causava T-- em cascata por toda a cadeia. */
     _agendar_apagar();
 }
 
@@ -314,10 +318,17 @@ void sm_process_event(sm_event_type_t type,
             ESP_LOGI(TAG, "[EVT] DETECTED id=%u vel=%.1f km/h eta=%lums",
                      vehicle_id, vel, (unsigned long)eta_ms);
 
-            if (s_T < 3) s_T++;
+            /* Cancelar apagamento e timeout pendentes — há um veículo activo */
             s_apagar_pend    = false;
+            s_tc_timeout_ms  = 0;
             s_last_detect_ms = _agora_ms();
             s_last_speed     = vel;
+
+            /* T++ sempre — cada DETECTED representa um veículo novo confirmado.
+               O PASSED vai decrementar exactamente uma vez por veículo.
+               Separado da transição de estado: T é um contador de veículos,
+               não um indicador de estado da luminária. */
+            if (s_T < 3) s_T++;
 
             /* Calcula pré-acendimento com base no ETA */
             if (eta_ms > MARGEM_ACENDER_MS)
@@ -357,19 +368,16 @@ void sm_process_event(sm_event_type_t type,
             s_last_detect_ms = _agora_ms();
             s_apagar_pend    = false;
 
-            /* Propaga para vizinho direito se disponível */
-            if (s_right_online) {
-                comm_send_tc_inc(vel, x_mm);
-                comm_send_spd(vel, x_mm);
-            }
             break;
 
         /* ── Veículo saiu da zona ───────────────────────────── */
         case SM_EVT_VEHICLE_PASSED:
-            ESP_LOGI(TAG, "[EVT] PASSED id=%u vel=%.1f km/h",
-                     vehicle_id, vel);
+            ESP_LOGI(TAG, "[EVT] PASSED id=%u vel=%.1f km/h", vehicle_id, vel);
 
-            if (s_T  > 0) s_T--;
+            if (!s_right_online) {
+                if (s_T > 0) s_T--;
+            }           
+
             if (s_Tc > 0) s_Tc--;
             s_acender_em_ms = 0;
 
@@ -381,12 +389,14 @@ void sm_process_event(sm_event_type_t type,
 
         /* ── Veículo detectado localmente pelo radar ─────────── */
         case SM_EVT_VEHICLE_LOCAL:
-            s_acender_em_ms  = 0;
+           
+            s_tc_timeout_ms = 0;
+            s_apagar_pend   = false;
+
             if (s_Tc > 0) s_Tc--;
             if (s_T  < 3) s_T++;
             s_last_speed     = vel;
             s_last_detect_ms = _agora_ms();
-            s_apagar_pend    = false;
 
             /* Fade up apenas na transição — não repete se já em LIGHT_ON */
             if (s_state == STATE_IDLE   ||
@@ -487,14 +497,13 @@ void sm_on_right_neighbor_online(void)
    recebe um bool de saúde do tracking_manager (que sabe se teve
    frames válidos recentemente). A lógica interna mantém-se igual.
 ============================================================ */
-static void _verificar_radar(bool teve_frame, bool comm_ok)
+static void _verificar_radar(bool teve_frame)
 {
     if (teve_frame) {
         s_radar_fail_cnt = 0;
         s_radar_ok_cnt++;
         if (!s_radar_ok && s_radar_ok_cnt >= RADAR_OK_COUNT) {
-            s_radar_ok        = true;
-            s_radar_degradado = false;
+            s_radar_ok = true;
             ESP_LOGI(TAG, "Radar recuperado");
             if (s_state == STATE_SAFE_MODE)
                 s_state = STATE_IDLE;
@@ -503,8 +512,7 @@ static void _verificar_radar(bool teve_frame, bool comm_ok)
         s_radar_ok_cnt = 0;
         s_radar_fail_cnt++;
         if (s_radar_ok && s_radar_fail_cnt >= RADAR_FAIL_COUNT) {
-            s_radar_ok        = false;
-            s_radar_degradado = true;
+            s_radar_ok = false;
             ESP_LOGW(TAG, "Radar FAIL após %d leituras — PASSO 10 decide estado", RADAR_FAIL_COUNT);
         }       
     }
@@ -537,11 +545,8 @@ void state_machine_init(void)
    state_machine_update  — ciclo de manutenção a 100ms
 ============================================================ */
 
-void state_machine_update(bool comm_ok, bool is_master,bool radar_teve_frame)
-
+void state_machine_update(bool comm_ok, bool is_master, bool radar_teve_frame)
 {
-    ESP_LOGI(TAG, "UPDATE inicio");
-    
     uint64_t agora = _agora_ms();
 
     /* ── PASSO 1: Simulador (modo sem radar físico) ───────── */
@@ -551,7 +556,7 @@ void state_machine_update(bool comm_ok, bool is_master,bool radar_teve_frame)
 #endif
 
     /* ── PASSO 2: Saúde do radar ──────────────────────────── */
-    _verificar_radar(radar_teve_frame, comm_ok);
+    _verificar_radar(radar_teve_frame);
 
     /* ── PASSO 3: Conectividade do vizinho direito ──────────── */
     bool dir_ok = comm_right_online();
@@ -573,7 +578,9 @@ void state_machine_update(bool comm_ok, bool is_master,bool radar_teve_frame)
     }
 
     /* ── PASSO 5: T preso com esquerdo offline ──────────────── */
-    if (s_left_was_offline && s_T > 0 &&
+   
+    if (POST_POSITION > 0 &&
+        s_left_was_offline && s_T > 0 &&
         (agora - s_left_offline_ms) > T_STUCK_TIMEOUT_MS) {
         s_T = 0;
         ESP_LOGW(TAG, "T forçado a 0 (viz. esq. offline)");
@@ -584,9 +591,7 @@ void state_machine_update(bool comm_ok, bool is_master,bool radar_teve_frame)
         s_acender_em_ms = 0;
         if (s_Tc > 0) {
             dali_fade_up(s_last_speed);
-            if (s_state == STATE_IDLE   ||
-                s_state == STATE_MASTER ||
-                s_state == STATE_AUTONOMO)
+            if (s_state == STATE_IDLE ||s_state == STATE_MASTER || s_state == STATE_AUTONOMO)
                 s_state = STATE_LIGHT_ON;
             ESP_LOGI(TAG, "Pré-acendimento: luz ON (ETA atingido)");
         }
@@ -594,8 +599,7 @@ void state_machine_update(bool comm_ok, bool is_master,bool radar_teve_frame)
 
 /* ── PASSO 7: Timeout para apagar ─────────────────────── */
     if (s_apagar_pend) {
-        ESP_LOGI(TAG, "APAGAR PEND: T=%d Tc=%d elapsed=%llums",
-                 s_T, s_Tc, (agora - s_last_detect_ms));
+        ESP_LOGI(TAG, "APAGAR PEND: T=%d Tc=%d elapsed=%llums",s_T, s_Tc, (agora - s_last_detect_ms));
     }
     if (s_apagar_pend && s_T == 0 && s_Tc == 0 &&
         (agora - s_last_detect_ms) >= TRAFIC_TIMEOUT_MS) {
@@ -605,7 +609,7 @@ void state_machine_update(bool comm_ok, bool is_master,bool radar_teve_frame)
         if (s_state == STATE_LIGHT_ON  ||
             s_state == STATE_AUTONOMO  ||
             s_state == STATE_OBSTACULO) {
-            bool era_autonomo = (s_state == STATE_AUTONOMO);
+            bool era_autonomo = (s_state == STATE_AUTONOMO) && !comm_ok;
             if (is_master)
                 s_state = STATE_MASTER;
             else if (era_autonomo)
@@ -696,8 +700,14 @@ void state_machine_update(bool comm_ok, bool is_master,bool radar_teve_frame)
             s_state = is_master ? STATE_MASTER : STATE_IDLE;
         }
 
-        /* Sem WiFi + radar OK → AUTONOMO imediato */
-        if (!comm_ok && s_radar_ok && s_state != STATE_SAFE_MODE)
+        /* Sem WiFi + radar OK → AUTONOMO imediato
+           BUG A FIX: não interromper LIGHT_ON nem OBSTACULO.
+           Se houver um veículo activo ou obstáculo, manter a luz
+           acesa é mais seguro do que transitar de estado. */
+        if (!comm_ok && s_radar_ok &&
+            s_state != STATE_SAFE_MODE &&
+            s_state != STATE_LIGHT_ON  &&
+            s_state != STATE_OBSTACULO)
             s_state = STATE_AUTONOMO;
 
         /* ── PASSO 11: Heartbeat MASTER_CLAIM ───────────────────── */
