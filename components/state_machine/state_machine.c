@@ -319,14 +319,21 @@ void on_tc_inc_received(float speed, int16_t x_mm)
     }
 }
 
-/* Recebe confirmação de passagem do veículo pelo poste anterior */
+/* Recebe confirmação do vizinho direito que o objecto chegou lá.
+   PROTOCOLO T/Tc CORRECTO:
+   - Este callback é chamado no Poste A quando o Poste B detectou
+     o objecto localmente e enviou PASSED de volta.
+   - Decrementa T (o objecto já não está neste poste).
+   - NÃO decrementa Tc — o Tc já foi decrementado quando B detectou
+     localmente (SM_EVT_VEHICLE_LOCAL faz Tc--).
+   - Propaga PASSED para o Poste anterior a este (cadeia). */
 void on_prev_passed_received(void)
 {
-    if (s_T  > 0) s_T--;
-    if (s_Tc > 0) s_Tc--;
+    if (s_T > 0) s_T--;
     s_acender_em_ms = 0;
-    ESP_LOGI(TAG, "[PASSED] T=%d Tc=%d", s_T, s_Tc);
-    /* Notifica o poste esquerdo para decrementar também */
+    ESP_LOGI(TAG, "[PASSED recebido] T=%d Tc=%d — propaga para viz. esq.", s_T, s_Tc);
+    /* Propaga a confirmação de passagem para o poste ainda mais à esquerda
+       (para cadeia com mais de 2 postes). */
     comm_notify_prev_passed(s_last_speed);
     _agendar_apagar();
 }
@@ -436,22 +443,40 @@ void sm_process_event(sm_event_type_t type,
 
         /* ── Veículo saiu da zona do radar ─────────────────── */
         case SM_EVT_VEHICLE_PASSED:
-            ESP_LOGI(TAG, "[EVT] PASSED id=%u vel=%.1f km/h", vehicle_id, vel);
+            /* PROTOCOLO T/Tc CORRECTO:
+               Poste A NÃO decrementa o seu próprio T aqui.
+               O objecto saiu do sensor mas ainda está entre postes.
+               T mantém-se a 1 — luz fica acesa — até o Poste B
+               confirmar a chegada via on_prev_passed_received().
+               Só então T é decrementado neste poste. */
+            ESP_LOGI(TAG, "[EVT] PASSED id=%u vel=%.1f km/h | T=%d mantido até confirm. viz. dir.",
+                     vehicle_id, vel, s_T);
 
-            if (s_T  > 0) s_T--;
-            if (s_Tc > 0) s_Tc--;
             s_acender_em_ms = 0;
 
-            /* Avisa vizinho esquerdo (T-- no poste anterior) */
-            comm_notify_prev_passed(vel);
-            /* Agenda apagamento após TRAFIC_TIMEOUT_MS */
+            /* Avisa vizinho direito que o objecto está a caminho.
+               Quando o vizinho o detectar localmente, enviará PASSED
+               de volta → on_prev_passed_received() decrementa T aqui. */
+            if (s_right_online)
+                comm_send_tc_inc(vel, x_mm);
+
+            /* Agenda apagamento — só actua quando T=0 e Tc=0.
+               Como T ainda é 1, o apagamento só acontece após
+               on_prev_passed_received() decrementar T. */
             _agendar_apagar();
             break;
 
         /* ── Veículo detectado localmente pelo radar ─────────── */
         case SM_EVT_VEHICLE_LOCAL:
+            /* PROTOCOLO T/Tc CORRECTO:
+               O Poste B detectou o objecto localmente.
+               T++ neste poste (objecto aqui).
+               Tc-- se havia Tc pendente (o anunciado chegou).
+               OBRIGATÓRIO: envia PASSED ao Poste A (viz. esquerdo)
+               para que o Poste A decremente o seu T.
+               Sem este PASSED, o T do Poste A ficaria preso a 1
+               indefinidamente até ao TC_TIMEOUT. */
             s_acender_em_ms  = 0;
-            /* Confirma chegada: Tc-- (veículo já aqui) e T++ */
             if (s_Tc > 0) s_Tc--;
             if (s_T  < 3) s_T++;
             s_last_speed     = vel;
@@ -469,7 +494,10 @@ void sm_process_event(sm_event_type_t type,
             ESP_LOGI(TAG, "[EVT] LOCAL vel=%.1f km/h T=%d Tc=%d",
                      vel, s_T, s_Tc);
 
-            /* Propaga para vizinho direito (em AUTONOMO não propaga) */
+            /* Confirma ao Poste A que o objecto chegou (T-- no A) */
+            comm_notify_prev_passed(vel);
+
+            /* Propaga para vizinho direito se disponível */
             if (s_right_online) {
                 comm_send_tc_inc(vel, x_mm);
                 comm_send_spd(vel, x_mm);

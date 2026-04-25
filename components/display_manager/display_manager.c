@@ -1,20 +1,14 @@
-
 /* ============================================================
-   DISPLAY MANAGER — IMPLEMENTAÇÃO v5.7
-   ------------------------------------------------------------
+   DISPLAY MANAGER — IMPLEMENTAÇÃO
    @file      display_manager.c
    @brief     Camada de apresentação LVGL + ST7789 — ecrã 240×240
-   @version   5.7
-   @date      2026-04-01
+   @version   6.0  |  2026-04-24
+   PROJECTO   : Poste Inteligente v8
+   AUTORES    : Luis Custódio | Tiago Moreno
+   PLATAFORMA : ESP32 (ESP-IDF v5.x)
 
-   Projecto  : Poste Inteligente
-   Estudantes: Luis Custodio | Tiago Moreno
-   Plataforma: ESP32 (ESP-IDF v5.x)
-
-   
-
-   Layout do ecrã (inalterado):
-   -----------------------------------
+   Layout do ecrã:
+   ───────────────────────────────────────
      y=  0.. 35  → ZONA IDENTIDADE
      y= 36.. 36  → separador
      y= 37.. 92  → ZONA HARDWARE
@@ -23,14 +17,33 @@
      y=146..146  → separador
      y=147..239  → ZONA RADAR (canvas 230×90 px)
 
+   MUDANÇA PRINCIPAL v5.7 → v6.0:
+   ──────────────────────────────────────────────────────────
+   REMOVIDO: interpolador preditivo (radar_interp_t, _interp_update,
+   _interp_aplicar_frame).
+   O interpolador avançava a posição do objecto com base na
+   velocidade entre frames reais — mostrava onde o algoritmo
+   ACHAVA que o objecto estava, não onde ele REALMENTE estava.
+
+   SUBSTITUÍDO POR: posição directa (dm_alvo_t).
+   O canvas mostra exactamente a posição x_mm / y_mm que vem
+   do tracking_manager a cada frame.
+   O rasto é construído com posições REAIS anteriores (buffer
+   circular preenchido apenas quando chega um frame real),
+   nunca com posições simuladas.
+
+   Timeout de visibilidade: ALVO_HOLD_MS (500ms).
+   Se não chegar frame real durante esse tempo, o alvo
+   desaparece do canvas — sem "fantasma" a mover-se sozinho.
+
    Dependências:
-   -------------
-   - display_manager.h : API pública
-   - st7789.h          : driver SPI do display físico
-   - system_config.h   : LCD_H_RES, LCD_V_RES, LIGHT_MIN, RADAR_MAX_MM
-   - hw_config.h       : LCD_PIN_*
-   - post_config.h     : post_get_name(), post_get_id()
-   - lvgl              : v8.3.x (LV_USE_CANVAS=1 em lv_conf.h)
+   ─────────────
+     display_manager.h : API pública
+     st7789.h          : driver SPI do display físico
+     system_config.h   : LCD_H_RES, LCD_V_RES, RADAR_MAX_MM
+     hw_config.h       : LCD_PIN_*
+     post_config.h     : post_get_name(), post_get_id()
+     lvgl              : v8.3.x (LV_USE_CANVAS=1 em lv_conf.h)
 ============================================================ */
 
 #include "display_manager.h"
@@ -48,13 +61,14 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 
-
-
-
 static const char *TAG = "DISP_MGR";
 
 /* ============================================================
    FILA DE MENSAGENS — THREAD SAFETY
+   ──────────────────────────────────────────────────────────
+   Toda a comunicação entre tasks produtoras (fsm_task, udp_task)
+   e a display_task consumidora é feita por esta fila.
+   Nunca chamar funções LVGL fora da display_task.
 ============================================================ */
 #define DM_FILA_CAP  24
 
@@ -89,6 +103,7 @@ typedef struct {
 
 static QueueHandle_t s_fila = NULL;
 
+
 /* ============================================================
    PALETA DE CORES
 ============================================================ */
@@ -98,7 +113,7 @@ static QueueHandle_t s_fila = NULL;
 #define COR_CINZ_CLARO  0x9CA3AF
 #define COR_VERDE       0x22C55E
 #define COR_VERMELHO    0xFF3333
-#define COR_AMARELO     0xFF0000
+#define COR_AMARELO     0xFF8C00
 #define COR_LARANJA     0xFF8C00
 #define COR_CIANO       0x00D4FF
 #define COR_VIOLETA     0xA855F7
@@ -109,13 +124,14 @@ static QueueHandle_t s_fila = NULL;
 /* ============================================================
    DIMENSÕES DO CANVAS DO RADAR
 ============================================================ */
-#define RADAR_W         230
-#define RADAR_H          90
-#define RADAR_X_OFF       5
-#define RADAR_Y_OFF     149
+#define RADAR_W       230
+#define RADAR_H        90
+#define RADAR_X_OFF     5
+#define RADAR_Y_OFF   149
 
-#define RADAR_HOLD_MS   500
-#define MATCH_DIST_MM   2000.0f
+/* Tempo máximo sem frame real antes de apagar o alvo do canvas */
+#define ALVO_HOLD_MS  500
+
 
 /* ============================================================
    PONTEIROS PARA ELEMENTOS VISUAIS
@@ -139,36 +155,43 @@ static lv_obj_t *canvas_radar;
 /* Buffer do canvas — RGB565 */
 static lv_color_t radar_buf[RADAR_W * RADAR_H];
 
+
 /* ============================================================
-   ESTADO INTERNO DOS OBJECTOS RADAR
+   ESTADO DOS ALVOS — POSIÇÕES REAIS
+   ──────────────────────────────────────────────────────────
+   dm_alvo_t armazena a última posição REAL recebida do
+   tracking_manager e um buffer circular de posições reais
+   anteriores (rasto).
+
+   Não existe nenhum campo de velocidade para movimento
+   preditivo — o alvo só se move quando chega um novo frame.
+   Se não chegar frame dentro de ALVO_HOLD_MS, desaparece.
 ============================================================ */
-static radar_obj_t s_radar_objs[RADAR_MAX_OBJ];
-static uint8_t     s_radar_count   = 0;
-static uint32_t    s_radar_last_ms = 0;
-
-/* ============================================================*/
-
 typedef struct {
-    float    x_mm;                      /* posição lateral (mm)        */
-    float    y_mm;                      /* posição frontal (mm)        */
-    float    vy_mm_ms;                  /* velocidade frontal (mm/ms)  */
-    float    speed_kmh;                 /* velocidade (km/h) p/ label  */
-    bool     activo;                    /* true = visível no canvas    */
-    uint32_t ultimo_ms;                 /* timestamp último frame real */
-    /* Rasto — últimas RADAR_TRAIL_MAX posições a 20ms */
-    uint8_t  trail_head;                /* índice circular (cabeça)    */
-    float    trail_x[RADAR_TRAIL_MAX];  /* buffer circular X           */
-    float    trail_y[RADAR_TRAIL_MAX];  /* buffer circular Y           */
-    uint8_t  trail_len;                 /* entradas válidas (0..MAX)   */
-} radar_interp_t;
+    float    x_mm;                      /* Posição lateral real (mm)         */
+    float    y_mm;                      /* Posição frontal real (mm)         */
+    float    speed_kmh;                 /* Velocidade para label (km/h)      */
+    bool     activo;                    /* true = visível no canvas          */
+    uint32_t ultimo_ms;                 /* Timestamp do último frame real    */
+    /* Rasto — posições reais anteriores em buffer circular */
+    uint8_t  trail_head;               /* Índice circular (próxima escrita)  */
+    float    trail_x[RADAR_TRAIL_MAX]; /* Buffer circular de X reais         */
+    float    trail_y[RADAR_TRAIL_MAX]; /* Buffer circular de Y reais         */
+    uint8_t  trail_len;                /* Número de entradas válidas         */
+} dm_alvo_t;
 
-static radar_interp_t s_interp[RADAR_MAX_OBJ];
-static uint32_t       s_ultimo_interp_ms = 0;
+static dm_alvo_t s_alvos[RADAR_MAX_OBJ];
+
+/* Estado de tráfego actual — para indicador de trânsito no canvas */
+static int s_T_actual  = 0;  /* Veículos detectados localmente         */
+static int s_Tc_actual = 0;  /* Veículos a caminho (anunciados via UDP) */
+
 
 /* ============================================================
    FUNÇÕES INTERNAS DE APOIO
 ============================================================ */
 
+/* Callback de flush SPI para o LVGL */
 static void st7789_flush_cb(lv_disp_drv_t  *disp_drv,
                              const lv_area_t *area,
                              lv_color_t      *color_p)
@@ -181,6 +204,7 @@ static void st7789_flush_cb(lv_disp_drv_t  *disp_drv,
     lv_disp_flush_ready(disp_drv);
 }
 
+/* Cria linha horizontal de separação de zonas */
 static void _separador(lv_obj_t *pai, int y_pos)
 {
     lv_obj_t *l = lv_obj_create(pai);
@@ -193,7 +217,9 @@ static void _separador(lv_obj_t *pai, int y_pos)
     lv_obj_set_style_pad_all(l, 0, 0);
 }
 
-static lv_obj_t *_label_novo(lv_obj_t   *pai,int x,int y,uint32_t cor,const char *texto)
+/* Cria label LVGL com posição, cor e texto iniciais */
+static lv_obj_t *_label_novo(lv_obj_t *pai, int x, int y,
+                              uint32_t cor, const char *texto)
 {
     lv_obj_t *l = lv_label_create(pai);
     lv_label_set_text(l, texto);
@@ -203,11 +229,13 @@ static lv_obj_t *_label_novo(lv_obj_t   *pai,int x,int y,uint32_t cor,const char
     return l;
 }
 
+
 /* ============================================================
    FUNÇÕES DE DESENHO PIXEL DIRECTO NO BUFFER RADAR
 ============================================================ */
 
-static inline void _px_blend(int x, int y,lv_color_t cor, uint8_t alpha)
+/* Pinta pixel com blending de alpha — sem escrita fora dos limites */
+static inline void _px_blend(int x, int y, lv_color_t cor, uint8_t alpha)
 {
     if ((unsigned)x >= RADAR_W || (unsigned)y >= RADAR_H) return;
     if (alpha == 0)   return;
@@ -216,6 +244,7 @@ static inline void _px_blend(int x, int y,lv_color_t cor, uint8_t alpha)
         lv_color_mix(cor, radar_buf[y * RADAR_W + x], alpha);
 }
 
+/* Preenche linha horizontal completa com cor sólida */
 static void _linha_h_px(int y, lv_color_t cor)
 {
     if ((unsigned)y >= RADAR_H) return;
@@ -223,6 +252,7 @@ static void _linha_h_px(int y, lv_color_t cor)
         radar_buf[y * RADAR_W + x] = cor;
 }
 
+/* Círculo preenchido com gradiente radial suave */
 static void _circulo_px(int cx, int cy, int r, lv_color_t cor)
 {
     int r2 = r * r;
@@ -236,7 +266,9 @@ static void _circulo_px(int cx, int cy, int r, lv_color_t cor)
     }
 }
 
-static void _halo_px(int cx, int cy,int r_int, int r_ext,lv_color_t cor, uint8_t alpha_base)
+/* Anel (halo) com gradiente entre raio interior e exterior */
+static void _halo_px(int cx, int cy, int r_int, int r_ext,
+                     lv_color_t cor, uint8_t alpha_base)
 {
     int ri2  = r_int * r_int;
     int re2  = r_ext * r_ext;
@@ -245,20 +277,22 @@ static void _halo_px(int cx, int cy,int r_int, int r_ext,lv_color_t cor, uint8_t
         for (int dx = -r_ext; dx <= r_ext; dx++) {
             int d2 = dx*dx + dy*dy;
             if (d2 < ri2 || d2 > re2) continue;
-            uint8_t a = (uint8_t)((uint32_t)alpha_base
-                                  * (re2 - d2) / span);
+            uint8_t a = (uint8_t)((uint32_t)alpha_base * (re2 - d2) / span);
             _px_blend(cx + dx, cy + dy, cor, a);
         }
     }
 }
 
-static void _radar_mm_to_px(int x_mm, int y_mm,lv_coord_t *px_x, lv_coord_t *px_y)
+/* Converte posição em mm (x_mm, y_mm) para pixel no canvas polar */
+static void _radar_mm_to_px(int x_mm, int y_mm,
+                             lv_coord_t *px_x, lv_coord_t *px_y)
 {
     const int cx_s  = RADAR_W / 2;
     const int cy_s  = RADAR_H - 2;
     const int r_max = RADAR_H - 4;
 
-    float dist_mm = sqrtf((float)x_mm * (float)x_mm + (float)y_mm * (float)y_mm);
+    float dist_mm = sqrtf((float)x_mm * (float)x_mm +
+                          (float)y_mm * (float)y_mm);
     float ang_rad = atan2f((float)x_mm, (float)y_mm);
     float radius  = (dist_mm / (float)RADAR_MAX_MM) * (float)r_max;
     if (radius > (float)r_max) radius = (float)r_max;
@@ -272,9 +306,10 @@ static void _radar_mm_to_px(int x_mm, int y_mm,lv_coord_t *px_x, lv_coord_t *px_
     if (*px_y >= RADAR_H) *px_y = RADAR_H - 1;
 }
 
+
 /* ============================================================
    FONTE BITMAP 4×6 — dígitos 0-9 + 'k','m','/','h'
-   Cada glifo: 6 bytes, cada byte = 4 bits (bit7=col esq)
+   Cada glifo: 6 bytes, bit7=coluna esquerda
 ============================================================ */
 static const uint8_t _font4x6[][6] = {
     /* 0 */ {0x69, 0x99, 0x96, 0x00, 0x00, 0x00},
@@ -297,6 +332,7 @@ static const uint8_t _font4x6[][6] = {
 #define FC_SL 12
 #define FC_H  13
 
+/* Desenha um glifo da fonte bitmap na posição (x0, y0) */
 static void _glifo_px(int x0, int y0, int idx, lv_color_t cor)
 {
     for (int row = 0; row < 6; row++) {
@@ -308,9 +344,8 @@ static void _glifo_px(int x0, int y0, int idx, lv_color_t cor)
     }
 }
 
-/* Desenha "XXXkm/h" a partir de (x0,y0) */
-static void _vel_label_px(int x0, int y0,
-                           float speed_kmh, lv_color_t cor)
+/* Desenha "XXXkm/h" a partir de (x0, y0) */
+static void _vel_label_px(int x0, int y0, float speed_kmh, lv_color_t cor)
 {
     if (fabsf(speed_kmh) < 1.0f) return;
     int v  = (int)(fabsf(speed_kmh) + 0.5f);
@@ -325,166 +360,135 @@ static void _vel_label_px(int x0, int y0,
 }
 
 
-static void _interp_update(void)
+/* ============================================================
+   _radar_aplicar_frame
+   ──────────────────────────────────────────────────────────
+   Recebe os objectos REAIS do tracking_manager e actualiza
+   o estado de cada alvo (dm_alvo_t) com a posição real.
+
+   Para cada objecto recebido:
+     1. Procura o slot activo mais próximo (nearest-neighbour)
+     2. Se match: actualiza posição real e acrescenta ao rasto
+     3. Se sem match: cria novo slot
+
+   O rasto é preenchido com a posição ANTERIOR ao update,
+   ou seja, apenas com posições que o sensor realmente mediu.
+
+   Alvos sem frame há ALVO_HOLD_MS são marcados inactivos.
+============================================================ */
+static void _radar_aplicar_frame(const radar_obj_t *objs, uint8_t count)
 {
     uint32_t agora = (uint32_t)(esp_timer_get_time() / 1000ULL);
 
-    if (s_ultimo_interp_ms == 0)
-    {
-        s_ultimo_interp_ms = agora;
-        return;
-    }
-
-    uint32_t delta_ms = agora - s_ultimo_interp_ms;
-    s_ultimo_interp_ms = agora;
-
-    /* Protecção: limita delta a 50ms para evitar saltos grandes */
-    if (delta_ms > 50) delta_ms = 50;
-    if (delta_ms < 5)  return;   /* micro-update — não compensa */
-
-    for (int i = 0; i < RADAR_MAX_OBJ; i++)
-    {
-        radar_interp_t *obj = &s_interp[i];
-        if (!obj->activo) continue;
-
-        /* Guarda posição actual no rasto (buffer circular) */
-        obj->trail_x[obj->trail_head] = obj->x_mm;
-        obj->trail_y[obj->trail_head] = obj->y_mm;
-        obj->trail_head = (obj->trail_head + 1) % RADAR_TRAIL_MAX;
-        if (obj->trail_len < RADAR_TRAIL_MAX) obj->trail_len++;
-
-        obj->y_mm -= obj->vy_mm_ms * (float)delta_ms;
-
-        /* Alvo saiu do campo de visão do sensor */
-        if (obj->y_mm <= 0.0f)
-        {
-            obj->activo    = false;
-            obj->trail_len = 0;
-            obj->trail_head = 0;
-        }
-
-        /* Alvo sem frame real há demasiado tempo */
-        if (obj->activo && (agora - obj->ultimo_ms) > RADAR_HOLD_MS)
-        {
-            obj->activo    = false;
-            obj->trail_len = 0;
-            obj->trail_head = 0;
-        }
-    }
-}
-
-static void _interp_aplicar_frame(void)
-{
-    uint32_t agora = (uint32_t)(esp_timer_get_time() / 1000ULL);
-
-    /* Marca quais slots de s_interp[] já foram emparelhados */
+    /* Marca quais slots já foram emparelhados neste frame */
     bool usado[RADAR_MAX_OBJ] = {false};
 
-    for (int n = 0; n < s_radar_count && n < RADAR_MAX_OBJ; n++)
-    {
-        const radar_obj_t *novo = &s_radar_objs[n];
+    for (int n = 0; n < count && n < RADAR_MAX_OBJ; n++) {
+        const radar_obj_t *novo = &objs[n];
         float nx = (float)novo->x_mm;
         float ny = (float)novo->y_mm;
 
         /* Procura o slot activo mais próximo */
         int   best_idx  = -1;
-        float best_dist = MATCH_DIST_MM;
+        float best_dist = 2000.0f;  /* Raio de associação em mm */
 
-        for (int s = 0; s < RADAR_MAX_OBJ; s++)
-        {
-            if (!s_interp[s].activo || usado[s]) continue;
-            float dx   = s_interp[s].x_mm - nx;
-            float dy   = s_interp[s].y_mm - ny;
+        for (int s = 0; s < RADAR_MAX_OBJ; s++) {
+            if (!s_alvos[s].activo || usado[s]) continue;
+            float dx   = s_alvos[s].x_mm - nx;
+            float dy   = s_alvos[s].y_mm - ny;
             float dist = sqrtf(dx*dx + dy*dy);
-            if (dist < best_dist)
-            {
+            if (dist < best_dist) {
                 best_dist = dist;
                 best_idx  = s;
             }
         }
 
-        float spd = novo->speed_kmh;
+        if (best_idx >= 0) {
+            /* Match — guarda posição anterior no rasto antes de actualizar */
+            dm_alvo_t *a = &s_alvos[best_idx];
+            a->trail_x[a->trail_head] = a->x_mm;
+            a->trail_y[a->trail_head] = a->y_mm;
+            a->trail_head = (a->trail_head + 1) % RADAR_TRAIL_MAX;
+            if (a->trail_len < RADAR_TRAIL_MAX) a->trail_len++;
 
-        if (best_idx >= 0)
-        {
-            /* Match — corrige posição e velocidade real do sensor */
-            s_interp[best_idx].x_mm      = nx;
-            s_interp[best_idx].y_mm      = ny;
-            s_interp[best_idx].ultimo_ms = agora;
-            if (spd > 0.0f) {
-                s_interp[best_idx].speed_kmh = spd;
-                s_interp[best_idx].vy_mm_ms  = spd * 0.2778f;
-            }
+            /* Actualiza para a posição real do frame actual */
+            a->x_mm     = nx;
+            a->y_mm     = ny;
+            a->speed_kmh = novo->speed_kmh;
+            a->ultimo_ms = agora;
             usado[best_idx] = true;
-        }
-        else
-        {
-            /* Sem match — inicializa no primeiro slot livre */
-            for (int s = 0; s < RADAR_MAX_OBJ; s++)
-            {
-                if (!s_interp[s].activo && !usado[s])
-                {
-                    s_interp[s].x_mm       = nx;
-                    s_interp[s].y_mm       = ny;
-                    s_interp[s].speed_kmh  = spd;
-                    s_interp[s].vy_mm_ms   = spd * 0.2778f;
-                    s_interp[s].activo     = true;
-                    s_interp[s].ultimo_ms  = agora;
-                    s_interp[s].trail_len  = 0;
-                    s_interp[s].trail_head = 0;
+        } else {
+            /* Sem match — inicializa novo slot com posição real */
+            for (int s = 0; s < RADAR_MAX_OBJ; s++) {
+                if (!s_alvos[s].activo && !usado[s]) {
+                    s_alvos[s].x_mm      = nx;
+                    s_alvos[s].y_mm      = ny;
+                    s_alvos[s].speed_kmh = novo->speed_kmh;
+                    s_alvos[s].activo    = true;
+                    s_alvos[s].ultimo_ms = agora;
+                    s_alvos[s].trail_len  = 0;
+                    s_alvos[s].trail_head = 0;
                     usado[s] = true;
                     break;
                 }
             }
         }
     }
+
+    /* Apaga alvos sem frame real há mais de ALVO_HOLD_MS */
+    for (int s = 0; s < RADAR_MAX_OBJ; s++) {
+        if (!s_alvos[s].activo) continue;
+        if ((agora - s_alvos[s].ultimo_ms) > ALVO_HOLD_MS) {
+            s_alvos[s].activo    = false;
+            s_alvos[s].trail_len = 0;
+            s_alvos[s].trail_head = 0;
+        }
+    }
 }
 
 
-
+/* ============================================================
+   _radar_redraw — redesenha o canvas com posições reais
+   ──────────────────────────────────────────────────────────
+   Chamado a cada 20ms pela display_task.
+   Mostra apenas posições reais vindas do tracking_manager.
+   Não avança nenhuma posição — o que é desenhado é o que
+   o sensor mediu no último frame válido.
+============================================================ */
 static void _radar_redraw(void)
 {
     if (!canvas_radar) return;
 
-    /* 1. Avança interpolação */
-    _interp_update();
-
-    /* Cores Táticas */
+    /* Cores do canvas */
     lv_color_t C_FUNDO  = lv_color_hex(0x010601);
-    lv_color_t C_ARCO   = lv_color_hex(0x28A745); // Verde Carregado
+    lv_color_t C_ARCO   = lv_color_hex(0x28A745);
     lv_color_t C_EIXO   = lv_color_hex(0x28A745);
     lv_color_t C_SWEEP  = lv_color_hex(0x22C55E);
     lv_color_t C_VRD    = lv_color_hex(0x22C55E);
     lv_color_t C_VRD_HL = lv_color_hex(0xAAFFAA);
 
-    /* Definição de cores e rastos dos alvos */
+    /* Cores e rastos dos alvos (até 3) */
     static const uint32_t COR_ALVO[3]    = {0xFF3333, 0x00D4FF, 0xF5C542};
     static const uint32_t COR_ALVO_HL[3] = {0xFFAAAA, 0xAAEEFF, 0xFFEEAA};
-    static const uint8_t  RASTO_R[3]     = {220,  0, 220};
-    static const uint8_t  RASTO_G[3]     = {  0,180, 180};
-    static const uint8_t  RASTO_B[3]     = {  0,220,   0};
+    static const uint8_t  RASTO_R[3]     = {220,   0, 220};
+    static const uint8_t  RASTO_G[3]     = {  0, 180, 180};
+    static const uint8_t  RASTO_B[3]     = {  0, 220,   0};
 
     const int cx_s  = RADAR_W / 2;
     const int cy_s  = RADAR_H - 2;
     const int r_max = RADAR_H - 4;
 
-    /* 2. Limpeza do Fundo */
+    /* 1. Limpeza do fundo */
     for (int i = 0; i < RADAR_W * RADAR_H; i++)
         radar_buf[i] = C_FUNDO;
 
-    /* 3. Arcos Semicirculares (Substituição: Agora de 1m em 1m) */
-    // Percorre de 1000mm (1m) até 6000mm (6m)
+    /* 2. Arcos semicirculares de 1m em 1m (até 6m) */
     for (int mm = 1000; mm <= 6000; mm += 1000) {
         int r = (int)((float)mm / (float)RADAR_MAX_MM * (float)r_max);
-        
-        /* Define a opacidade baseada na distância:
-         * Metros ímpares (1,3,5): 35u (mais discreto)
-         * Metros pares (2,4): 70u
-         * Limite exterior (6m): 100u */
         uint8_t opa;
-        if (mm == 6000) opa = 100u;
+        if (mm == 6000)              opa = 100u;
         else if ((mm / 1000) % 2 == 0) opa = 70u;
-        else opa = 35u;
+        else                         opa = 35u;
 
         for (int dx = -r; dx <= r; dx++) {
             int dy2 = r*r - dx*dx;
@@ -494,18 +498,18 @@ static void _radar_redraw(void)
         }
     }
 
-    /* 4. Raios guia: ±30°, ±60°, centro (0°) */
+    /* 3. Raios guia: ±30°, ±60°, centro (0°) */
     const float guia_ang[] = {
-        -60.0f * 3.14159f/180.0f,
-        -30.0f * 3.14159f/180.0f,
+        -60.0f * 3.14159f / 180.0f,
+        -30.0f * 3.14159f / 180.0f,
          0.0f,
-         30.0f * 3.14159f/180.0f,
-         60.0f * 3.14159f/180.0f,
+         30.0f * 3.14159f / 180.0f,
+         60.0f * 3.14159f / 180.0f,
     };
     for (int ri = 0; ri < 5; ri++) {
-        float ang  = guia_ang[ri];
-        float fdx  = sinf(ang);
-        float fdy  = -cosf(ang);
+        float ang = guia_ang[ri];
+        float fdx = sinf(ang);
+        float fdy = -cosf(ang);
         uint8_t opa = (ri == 2) ? 70u : 35u;
         for (float t = 2.0f; t < (float)r_max; t += 1.0f) {
             int x = cx_s + (int)(t * fdx);
@@ -515,18 +519,19 @@ static void _radar_redraw(void)
         }
     }
 
-    /* 5. Linha de base do sensor */
+    /* 4. Linha de base do sensor */
     _linha_h_px(RADAR_H - 1, C_EIXO);
     _linha_h_px(RADAR_H - 2, lv_color_hex(0x0A1A0A));
 
-    /* 6. Sweep animado polar (0°=esq → 180°=dir) */
+    /* 5. Sweep animado polar (estética radar) */
     static uint16_t s_sweep_tick = 0;
     s_sweep_tick = (uint16_t)((s_sweep_tick + 2u) % 180u);
 
-    float sw_s   = ((float)s_sweep_tick * 3.14159f / 180.0f)- 3.14159f / 2.0f;
-    float sw_dx  = sinf(sw_s);
-    float sw_dy  = -cosf(sw_s);
+    float sw_s  = ((float)s_sweep_tick * 3.14159f / 180.0f) - 3.14159f / 2.0f;
+    float sw_dx = sinf(sw_s);
+    float sw_dy = -cosf(sw_s);
 
+    /* Rastilho de fade do sweep */
     for (int back = 1; back <= 30; back++) {
         int   bd   = ((int)s_sweep_tick - back + 360) % 180;
         float bd_s = ((float)bd * 3.14159f / 180.0f) - 3.14159f / 2.0f;
@@ -541,6 +546,7 @@ static void _radar_redraw(void)
             _px_blend(x, y, C_SWEEP, fa);
         }
     }
+    /* Linha principal do sweep */
     for (float t = 2.0f; t < (float)r_max; t += 1.0f) {
         int x = cx_s + (int)(t * sw_dx);
         int y = cy_s + (int)(t * sw_dy);
@@ -550,34 +556,33 @@ static void _radar_redraw(void)
         _px_blend(x, y, C_SWEEP, fade);
     }
 
-    /* 7 + 8 + 9 + 10. Alvos */
-    for (int i = 0; i < RADAR_MAX_OBJ; i++)
-    {
-        radar_interp_t *obj = &s_interp[i];
-        if (!obj->activo) continue;
+    /* 6. Alvos — posições REAIS do tracking_manager */
+    for (int i = 0; i < RADAR_MAX_OBJ; i++) {
+        dm_alvo_t *alvo = &s_alvos[i];
+        if (!alvo->activo) continue;
 
         lv_color_t C_ALV    = lv_color_hex(COR_ALVO[i]);
         lv_color_t C_ALV_HL = lv_color_hex(COR_ALVO_HL[i]);
 
+        /* Converte posição real para pixel */
         lv_coord_t px, py;
-        _radar_mm_to_px((int)obj->x_mm, (int)obj->y_mm, &px, &py);
+        _radar_mm_to_px((int)alvo->x_mm, (int)alvo->y_mm, &px, &py);
 
-        /* 7. Rasto — lê buffer circular do mais antigo para o mais recente */
-        if (obj->trail_len > 0)
-        {
-            int len = obj->trail_len;
-            for (int t = 0; t < len; t++)
-            {
-                /* Índice do ponto: head aponta para o próximo a escrever,
-                 * (head - 1) é o mais recente, (head - len) é o mais antigo */
-                int idx = ((int)obj->trail_head - len + t
+        /* 6a. Rasto — posições reais anteriores (do mais antigo ao mais recente) */
+        if (alvo->trail_len > 0) {
+            int len = alvo->trail_len;
+            for (int t = 0; t < len; t++) {
+                /* O buffer circular: head aponta para próxima escrita.
+                   (head - len + t) = ponto mais antigo + t */
+                int idx = ((int)alvo->trail_head - len + t
                            + RADAR_TRAIL_MAX) % RADAR_TRAIL_MAX;
                 lv_coord_t tx, ty;
-                _radar_mm_to_px((int)obj->trail_x[idx],
-                                (int)obj->trail_y[idx],
-                                &tx, &ty);
+                _radar_mm_to_px((int)alvo->trail_x[idx],
+                                (int)alvo->trail_y[idx], &tx, &ty);
+                /* Raio e alpha crescem do mais antigo para o mais recente */
                 int     r_tr = 1 + (t * 2) / (len + 1);
-                uint8_t a_tr = (uint8_t)(20u + (uint32_t)t * 80u / (uint32_t)(len + 1));
+                uint8_t a_tr = (uint8_t)(20u + (uint32_t)t * 80u /
+                                         (uint32_t)(len + 1));
                 lv_color_t c_tr = lv_color_make(
                     (uint8_t)((uint32_t)RASTO_R[i] * a_tr >> 8),
                     (uint8_t)((uint32_t)RASTO_G[i] * a_tr >> 8),
@@ -586,69 +591,138 @@ static void _radar_redraw(void)
             }
         }
 
-        /* 8. Halo duplo */
+        /* 6b. Halo duplo em torno do ponto */
         _halo_px((int)px, (int)py, 5, 10, C_ALV, 50u);
         _halo_px((int)px, (int)py, 3,  6, C_ALV, 90u);
 
-        /* 9. Ponto principal */
+        /* 6c. Ponto principal */
         _circulo_px((int)px, (int)py, 3, C_ALV);
         _px_blend((int)px - 1, (int)py - 1, C_ALV_HL, 210u);
         _px_blend((int)px,     (int)py - 1, C_ALV_HL, 160u);
         _px_blend((int)px - 1, (int)py,     C_ALV_HL, 110u);
 
-        /* 10. Label de velocidade
-         * CORRECÇÃO 3: clamp vertical completo */
-        if (fabsf(obj->speed_kmh) > 0.5f)
-        {
-            int v     = (int)(fabsf(obj->speed_kmh) + 0.5f);
+        /* 6d. Label de velocidade junto ao ponto */
+        if (fabsf(alvo->speed_kmh) > 0.5f) {
+            int v     = (int)(fabsf(alvo->speed_kmh) + 0.5f);
             int n_dig = (v >= 100) ? 3 : (v >= 10 ? 2 : 1);
             int lbl_w = (n_dig + 4) * 5;
             int lx    = (int)px + 12;
             int ly    = (int)py - 10;
 
+            /* Clamp para não sair do canvas */
             if (lx + lbl_w > RADAR_W - 2) lx = (int)px - lbl_w - 4;
             if (lx < 1)                   lx = 1;
             if (ly < 1)                   ly = 1;
-            if (ly > RADAR_H - 8)         ly = RADAR_H - 8; /* CORRECÇÃO 3 */
+            if (ly > RADAR_H - 8)         ly = RADAR_H - 8;
 
-            _vel_label_px(lx, ly, obj->speed_kmh,lv_color_hex(COR_ALVO[i]));
+            _vel_label_px(lx, ly, alvo->speed_kmh, lv_color_hex(COR_ALVO[i]));
         }
     }
 
-    /* 11. Ponto do sensor — verde vivo, centro da base */
+    /* 7. Ponto do sensor — centro verde da base */
     _halo_px(cx_s, cy_s, 4, 9, C_VRD, 55u);
     _circulo_px(cx_s, cy_s, 3, C_VRD);
     _px_blend(cx_s - 1, cy_s - 1, C_VRD_HL, 210u);
     _px_blend(cx_s,     cy_s - 1, C_VRD_HL, 150u);
 
+    /* 8. Indicador de tráfego em trânsito
+       ─────────────────────────────────────────────────────────
+       Quando há veículos contabilizados (T ou Tc > 0) mas o
+       radar local não vê nenhum objecto no canvas, mostra
+       indicadores visuais nas bordas do canvas:
+
+       T > 0 sem objecto visível:
+         Seta amarela no canto DIREITO do canvas → o objecto
+         saiu deste poste e está a caminho do seguinte.
+         A luz deste poste mantém-se acesa (T=1) até o poste
+         seguinte confirmar a chegada.
+
+       Tc > 0 sem objecto visível:
+         Seta ciano no canto ESQUERDO do canvas → há um objecto
+         a caminho deste poste, anunciado via UDP pelo anterior.
+
+       Quando há objectos visíveis no canvas, os indicadores
+       não são necessários — o objecto fala por si.
+    ────────────────────────────────────────────────────────── */
+    {
+        /* Conta alvos actualmente visíveis no canvas */
+        int alvos_visiveis = 0;
+        for (int i = 0; i < RADAR_MAX_OBJ; i++)
+            if (s_alvos[i].activo) alvos_visiveis++;
+
+        /* Tick de piscar — alterna a cada ~10 frames (200ms a 50Hz) */
+        static uint16_t s_blink_tick = 0;
+        s_blink_tick++;
+        bool blink_on = (s_blink_tick % 20) < 10;  /* 50% duty cycle */
+
+        /* T > 0 e sem objecto visível → seta amarela à direita
+           Indica: objecto saiu, está entre este poste e o seguinte */
+        if (s_T_actual > 0 && alvos_visiveis == 0 && blink_on) {
+            lv_color_t C_T = lv_color_hex(0xFF8C00);  /* Amarelo */
+            /* Seta a apontar para a direita (→) na borda direita */
+            int sx = RADAR_W - 8;
+            int sy = RADAR_H / 2;
+            /* Corpo da seta */
+            for (int i = -3; i <= 3; i++)
+                _px_blend(sx - 6 + i, sy, C_T, 200u);
+            /* Ponta da seta */
+            _px_blend(sx, sy - 1, C_T, 200u);
+            _px_blend(sx, sy + 1, C_T, 200u);
+            _px_blend(sx - 1, sy - 2, C_T, 160u);
+            _px_blend(sx - 1, sy + 2, C_T, 160u);
+            /* Label "T" em bitmap */
+            char t_str[4];
+            snprintf(t_str, sizeof(t_str), "%d", s_T_actual);
+            int digit = t_str[0] - '0';
+            if (digit >= 0 && digit <= 9)
+                _glifo_px(sx - 14, sy - 3, digit, C_T);
+        }
+
+        /* Tc > 0 e sem objecto visível → seta ciano à esquerda
+           Indica: objecto a caminho deste poste, anunciado via UDP */
+        if (s_Tc_actual > 0 && alvos_visiveis == 0 && blink_on) {
+            lv_color_t C_Tc = lv_color_hex(0x00D4FF);  /* Ciano */
+            /* Seta a apontar para a direita (→) na borda esquerda
+               (vem da esquerda, entra pela esquerda do canvas) */
+            int sx = 8;
+            int sy = RADAR_H / 2;
+            /* Corpo da seta */
+            for (int i = -3; i <= 3; i++)
+                _px_blend(sx + i, sy, C_Tc, 200u);
+            /* Ponta da seta */
+            _px_blend(sx + 4, sy - 1, C_Tc, 200u);
+            _px_blend(sx + 4, sy + 1, C_Tc, 200u);
+            _px_blend(sx + 5, sy - 2, C_Tc, 160u);
+            _px_blend(sx + 5, sy + 2, C_Tc, 160u);
+            /* Label "Tc" */
+            char tc_str[4];
+            snprintf(tc_str, sizeof(tc_str), "%d", s_Tc_actual);
+            int digit = tc_str[0] - '0';
+            if (digit >= 0 && digit <= 9)
+                _glifo_px(sx + 8, sy - 3, digit, C_Tc);
+        }
+    }
+
     lv_obj_invalidate(canvas_radar);
 }
 
+
 /* ============================================================
-   ui_create
+   ui_create — constrói a interface LVGL
+   ──────────────────────────────────────────────────────────
+   Layout fixo de 4 zonas verticais:
+     IDENTIDADE (0-35) | HARDWARE (37-92) | TRÁFEGO (94-145) | RADAR (147-239)
 ============================================================ */
 static void ui_create(void)
 {
-
-
     lv_obj_t *scr = lv_scr_act();
     lv_obj_set_style_bg_color(scr, lv_color_hex(COR_PRETO), LV_PART_MAIN);
     lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, LV_PART_MAIN);
 
-    /* ----------------------------------------------------------
-       ZONA IDENTIDADE (y: 0..35)
-       ----------------------------------------------------------
-       Linha 1 (y=3)  : "Poste Inteligente" — subtítulo fixo
-       Linha 2 (y=15) : nome do poste (ex: "↑ POSTE-A") — lido da NVS
-       Badge (dir)    : estado FSM (IDLE / MASTER / LIGHT ON / ...)
-                        Cor do badge muda com o estado em _task().
-    ---------------------------------------------------------- */
-    
-
+    /* ── ZONA IDENTIDADE (y: 0..35) ─────────────────────────── */
+    /* Nome do poste e badge de estado FSM */
     label_nome = lv_label_create(scr);
-    //lv_label_set_text_fmt(label_nome, LV_SYMBOL_UP " %s", post_get_name());
     lv_label_set_text_fmt(label_nome, "> %s", post_get_name());
-
     lv_obj_set_style_text_color(label_nome, lv_color_hex(COR_BRANCO), 0);
     lv_obj_set_style_text_font(label_nome, &lv_font_montserrat_14, 0);
     lv_obj_align(label_nome, LV_ALIGN_TOP_LEFT, 8, 15);
@@ -669,92 +743,51 @@ static void ui_create(void)
 
     _separador(scr, 36);
 
-    /* ----------------------------------------------------------
-       ZONA HARDWARE (y: 37..92)
-       ----------------------------------------------------------
-       Linha 1 (y=39): WiFi (esq) + estado Radar (dir)
-                        WiFi: "WiFi: 192.168.1.X" verde se ligado
-                               "WiFi: OFF" vermelho se desligado
-                        Radar: "Radar: REAL" verde | "FAIL" vermelho
-                                              | "SIM" cinzento
+    /* ── ZONA HARDWARE (y: 37..92) ──────────────────────────── */
+    /* WiFi, estado radar, vizinhos, barra DALI */
+    label_wifi     = _label_novo(scr,   8, 39, COR_CINZENTO, "WiFi: ---");
+    label_radar_st = _label_novo(scr, 130, 39, COR_CINZENTO, "Radar: ---");
 
-       Linha 2 (y=57): vizinhos UDP esquerdo (Esq) e direito (Dir)
-                        Separador vertical ao centro (x=120)
-                        "E: 192.168.1.X OK"  → verde se online
-                        "E: ---  OFF"        → vermelho se offline
-                        Idem para o vizinho direito.
-
-       Linha 3 (y=76): brilho DALI actual
-                        Label "DALI: XX%" + barra horizontal 88px
-    ---------------------------------------------------------- */
-    label_wifi     = _label_novo(scr, 8,   39, COR_VERMELHO,   "WiFi: OFF");
-    label_radar_st = _label_novo(scr, 140, 39, COR_CINZENTO,   "Radar: ---");
-    label_neb_esq  = _label_novo(scr, 8,   57, COR_CINZ_CLARO, "Esq: ---");
-
+    /* Linha de vizinhos */
     lv_obj_t *div_neb = lv_obj_create(scr);
-    lv_obj_set_size(div_neb, 1, 12);
-    lv_obj_set_pos(div_neb, LCD_H_RES / 2, 59);
-    lv_obj_set_style_bg_color(div_neb, lv_color_hex(COR_SEPARADOR), 0);
-    lv_obj_set_style_bg_opa(div_neb, LV_OPA_COVER, 0);
+    lv_obj_set_size(div_neb, LCD_H_RES - 16, 16);
+    lv_obj_set_pos(div_neb, 8, 55);
+    lv_obj_set_style_bg_opa(div_neb, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(div_neb, 0, 0);
     lv_obj_set_style_pad_all(div_neb, 0, 0);
 
-    label_neb_dir = _label_novo(scr, LCD_H_RES/2+4, 57,COR_CINZ_CLARO, "Dir: ---");
-    label_dali    = _label_novo(scr, 8, 76, COR_CINZENTO, "DALI:  0%");
+    label_neb_esq = _label_novo(scr,   8, 57, COR_CINZ_CLARO, "E: ---");
+    label_neb_dir = _label_novo(scr, LCD_H_RES/2+4, 57, COR_CINZ_CLARO, "D: ---");
+    label_dali    = _label_novo(scr,   8, 76, COR_CINZENTO,   "DALI:  0%");
 
+    /* Barra de brilho DALI */
     bar_dali = lv_bar_create(scr);
     lv_obj_set_size(bar_dali, 88, 7);
     lv_obj_set_pos(bar_dali, 144, 78);
     lv_bar_set_range(bar_dali, 0, 100);
     lv_bar_set_value(bar_dali, 0, LV_ANIM_OFF);
     lv_obj_set_style_bg_color(bar_dali, lv_color_hex(0x2A2A2A), LV_PART_MAIN);
-    lv_obj_set_style_bg_color(bar_dali, lv_color_hex(COR_AMARELO),LV_PART_INDICATOR);
+    lv_obj_set_style_bg_color(bar_dali, lv_color_hex(COR_AMARELO), LV_PART_INDICATOR);
     lv_obj_set_style_radius(bar_dali, 3, LV_PART_MAIN);
     lv_obj_set_style_radius(bar_dali, 3, LV_PART_INDICATOR);
 
     _separador(scr, 93);
 
-    /* ----------------------------------------------------------
-       ZONA TRÁFEGO (y: 94..145)
-       ----------------------------------------------------------
-       3 cards horizontais de largura igual (CW=70px, CH=46px):
-         Card 0 (x=5)   — T   : veículos presentes neste poste
-                                 Cor: AMARELO quando T>0
-         Card 1 (x=80)  — Tc  : veículos a caminho (anunciados via UDP)
-                                 Cor: CIANO quando Tc>0
-         Card 2 (x=155) — km/h: última velocidade detectada
-                                 Cor: VIOLETA quando speed>0
-
-       Layout interno de cada card (v5.7):
-         ┌──────────────────────┐
-         │  TÍTULO  (header 14px, cor tenue)                  │
-         │                                                     │
-         │         VALOR  (Montserrat 18, centrado)            │
-         │        unidade (Montserrat 10, cor cinza, baixo)    │
-         └──────────────────────┘
-
-       Objectivo: o card é autónomo — não é necessário olhar
-       para fora dele para perceber o que o número significa.
-    ---------------------------------------------------------- */
-    //const int CW  = 70, CH = 46, CY = 95, GAP = 5, CX0 = 5;
+    /* ── ZONA TRÁFEGO (y: 94..145) ──────────────────────────── */
+    /* 3 cards: T (aqui), Tc (a caminho), km/h (velocidade) */
     const int CW  = 70, CH = 56, CY = 95, GAP = 5, CX0 = 5;
     const int CX1 = CX0 + CW + GAP;
     const int CX2 = CX1 + CW + GAP;
 
-    /* Cores temáticas por card */
-    const uint32_t COR_CARD[3]    = {COR_AMARELO, COR_CIANO, COR_VIOLETA};
-    /* Título curto no header do card */
-    //const char *TITULO_CARD[3]    = {"T  aqui", "Tc  vem", "velocidade"};
-    const char *TITULO_CARD[3] = {"T", "Tc", "km/h"};
-    /* Unidade pequena por baixo do valor numérico */
-    const char *UNIDADE_CARD[3]   = {"carros", "carros", "km/h"};
-    const int   CX_ARR[3]         = {CX0, CX1, CX2};
-    lv_obj_t  **VAL_LABELS[3]     = {&label_T_val, &label_Tc_val, &label_vel_val};
-    lv_obj_t  **CARDS[3]          = {&card_T, &card_Tc, &card_vel};
+    const uint32_t COR_CARD[3]  = {COR_AMARELO, COR_CIANO, COR_VIOLETA};
+    const char *TITULO_CARD[3]  = {"T", "Tc", "km/h"};
+    const char *UNIDADE_CARD[3] = {"carros", "carros", "km/h"};
+    const int   CX_ARR[3]       = {CX0, CX1, CX2};
+    lv_obj_t  **VAL_LABELS[3]   = {&label_T_val, &label_Tc_val, &label_vel_val};
+    lv_obj_t  **CARDS[3]        = {&card_T, &card_Tc, &card_vel};
 
     for (int i = 0; i < 3; i++) {
-
-        /* --- Corpo do card --- */
+        /* Corpo do card */
         lv_obj_t *card = lv_obj_create(scr);
         lv_obj_set_size(card, CW, CH);
         lv_obj_set_pos(card, CX_ARR[i], CY);
@@ -767,92 +800,61 @@ static void ui_create(void)
         lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
         *CARDS[i] = card;
 
-        /* --- Header colorido com título do card --- */
+        /* Header colorido */
         lv_obj_t *hdr = lv_obj_create(card);
         lv_obj_set_size(hdr, CW, 14);
         lv_obj_set_pos(hdr, 0, 0);
         lv_obj_set_style_bg_color(hdr, lv_color_hex(COR_CARD[i]), 0);
-        lv_obj_set_style_bg_opa(hdr, 45, 0);  /* tênue — não ofusca o valor */
+        lv_obj_set_style_bg_opa(hdr, 45, 0);
         lv_obj_set_style_radius(hdr, 0, 0);
         lv_obj_set_style_border_width(hdr, 0, 0);
         lv_obj_set_style_pad_all(hdr, 0, 0);
 
-        /* Título do card centrado no header */
         lv_obj_t *lbl_tit = lv_label_create(hdr);
         lv_label_set_text(lbl_tit, TITULO_CARD[i]);
         lv_obj_set_style_text_font(lbl_tit, &lv_font_montserrat_14, 0);
         lv_obj_set_style_text_color(lbl_tit, lv_color_hex(COR_CARD[i]), 0);
         lv_obj_center(lbl_tit);
 
-        /* --- Valor numérico grande — zona central do card --- */
-        /* Posicionado manualmente: y=15 (logo abaixo do header de 14px)
-         * centrado em X. Usa Montserrat 18 para máxima legibilidade. */
+        /* Valor numérico grande */
         *VAL_LABELS[i] = lv_label_create(card);
         lv_label_set_text(*VAL_LABELS[i], "0");
-        lv_obj_set_style_text_color(*VAL_LABELS[i],lv_color_hex(COR_CINZENTO), 0);
-        lv_obj_set_style_text_font(*VAL_LABELS[i],&lv_font_montserrat_14, 0);
-        /* Alinha o valor no centro horizontal, a 15px do topo do card
-         * (imediatamente abaixo do header). y_ofs=-3 afasta da base. */
-        //lv_obj_align(*VAL_LABELS[i], LV_ALIGN_CENTER, 0, 4);
+        lv_obj_set_style_text_color(*VAL_LABELS[i], lv_color_hex(COR_CINZENTO), 0);
+        lv_obj_set_style_text_font(*VAL_LABELS[i], &lv_font_montserrat_14, 0);
         lv_obj_align(*VAL_LABELS[i], LV_ALIGN_TOP_MID, 0, 18);
 
-        /* --- Unidade pequena na base do card --- */
-        /* Identifica inequivocamente o que o número representa:
-         *   card T    → "carros"
-         *   card Tc   → "carros"
-         *   card vel  → "km/h"
-         * Cor: cinzento claro para não competir com o valor.     */
+        /* Unidade por baixo */
         lv_obj_t *lbl_unit = lv_label_create(card);
         lv_label_set_text(lbl_unit, UNIDADE_CARD[i]);
         lv_obj_set_style_text_font(lbl_unit, &lv_font_montserrat_14, 0);
-        lv_obj_set_style_text_color(lbl_unit,lv_color_hex(COR_CINZ_CLARO), 0);
+        lv_obj_set_style_text_color(lbl_unit, lv_color_hex(COR_CINZ_CLARO), 0);
         lv_obj_align(lbl_unit, LV_ALIGN_BOTTOM_MID, 0, -3);
     }
 
     _separador(scr, 146);
 
-    /* ----------------------------------------------------------
-       ZONA RADAR (y: 147..239)
-       ----------------------------------------------------------
-       Título (y=148)  : "HLK-LD2450  radar" — identificação
-                          do sensor em cinzento tênue.
-
-       Canvas (y=149)  : 230×90 px — representação polar
-                          do campo de visão do radar (8m raio).
-                          Redesenhado a 50 Hz pela main_task
-                          via _radar_redraw() → interpolação suave.
-
-       Elementos visuais no canvas:
-         - Arcos semicirculares: 2m / 4m / 6m de distância
-         - Raios guia: ±30°, ±60° e centro (0°)
-         - Sweep animado: linha verde giratória (estética radar)
-         - Alvos activos: até 3 pontos coloridos com rasto
-           (vermelho=alvo 0, ciano=alvo 1, amarelo=alvo 2)
-         - Label de velocidade bitmap 4×6 junto a cada alvo
-         - Ponto verde no centro da base = posição do sensor
-
-       Alimentado por:
-         display_manager_set_radar() → fila → _interp_aplicar_frame()
-         → _radar_redraw() a cada 20ms (interpolação preditiva).
-    ---------------------------------------------------------- */
+    /* ── ZONA RADAR (y: 147..239) ───────────────────────────── */
+    /* Canvas 230×90px — representação polar do sensor HLK-LD2450 */
     lv_obj_t *lbl_radar_tit = lv_label_create(scr);
     lv_label_set_text(lbl_radar_tit, "HLK-LD2450  radar");
-    lv_obj_set_style_text_color(lbl_radar_tit,lv_color_hex(COR_SEPARADOR), 0);
+    lv_obj_set_style_text_color(lbl_radar_tit, lv_color_hex(COR_SEPARADOR), 0);
     lv_obj_set_style_text_font(lbl_radar_tit, &lv_font_montserrat_14, 0);
     lv_obj_set_pos(lbl_radar_tit, RADAR_X_OFF, 148);
 
     canvas_radar = lv_canvas_create(scr);
-    lv_canvas_set_buffer(canvas_radar, radar_buf,RADAR_W, RADAR_H,LV_IMG_CF_TRUE_COLOR);
+    lv_canvas_set_buffer(canvas_radar, radar_buf,
+                         RADAR_W, RADAR_H, LV_IMG_CF_TRUE_COLOR);
     lv_obj_set_pos(canvas_radar, RADAR_X_OFF, RADAR_Y_OFF);
-    lv_obj_set_style_border_color(canvas_radar,lv_color_hex(COR_SEPARADOR), 0);
+    lv_obj_set_style_border_color(canvas_radar, lv_color_hex(COR_SEPARADOR), 0);
     lv_obj_set_style_border_width(canvas_radar, 1, 0);
     lv_obj_set_style_radius(canvas_radar, 3, 0);
 
     _radar_redraw();
 
-    ESP_LOGI(TAG, "Interface v5.6 criada | ID=%d | Nome=%s",
+    ESP_LOGI(TAG, "Interface v6.0 criada | ID=%d | %s",
              post_get_id(), post_get_name());
 }
+
 
 /* ============================================================
    API PÚBLICA — CICLO DE VIDA
@@ -860,7 +862,7 @@ static void ui_create(void)
 
 void display_manager_init(void)
 {
-    ESP_LOGI(TAG, "A inicializar display v5.7 | ID=%d | %s",
+    ESP_LOGI(TAG, "A inicializar display v6.0 | ID=%d | %s",
              post_get_id(), post_get_name());
 
     st7789_init();
@@ -878,10 +880,10 @@ void display_manager_init(void)
     disp_drv.draw_buf = &draw_buf;
     lv_disp_drv_register(&disp_drv);
 
-    memset(s_radar_objs, 0, sizeof(s_radar_objs));
-    memset(s_interp,     0, sizeof(s_interp));
-    s_radar_count      = 0;
-    s_ultimo_interp_ms = 0;
+    /* Inicializa estado dos alvos e contadores de tráfego a zero */
+    memset(s_alvos, 0, sizeof(s_alvos));
+    s_T_actual  = 0;
+    s_Tc_actual = 0;
 
     s_fila = xQueueCreate(DM_FILA_CAP, sizeof(dm_msg_t));
     if (!s_fila)
@@ -889,7 +891,7 @@ void display_manager_init(void)
 
     ui_create();
 
-    ESP_LOGI(TAG, "Display v5.6 pronto | tracking por proximidade activo");
+    ESP_LOGI(TAG, "Display v6.0 pronto | posições reais activas");
 }
 
 void display_manager_tick(uint32_t ms)
@@ -897,32 +899,30 @@ void display_manager_tick(uint32_t ms)
     lv_tick_inc(ms);
 }
 
+
 /* ============================================================
-   display_manager_reset_radar — CORRECÇÃO 4
-   ------------------------------------------------------------
-   Limpa todo o estado de interpolação do radar.
-   Chamar quando o radar reinicia ou perde tracking total.
-   Thread-safe: s_interp é lido/escrito apenas na main_task
-   (via display_manager_task).
+   display_manager_reset_radar — limpa estado dos alvos
+   Chamar quando radar reinicia ou perde tracking total.
+   Thread-safe: s_alvos é lido/escrito apenas na display_task.
 ============================================================ */
 void display_manager_reset_radar(void)
 {
-    memset(s_interp, 0, sizeof(s_interp));
-    s_radar_count      = 0;
-    s_ultimo_interp_ms = 0;
+    memset(s_alvos, 0, sizeof(s_alvos));
+    s_T_actual  = 0;
+    s_Tc_actual = 0;
     ESP_LOGI(TAG, "Estado radar limpo");
 }
 
+
 /* ============================================================
-   display_manager_task
-   ------------------------------------------------------------
+   display_manager_task — loop de render (20ms / 50Hz)
+   ──────────────────────────────────────────────────────────
    ÚNICA função que toca em objectos LVGL.
-   Chama _radar_redraw() a cada ciclo (20ms) para interpolação
-   suave mesmo sem novos frames do sensor.
+   Drena fila de mensagens, redesenha canvas e chama
+   lv_timer_handler(). Chamada exclusivamente pela display_task.
 ============================================================ */
 void display_manager_task(void)
 {
-    // 1. Proteção inicial
     if (!s_fila) {
         lv_timer_handler();
         return;
@@ -930,17 +930,13 @@ void display_manager_task(void)
 
     dm_msg_t msg;
     int msg_count = 0;
-    
-    /* * 2. Limita o processamento a 5 mensagens por ciclo.
-     * Isto garante que a tarefa IDLE (Watchdog) e o lv_timer_handler 
-     * tenham tempo de correr, mesmo que a fila esteja a inundar.
-     */
-    while (xQueueReceive(s_fila, &msg, 0) == pdTRUE && msg_count < 5)
-    {
+
+    /* Processa até 5 mensagens por ciclo para não bloquear o render */
+    while (xQueueReceive(s_fila, &msg, 0) == pdTRUE && msg_count < 5) {
         msg_count++;
 
-        switch (msg.tipo)
-        {
+        switch (msg.tipo) {
+
             case DM_MSG_STATUS:
                 if (!label_badge) break;
                 lv_label_set_text(label_badge, msg.st.status);
@@ -950,13 +946,13 @@ void display_manager_task(void)
                     uint32_t cor_brd = COR_SEPARADOR;
                     const char *s = msg.st.status;
                     if      (strcmp(s, "LIGHT ON")  == 0) {
-                        cor_txt=COR_AMARELO; cor_bg=0x1E1600; cor_brd=0x3A2A00;
+                        cor_txt = COR_AMARELO; cor_bg = 0x1E1600; cor_brd = 0x3A2A00;
                     } else if (strcmp(s, "SAFE MODE") == 0) {
-                        cor_txt=COR_LARANJA; cor_bg=0x1E0E00; cor_brd=0x3A1A00;
+                        cor_txt = COR_LARANJA; cor_bg = 0x1E0E00; cor_brd = 0x3A1A00;
                     } else if (strcmp(s, "MASTER")    == 0) {
-                        cor_txt=COR_VERDE;   cor_bg=0x001A08; cor_brd=0x003A10;
+                        cor_txt = COR_VERDE;   cor_bg = 0x001A08; cor_brd = 0x003A10;
                     } else if (strcmp(s, "AUTONOMO")  == 0) {
-                        cor_txt=COR_VERMELHO;cor_bg=0x1A0000; cor_brd=0x3A0000;
+                        cor_txt = COR_VERMELHO; cor_bg = 0x1A0000; cor_brd = 0x3A0000;
                     }
                     lv_obj_set_style_text_color(label_badge, lv_color_hex(cor_txt), 0);
                     lv_obj_set_style_bg_color(label_badge, lv_color_hex(cor_bg), 0);
@@ -968,43 +964,46 @@ void display_manager_task(void)
                 if (!label_wifi) break;
                 if (msg.wifi.connected) {
                     char buf[36];
-                    snprintf(buf, sizeof(buf), "WiFi: %s", msg.wifi.ip[0] ? msg.wifi.ip : "---");
+                    snprintf(buf, sizeof(buf), "WiFi: %s",
+                             msg.wifi.ip[0] ? msg.wifi.ip : "---");
                     lv_label_set_text(label_wifi, buf);
-                    lv_obj_set_style_text_color(label_wifi, lv_color_hex(COR_VERDE), 0);
+                    lv_obj_set_style_text_color(label_wifi,
+                        lv_color_hex(COR_VERDE), 0);
                 } else {
                     lv_label_set_text(label_wifi, "WiFi: OFF");
-                    lv_obj_set_style_text_color(label_wifi, lv_color_hex(COR_VERMELHO), 0);
+                    lv_obj_set_style_text_color(label_wifi,
+                        lv_color_hex(COR_VERMELHO), 0);
                 }
                 break;
 
             case DM_MSG_NEIGHBORS:
-                    if (label_neb_esq) {
-                        char buf[32];
-                        if (msg.neb.nebL[0] && strcmp(msg.neb.nebL, "---") != 0) {
-                            snprintf(buf, sizeof(buf), "E: %s", msg.neb.nebL);
-                            lv_obj_set_style_text_color(label_neb_esq,
-                                lv_color_hex(msg.neb.leftOk ? COR_VERDE : COR_VERMELHO), 0);
-                        } else {
-                            snprintf(buf, sizeof(buf), "E: ---");
-                            lv_obj_set_style_text_color(label_neb_esq,
-                                lv_color_hex(COR_CINZ_CLARO), 0);
-                        }
-                        lv_label_set_text(label_neb_esq, buf);
+                if (label_neb_esq) {
+                    char buf[32];
+                    if (msg.neb.nebL[0] && strcmp(msg.neb.nebL, "---") != 0) {
+                        snprintf(buf, sizeof(buf), "E: %s", msg.neb.nebL);
+                        lv_obj_set_style_text_color(label_neb_esq,
+                            lv_color_hex(msg.neb.leftOk ? COR_VERDE : COR_VERMELHO), 0);
+                    } else {
+                        snprintf(buf, sizeof(buf), "E: ---");
+                        lv_obj_set_style_text_color(label_neb_esq,
+                            lv_color_hex(COR_CINZ_CLARO), 0);
                     }
-                    if (label_neb_dir) {
-                        char buf[32];
-                        if (msg.neb.nebR[0] && strcmp(msg.neb.nebR, "---") != 0) {
-                            snprintf(buf, sizeof(buf), "D: %s", msg.neb.nebR);
-                            lv_obj_set_style_text_color(label_neb_dir,
-                                lv_color_hex(msg.neb.rightOk ? COR_VERDE : COR_VERMELHO), 0);
-                        } else {
-                            snprintf(buf, sizeof(buf), "D: ---");
-                            lv_obj_set_style_text_color(label_neb_dir,
-                                lv_color_hex(COR_CINZ_CLARO), 0);
-                        }
-                        lv_label_set_text(label_neb_dir, buf);
+                    lv_label_set_text(label_neb_esq, buf);
+                }
+                if (label_neb_dir) {
+                    char buf[32];
+                    if (msg.neb.nebR[0] && strcmp(msg.neb.nebR, "---") != 0) {
+                        snprintf(buf, sizeof(buf), "D: %s", msg.neb.nebR);
+                        lv_obj_set_style_text_color(label_neb_dir,
+                            lv_color_hex(msg.neb.rightOk ? COR_VERDE : COR_VERMELHO), 0);
+                    } else {
+                        snprintf(buf, sizeof(buf), "D: ---");
+                        lv_obj_set_style_text_color(label_neb_dir,
+                            lv_color_hex(COR_CINZ_CLARO), 0);
                     }
-                    break;
+                    lv_label_set_text(label_neb_dir, buf);
+                }
+                break;
 
             case DM_MSG_HARDWARE:
                 if (label_radar_st) {
@@ -1014,31 +1013,37 @@ void display_manager_task(void)
                     uint32_t cor = COR_VERMELHO;
                     if (msg.hw.radar_ok)
                         cor = (msg.hw.radar_st[0] == 'S') ? 0xFFAA00 : COR_VERDE;
-                    lv_obj_set_style_text_color(label_radar_st, lv_color_hex(cor), 0);
+                    lv_obj_set_style_text_color(label_radar_st,
+                        lv_color_hex(cor), 0);
                 }
                 if (label_dali) {
                     char buf[14];
                     snprintf(buf, sizeof(buf), "DALI: %3d%%", msg.hw.brightness);
                     lv_label_set_text(label_dali, buf);
-                    lv_obj_set_style_text_color(label_dali, 
-                        lv_color_hex(msg.hw.brightness > 10 ? COR_AMARELO : COR_CINZENTO), 0);
+                    lv_obj_set_style_text_color(label_dali,
+                        lv_color_hex(msg.hw.brightness > 10
+                                     ? COR_AMARELO : COR_CINZENTO), 0);
                 }
-                if (bar_dali) lv_bar_set_value(bar_dali, (int)msg.hw.brightness, LV_ANIM_ON);
+                if (bar_dali)
+                    lv_bar_set_value(bar_dali, (int)msg.hw.brightness, LV_ANIM_ON);
                 break;
 
             case DM_MSG_TRAFFIC:
+                /* Guarda T e Tc para o indicador de trânsito no canvas */
+                s_T_actual  = msg.traf.T;
+                s_Tc_actual = msg.traf.Tc;
                 if (label_T_val) {
                     char buf[8];
                     snprintf(buf, sizeof(buf), "%d", msg.traf.T);
                     lv_label_set_text(label_T_val, buf);
-                    lv_obj_set_style_text_color(label_T_val, 
+                    lv_obj_set_style_text_color(label_T_val,
                         lv_color_hex(msg.traf.T > 0 ? COR_AMARELO : COR_CINZENTO), 0);
                 }
                 if (label_Tc_val) {
                     char buf[8];
                     snprintf(buf, sizeof(buf), "%d", msg.traf.Tc);
                     lv_label_set_text(label_Tc_val, buf);
-                    lv_obj_set_style_text_color(label_Tc_val, 
+                    lv_obj_set_style_text_color(label_Tc_val,
                         lv_color_hex(msg.traf.Tc > 0 ? COR_CIANO : COR_CINZENTO), 0);
                 }
                 break;
@@ -1048,37 +1053,42 @@ void display_manager_task(void)
                     char buf[8];
                     snprintf(buf, sizeof(buf), "%d", msg.spd.speed);
                     lv_label_set_text(label_vel_val, buf);
-                    lv_obj_set_style_text_color(label_vel_val, 
+                    lv_obj_set_style_text_color(label_vel_val,
                         lv_color_hex(msg.spd.speed > 0 ? COR_VIOLETA : COR_CINZENTO), 0);
                 }
-                
                 break;
 
-            case DM_MSG_RADAR: {
-                uint32_t agora = (uint32_t)(esp_timer_get_time() / 1000ULL);
+            case DM_MSG_RADAR:
+                /* Aplica frame REAL — sem simulação de posição */
                 if (msg.radar.count > 0) {
-                    s_radar_count = msg.radar.count;
-                    s_radar_last_ms = agora;
-                    memcpy(s_radar_objs, msg.radar.objs, msg.radar.count * sizeof(radar_obj_t));
-                    _interp_aplicar_frame();
+                    _radar_aplicar_frame(msg.radar.objs, msg.radar.count);
                 } else {
-                    s_radar_count = 0;
+                    /* count=0 → tracking não tem nenhum alvo activo neste ciclo.
+                       Limpa canvas imediatamente — sem esperar timeout.
+                       Evita que um obstáculo parado fique eternamente
+                       no ecrã quando outros veículos passam por cima. */
+                    for (int s = 0; s < RADAR_MAX_OBJ; s++) {
+                        s_alvos[s].activo    = false;
+                        s_alvos[s].trail_len = 0;
+                        s_alvos[s].trail_head = 0;
+                    }
                 }
                 break;
-            }
+
             default: break;
         }
     }
 
-    // 3. Redesenha o canvas da interpolação
+    /* Redesenha canvas com posições reais actuais */
     _radar_redraw();
 
-    // 4. Processa o motor gráfico (Desenho e Flush)
+    /* Processa motor gráfico LVGL */
     lv_timer_handler();
 
-    // 5. IMPORTANTE: Delay para ceder tempo ao CPU e evitar Watchdog
-    vTaskDelay(pdMS_TO_TICKS(10)); 
+    /* Cede tempo ao CPU — evita watchdog */
+    vTaskDelay(pdMS_TO_TICKS(10));
 }
+
 
 /* ============================================================
    API PÚBLICA — ACTUALIZAÇÃO DE ESTADO
@@ -1133,12 +1143,6 @@ void display_manager_set_traffic(int T, int Tc)
     xQueueSend(s_fila, &msg, 0);
 }
 
-/* ------------------------------------------------------------
-   display_manager_set_speed
-   Actualiza card km/h E velocidade dos alvos activos no
-   interpolador — garante que o movimento preditivo usa a
-   velocidade real detectada pela FSM.
------------------------------------------------------------- */
 void display_manager_set_speed(int speed)
 {
     if (!s_fila) return;
@@ -1147,10 +1151,8 @@ void display_manager_set_speed(int speed)
     xQueueSend(s_fila, &msg, 0);
 }
 
-void display_manager_set_neighbors(const char *nebL,
-                                   const char *nebR,
-                                   bool        leftOk,
-                                   bool        rightOk)
+void display_manager_set_neighbors(const char *nebL, const char *nebR,
+                                   bool leftOk, bool rightOk)
 {
     if (!s_fila) return;
     dm_msg_t msg = { .tipo = DM_MSG_NEIGHBORS };
@@ -1167,6 +1169,7 @@ void display_manager_set_neighbors(const char *nebL,
     xQueueSend(s_fila, &msg, 0);
 }
 
+/* Recebe posições reais do tracking_manager e coloca na fila */
 void display_manager_set_radar(const radar_obj_t *objs, uint8_t count)
 {
     if (!s_fila) return;
@@ -1174,8 +1177,8 @@ void display_manager_set_radar(const radar_obj_t *objs, uint8_t count)
     msg.radar.count = (count > RADAR_MAX_OBJ) ? RADAR_MAX_OBJ : count;
     if (objs && msg.radar.count > 0)
         memcpy(msg.radar.objs, objs, msg.radar.count * sizeof(radar_obj_t));
-    if (xQueueSend(s_fila, &msg, 0) != pdTRUE) {
-        /* Fila cheia — descarta frame silenciosamente.
-         * O interpolador continua com o último frame válido. */
-    }
+    /* Se fila cheia, descarta — o próximo frame real substitui */
+    xQueueSend(s_fila, &msg, 0);
 }
+
+
