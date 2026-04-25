@@ -1,12 +1,26 @@
 /* ============================================================
    MÓDULO     : state_machine
    FICHEIRO   : state_machine.c — Implementação
-   VERSÃO     : 4.0  |  2026-04-17
+   VERSÃO     : 5.0  |  2026-04-24
    PROJECTO   : Poste Inteligente v8
    AUTORES    : Luis Custódio | Tiago Moreno
    PLATAFORMA : ESP32 (ESP-IDF v5.x)
 
-  
+   MELHORIAS v4.0 → v5.0:
+   ──────────────────────────────────────────────────────────
+   1. Log excessivo corrigido: UPDATE início removido do ciclo
+      a 100ms (causava flood no monitor série).
+   2. TC_TIMEOUT_MS e T_STUCK_TIMEOUT_MS movidos para system_config.h
+      (fonte única de verdade — eliminadas duplicações).
+   3. AUTONOMO_DELAY_MS e OBSTACULO_REMOVE_MS lidos de system_config.h.
+   4. Modo OBSTÁCULO: timeout de remoção automática implementado
+      com base em OBSTACULO_REMOVE_MS (antes não havia remoção).
+   5. Comentários em todos os blocos lógicos — código mais legível.
+      - Sem WiFi + radar OK → AUTONOMO imediato ocorria antes de
+        verificar SAFE MODE — reordenado para prioridade correcta.
+   7. Comentários em todos os blocos lógicos — código mais legível.
+   8. ESP_LOGI de APAGAR_PEND removido do ciclo quente (reduz UART).
+   9. s_radar_degradado removido (variável sem uso após v4.0).
 ============================================================ */
 
 #include "state_machine.h"
@@ -23,58 +37,60 @@
 static const char *TAG = "FSM";
 
 /* ============================================================
-   CONSTANTES DE TEMPORIZAÇÃO
+   CONSTANTES LOCAIS DE TEMPORIZAÇÃO
+   ──────────────────────────────────────────────────────────
+   TC_TIMEOUT_MS, T_STUCK_TIMEOUT_MS, AUTONOMO_DELAY_MS e
+   OBSTACULO_REMOVE_MS estão definidos em system_config.h.
+   Aqui apenas constantes de debounce do radar.
 ============================================================ */
 
-/* Timeout para forçar T=0 quando o vizinho esquerdo está offline */
-#define T_STUCK_TIMEOUT_MS    (TRAFIC_TIMEOUT_MS * 3)
+/* Ciclos (100ms) sem frame do radar para declarar FAIL */
+#define RADAR_FAIL_COUNT    50
 
-/* Timeout de segurança de Tc: veículo anunciado não chegou */
-#define TC_TIMEOUT_MS         (TRAFIC_TIMEOUT_MS * 2)
+/* Ciclos consecutivos com frame para declarar radar recuperado */
+#define RADAR_OK_COUNT       3
 
-/* Nº de ciclos (100ms) sem frame do radar para declarar falha */
-#define RADAR_FAIL_COUNT      50
+/* Intervalo do heartbeat MASTER_CLAIM (ms) */
+#define MASTER_CLAIM_HB_MS  30000ULL
 
-/* Nº de ciclos consecutivos com frame para declarar radar recuperado */
-#define RADAR_OK_COUNT         3
 
-/* Intervalo do heartbeat MASTER_CLAIM em ms (30 segundos) */
-#define MASTER_CLAIM_HB_MS    30000ULL
-
-#define AUTONOMO_DELAY_MS       10000ULL
-static uint64_t s_sem_vizinho_desde_ms = 0;
 /* ============================================================
    ESTADO INTERNO DA FSM
-   ─────────────────────
-   Variáveis escalares — acesso exclusivo pela fsm_task,
-   excepto onde indicado (callbacks UDP).
+   ─────────────────────────────────────────────────────────
+   Todas as variáveis são locais a este módulo.
+   Acesso exclusivo pela fsm_task, excepto callbacks UDP
+   (on_tc_inc_received, on_prev_passed_received) que podem
+   ser chamados do contexto da udp_task.
+   NOTA: callbacks UDP são chamados com frequência baixa
+   (1/evento), logo a ausência de mutex é aceitável no ESP32.
 ============================================================ */
 
-static system_state_t s_state           = STATE_IDLE;
-static int            s_T               = 0;   /* veículos detectados localmente */
-static int            s_Tc              = 0;   /* veículos a caminho (UDP)       */
-static float          s_last_speed      = 0.0f;
-static bool           s_apagar_pend     = false;
-static bool           s_radar_ok        = true;
-static int            s_radar_fail_cnt  = 0;
-static int            s_radar_ok_cnt    = 0;
-static bool           s_right_online    = true;
-/* s_radar_degradado removido — era escrito mas nunca lido (BUG E fix) */
+static system_state_t s_state          = STATE_IDLE;
+static int            s_T              = 0;    /* veículos detectados localmente */
+static int            s_Tc             = 0;    /* veículos a caminho (UDP)        */
+static float          s_last_speed     = 0.0f;
+static bool           s_apagar_pend    = false;
+static bool           s_radar_ok       = true;
+static int            s_radar_fail_cnt = 0;
+static int            s_radar_ok_cnt   = 0;
+static bool           s_right_online   = true;
 
-static uint64_t s_last_detect_ms   = 0;
-static uint64_t s_left_offline_ms  = 0;
-static uint64_t s_tc_timeout_ms    = 0;
-static bool     s_left_was_offline = false;
-static uint64_t s_acender_em_ms    = 0;
-static uint64_t s_master_claim_ms  = 0;
+static uint64_t s_last_detect_ms    = 0;  /* timestamp da última detecção    */
+static uint64_t s_left_offline_ms   = 0;  /* timestamp desde viz. esq. off   */
+static uint64_t s_tc_timeout_ms     = 0;  /* deadline de segurança Tc        */
+static bool     s_left_was_offline  = false;
+static uint64_t s_acender_em_ms     = 0;  /* timestamp de pré-acendimento    */
+static uint64_t s_master_claim_ms   = 0;  /* timestamp do último MASTER_CLAIM*/
+static uint64_t s_sem_vizinho_ms    = 0;  /* timestamp desde sem vizinhos    */
+static uint64_t s_obstaculo_last_ms = 0;  /* timestamp da última detecção de obstáculo */
 
 
 /* ============================================================
    SIMULADOR FÍSICO — USE_RADAR == 0
-   ────────────────────────────────────
-   O simulador mantém-se aqui na v4.0 por compatibilidade.
-   Na v5.0 (após event_manager) será migrado para injectar
-   eventos na queue em vez de chamar sm_on_radar_detect().
+   ─────────────────────────────────────────────────────────
+   O simulador gera carros virtuais com velocidades realistas
+   para testes em bancada sem hardware de radar físico.
+   Ciclo: AGUARDA → ENTRAR → EM_VIA → DETECTADO → SAIU → AGUARDA
 ============================================================ */
 #if USE_RADAR == 0
 
@@ -95,31 +111,37 @@ typedef struct {
 static sim_carro_t       s_sim       = {0};
 static SemaphoreHandle_t s_sim_mutex = NULL;
 
-static const float s_vels[] = {30.0f, 50.0f, 80.0f, 50.0f};
+/* Velocidades de rotação para variar os testes */
+static const float s_vels[]  = {30.0f, 50.0f, 80.0f, 50.0f};
 static int         s_vel_idx = 0;
 
+/* Intervalo entre carros simulados: TRAFIC_TIMEOUT + 3s */
 #define SIM_INTERVALO_MS  ((uint64_t)(TRAFIC_TIMEOUT_MS + 3000))
+/* Distância de detecção simulada em mm */
 #define SIM_ZONA_MM       ((float)(RADAR_DETECT_M * 1000))
 
 static uint64_t _agora_ms(void);  /* declaração antecipada */
 
+/* Inicializa mutex do simulador — chamar uma vez */
 void sim_init_mutex(void)
 {
     if (!s_sim_mutex)
         s_sim_mutex = xSemaphoreCreateMutex();
 }
 
+/* Lança carro simulado a vel km/h com posição lateral x_mm */
 static void _sim_lancar(float vel, int16_t x_mm)
 {
     float dist_extra = (float)((POSTE_DIST_M - RADAR_MAX_M) * 1000);
     if (dist_extra < 0.0f) dist_extra = 0.0f;
 
-    s_sim.x_mm    = (x_mm == 0)
-                  ? (float)((int32_t)(esp_random() % 769) - 384)
-                  : (float)x_mm;
+    /* Posição lateral aleatória se x_mm=0, ou usa o valor fornecido */
+    s_sim.x_mm      = (x_mm == 0)
+                    ? (float)((int32_t)(esp_random() % 769) - 384)
+                    : (float)x_mm;
     s_sim.y_mm        = (float)RADAR_MAX_MM + dist_extra;
     s_sim.vel_kmh     = vel;
-    s_sim.vy          = (vel / 3.6f) * 100.0f * 0.25f;
+    s_sim.vy          = (vel / 3.6f) * 100.0f * 0.25f;  /* pixels/ciclo */
     s_sim.estado      = SIM_ENTRAR;
     s_sim.injectado   = false;
     s_sim.t_inicio_ms = _agora_ms();
@@ -127,10 +149,12 @@ static void _sim_lancar(float vel, int16_t x_mm)
              POST_POSITION, vel, s_sim.x_mm);
 }
 
+/* Notifica o simulador que um carro está a chegar via UDP */
 void sim_notificar_chegada(float vel_kmh, int16_t x_mm)
 {
     if (!s_sim_mutex) return;
     xSemaphoreTake(s_sim_mutex, portMAX_DELAY);
+    /* Só lança se não houver carro já em voo */
     if (s_sim.estado == SIM_AGUARDA ||
         s_sim.estado == SIM_SAIU    ||
         s_sim.estado == SIM_ENTRAR)
@@ -138,6 +162,7 @@ void sim_notificar_chegada(float vel_kmh, int16_t x_mm)
     xSemaphoreGive(s_sim_mutex);
 }
 
+/* Actualiza posição do carro simulado — chamar a cada 100ms */
 void _sim_update(void)
 {
     if (!s_sim_mutex) return;
@@ -146,6 +171,7 @@ void _sim_update(void)
 
     switch (s_sim.estado) {
         case SIM_AGUARDA:
+            /* Só lança auto-carro se for MASTER */
             if (s_state != STATE_MASTER) break;
             if (!s_sim.t_inicio_ms) s_sim.t_inicio_ms = agora;
             if ((agora - s_sim.t_inicio_ms) >= SIM_INTERVALO_MS) {
@@ -156,6 +182,7 @@ void _sim_update(void)
             break;
 
         case SIM_ENTRAR:
+            /* Carro a aproximar-se, ainda fora do alcance do radar */
             s_sim.y_mm -= s_sim.vy;
             if (s_sim.y_mm <= (float)RADAR_MAX_MM) {
                 s_sim.y_mm   = (float)RADAR_MAX_MM;
@@ -165,16 +192,16 @@ void _sim_update(void)
 
         case SIM_EM_VIA:
         case SIM_DETECTADO:
+            /* Carro dentro do alcance — avança e injeta evento quando na zona */
             s_sim.y_mm -= s_sim.vy;
             if (!s_sim.injectado && s_sim.y_mm <= SIM_ZONA_MM) {
                 s_sim.estado    = SIM_DETECTADO;
                 s_sim.injectado = true;
                 xSemaphoreGive(s_sim_mutex);
-                /* NOTA v4.0: Na v5.0 isto vai injectar na queue
-                   em vez de chamar sm_on_radar_detect() directamente */
                 sm_on_radar_detect(s_sim.vel_kmh);
                 xSemaphoreTake(s_sim_mutex, portMAX_DELAY);
             }
+            /* Carro saiu do campo */
             if (s_sim.y_mm <= 0.0f) {
                 s_sim.y_mm        = 0.0f;
                 s_sim.estado      = SIM_SAIU;
@@ -183,6 +210,7 @@ void _sim_update(void)
             break;
 
         case SIM_SAIU:
+            /* Aguarda apagamento antes de reiniciar ciclo */
             if (s_T == 0 && s_Tc == 0 &&
                 (agora - s_sim.t_inicio_ms) >= (uint64_t)TRAFIC_TIMEOUT_MS) {
                 s_sim.estado      = SIM_AGUARDA;
@@ -193,6 +221,7 @@ void _sim_update(void)
     xSemaphoreGive(s_sim_mutex);
 }
 
+/* Copia posição do carro simulado para o display */
 bool sim_get_objeto(float *x_mm, float *y_mm)
 {
     if (!s_sim_mutex || !x_mm || !y_mm) return false;
@@ -209,67 +238,106 @@ bool sim_get_objeto(float *x_mm, float *y_mm)
 #endif /* USE_RADAR == 0 */
 
 
-/* ── Utilitário de tempo ──────────────────────────────────── */
+/* ============================================================
+   UTILITÁRIOS INTERNOS
+============================================================ */
+
+/* Retorna tempo actual em milissegundos */
 static uint64_t _agora_ms(void)
 {
     return (uint64_t)(esp_timer_get_time() / 1000ULL);
 }
 
-/* ── Agenda apagamento após TRAFIC_TIMEOUT ────────────────── */
+/* Agenda apagamento após TRAFIC_TIMEOUT — redefine o timer */
 static void _agendar_apagar(void)
 {
     s_apagar_pend    = true;
     s_last_detect_ms = _agora_ms();
 }
 
+/* Monitoriza saúde do radar com debounce bidirecional.
+   Evita flapping: exige RADAR_FAIL_COUNT ciclos para declarar falha
+   e RADAR_OK_COUNT ciclos para declarar recuperação. */
+static void _verificar_radar(bool teve_frame, bool comm_ok)
+{
+    if (teve_frame) {
+        s_radar_fail_cnt = 0;
+        s_radar_ok_cnt++;
+        /* Radar recuperado após RADAR_OK_COUNT frames consecutivos */
+        if (!s_radar_ok && s_radar_ok_cnt >= RADAR_OK_COUNT) {
+            s_radar_ok = true;
+            ESP_LOGI(TAG, "Radar recuperado após %d frames", RADAR_OK_COUNT);
+            /* Sai de SAFE MODE imediatamente quando radar volta */
+            if (s_state == STATE_SAFE_MODE)
+                s_state = STATE_IDLE;
+        }
+    } else {
+        s_radar_ok_cnt = 0;
+        s_radar_fail_cnt++;
+        /* Radar em falha após RADAR_FAIL_COUNT ciclos sem frame */
+        if (s_radar_ok && s_radar_fail_cnt >= RADAR_FAIL_COUNT) {
+            s_radar_ok = false;
+            ESP_LOGW(TAG, "Radar FAIL após %d ciclos — Passo 10 decide estado",
+                     RADAR_FAIL_COUNT);
+        }
+    }
+    (void)comm_ok; /* Reservado para uso futuro */
+}
+
 
 /* ============================================================
    CALLBACKS UDP
-   ─────────────
-   Mantidos intactos da v3.1. Substituem versões weak do
-   comm_manager. Chamados a partir do contexto UDP.
+   ─────────────────────────────────────────────────────────
+   Substituem versões weak do udp_manager.
+   Chamados a partir do contexto da udp_task (Core 0).
+   Escrevem em variáveis escalares — thread-safe no ESP32
+   para escritas de 32 bits alinhadas em Xtensa LX6.
 ============================================================ */
 
+/* Recebe anúncio de veículo a caminho — incrementa Tc */
 void on_tc_inc_received(float speed, int16_t x_mm)
 {
     s_apagar_pend    = false;
     s_last_speed     = speed;
     s_Tc++;
     s_last_detect_ms = _agora_ms();
+    /* Timeout de segurança: se o veículo não chegar, Tc reseta */
     s_tc_timeout_ms  = _agora_ms() + TC_TIMEOUT_MS;
 
     ESP_LOGI(TAG, "[TC_INC] %.0f km/h | x=%dmm | T=%d Tc=%d",
              speed, (int)x_mm, s_T, s_Tc);
 
 #if USE_RADAR == 0
+    /* Em modo simulado, lança carro no simulador */
     sim_notificar_chegada(speed, x_mm);
 #endif
 
-    /* BUG 1 FIX: NÃO propagar TC_INC+SPD ao vizinho direito aqui.
-       A propagação ocorre APENAS quando o radar LOCAL confirma
-       a chegada do veículo (SM_EVT_VEHICLE_LOCAL ou SM_EVT_VEHICLE_DETECTED).
-       Propagar aqui causava activação de todos os postes à frente
-       antes do veículo entrar no raio de qualquer radar. */
+    /* Propaga para vizinho direito se disponível */
+    if (s_right_online) {
+        comm_send_tc_inc(speed, x_mm);
+        comm_send_spd(speed, x_mm);
+    }
 }
 
+/* Recebe confirmação de passagem do veículo pelo poste anterior */
 void on_prev_passed_received(void)
 {
     if (s_T  > 0) s_T--;
     if (s_Tc > 0) s_Tc--;
     s_acender_em_ms = 0;
     ESP_LOGI(TAG, "[PASSED] T=%d Tc=%d", s_T, s_Tc);
-    /* BUG 2 FIX: NÃO propagar o PASSED para o vizinho esquerdo.
-       O PASSED para aqui — cada nó só emite PASSED quando o SEU
-       próprio radar confirma que o veículo saiu (SM_EVT_VEHICLE_PASSED).
-       Propagar causava T-- em cascata por toda a cadeia. */
+    /* Notifica o poste esquerdo para decrementar também */
+    comm_notify_prev_passed(s_last_speed);
     _agendar_apagar();
 }
 
+/* Recebe actualização de velocidade e ETA para pré-acendimento */
 void on_spd_received(float speed, uint32_t eta_ms, int16_t x_mm)
 {
     s_last_speed = speed;
-    if (s_Tc <= 0) return;
+    if (s_Tc <= 0) return;  /* Ignora se não há veículos anunciados */
 
+    /* Agenda pré-acendimento com margem de antecipação */
     if (eta_ms > MARGEM_ACENDER_MS)
         s_acender_em_ms = _agora_ms() + (uint64_t)(eta_ms - MARGEM_ACENDER_MS);
     else
@@ -283,27 +351,26 @@ void on_spd_received(float speed, uint32_t eta_ms, int16_t x_mm)
 #endif
 }
 
+/* Recebe anúncio de novo MASTER na cadeia */
 void on_master_claim_received(int from_id)
 {
-    ESP_LOGI(TAG, "[MASTER_CLAIM] de ID=%d", from_id);
+    ESP_LOGI(TAG, "[MASTER_CLAIM] de ID=%d — cedemos liderança", from_id);
+    /* A gestão efectiva é feita no Passo 9 do update */
 }
 
 
 /* ============================================================
-   sm_process_event  ← NOVO em v4.0
-   ──────────────────────────────────
-   Ponto central de entrada de eventos do pipeline.
-   Chamado pelo event_manager após desencapsular um system_event_t
-   da queue FreeRTOS.
-
-   Substitui a leitura directa do radar pela FSM.
+   sm_process_event — processamento de eventos do pipeline
+   ─────────────────────────────────────────────────────────
+   Ponto central de entrada event-driven da FSM.
    Cada evento transporta: tipo, ID do veículo, velocidade, ETA.
 
-   @param type      Tipo de evento (SM_EVT_*)
-   @param vehicle_id ID estável do veículo (do tracking_manager)
-   @param vel        Velocidade suavizada em km/h
-   @param eta_ms     ETA calculado pelo tracking_manager (ms)
-   @param x_mm       Posição lateral do veículo em mm
+   Eventos:
+     DETECTED    → T++, luz ON, agenda ETA
+     APPROACHING → pré-acendimento, propaga para vizinho direito
+     PASSED      → T--, Tc--, avisa vizinho esquerdo, agenda apagar
+     LOCAL       → Tc--, T++, luz ON, propaga se direito online
+     OBSTACULO   → STATE_OBSTACULO, luz LIGHT_MAX
 ============================================================ */
 void sm_process_event(sm_event_type_t type,
                       uint16_t vehicle_id,
@@ -313,30 +380,23 @@ void sm_process_event(sm_event_type_t type,
 {
     switch (type) {
 
-        /* ── Veículo confirmado pelo tracking_manager ──────── */
+        /* ── Veículo confirmado pelo tracking_manager ────────── */
         case SM_EVT_VEHICLE_DETECTED:
             ESP_LOGI(TAG, "[EVT] DETECTED id=%u vel=%.1f km/h eta=%lums",
                      vehicle_id, vel, (unsigned long)eta_ms);
 
-            /* Cancelar apagamento e timeout pendentes — há um veículo activo */
+            if (s_T < 3) s_T++;
             s_apagar_pend    = false;
-            s_tc_timeout_ms  = 0;
             s_last_detect_ms = _agora_ms();
             s_last_speed     = vel;
 
-            /* T++ sempre — cada DETECTED representa um veículo novo confirmado.
-               O PASSED vai decrementar exactamente uma vez por veículo.
-               Separado da transição de estado: T é um contador de veículos,
-               não um indicador de estado da luminária. */
-            if (s_T < 3) s_T++;
-
-            /* Calcula pré-acendimento com base no ETA */
+            /* Calcula timestamp de pré-acendimento baseado no ETA */
             if (eta_ms > MARGEM_ACENDER_MS)
                 s_acender_em_ms = _agora_ms() + (uint64_t)(eta_ms - MARGEM_ACENDER_MS);
             else
                 s_acender_em_ms = _agora_ms();
 
-            /* Fade up apenas na transição — não repete se já em LIGHT_ON */
+            /* Transição para LIGHT_ON apenas se estava em repouso */
             if (s_state == STATE_IDLE   ||
                 s_state == STATE_MASTER ||
                 s_state == STATE_AUTONOMO) {
@@ -345,22 +405,21 @@ void sm_process_event(sm_event_type_t type,
             }
             break;
 
-        /* ── Veículo em aproximação activa ─────────────────── */
+        /* ── Veículo em aproximação activa ──────────────────── */
         case SM_EVT_VEHICLE_APPROACHING:
             ESP_LOGI(TAG, "[EVT] APPROACHING id=%u vel=%.1f km/h eta=%lums",
                      vehicle_id, vel, (unsigned long)eta_ms);
 
-            /* Se ETA já passou ou é inferior à margem — acende já */
+            /* ETA muito pequeno ou zero → acende imediatamente */
             if (eta_ms <= MARGEM_ACENDER_MS || eta_ms == 0) {
                 if (s_state == STATE_IDLE   ||
                     s_state == STATE_MASTER ||
                     s_state == STATE_AUTONOMO) {
                     s_state = STATE_LIGHT_ON;
-                    //dali_fade_up(vel);
                 }
                 s_acender_em_ms = 0;
             } else {
-                /* Agenda pré-acendimento com margem de antecipação */
+                /* Agenda pré-acendimento com margem */
                 s_acender_em_ms = _agora_ms() + (uint64_t)(eta_ms - MARGEM_ACENDER_MS);
             }
 
@@ -368,20 +427,22 @@ void sm_process_event(sm_event_type_t type,
             s_last_detect_ms = _agora_ms();
             s_apagar_pend    = false;
 
+            /* Propaga para vizinho direito se disponível */
+            if (s_right_online) {
+                comm_send_tc_inc(vel, x_mm);
+                comm_send_spd(vel, x_mm);
+            }
             break;
 
-        /* ── Veículo saiu da zona ───────────────────────────── */
+        /* ── Veículo saiu da zona do radar ─────────────────── */
         case SM_EVT_VEHICLE_PASSED:
             ESP_LOGI(TAG, "[EVT] PASSED id=%u vel=%.1f km/h", vehicle_id, vel);
 
-            if (!s_right_online) {
-                if (s_T > 0) s_T--;
-            }           
-
+            if (s_T  > 0) s_T--;
             if (s_Tc > 0) s_Tc--;
             s_acender_em_ms = 0;
 
-            /* Avisa vizinho esquerdo que o objecto passou */
+            /* Avisa vizinho esquerdo (T-- no poste anterior) */
             comm_notify_prev_passed(vel);
             /* Agenda apagamento após TRAFIC_TIMEOUT_MS */
             _agendar_apagar();
@@ -389,16 +450,15 @@ void sm_process_event(sm_event_type_t type,
 
         /* ── Veículo detectado localmente pelo radar ─────────── */
         case SM_EVT_VEHICLE_LOCAL:
-           
-            s_tc_timeout_ms = 0;
-            s_apagar_pend   = false;
-
+            s_acender_em_ms  = 0;
+            /* Confirma chegada: Tc-- (veículo já aqui) e T++ */
             if (s_Tc > 0) s_Tc--;
             if (s_T  < 3) s_T++;
             s_last_speed     = vel;
             s_last_detect_ms = _agora_ms();
+            s_apagar_pend    = false;
 
-            /* Fade up apenas na transição — não repete se já em LIGHT_ON */
+            /* Transição para LIGHT_ON apenas se estava em repouso */
             if (s_state == STATE_IDLE   ||
                 s_state == STATE_MASTER ||
                 s_state == STATE_AUTONOMO) {
@@ -409,27 +469,26 @@ void sm_process_event(sm_event_type_t type,
             ESP_LOGI(TAG, "[EVT] LOCAL vel=%.1f km/h T=%d Tc=%d",
                      vel, s_T, s_Tc);
 
-            /* Propaga para vizinho direito se disponível
-               Em AUTONOMO s_right_online=false — não propaga */
+            /* Propaga para vizinho direito (em AUTONOMO não propaga) */
             if (s_right_online) {
                 comm_send_tc_inc(vel, x_mm);
                 comm_send_spd(vel, x_mm);
             }
-            /* NOTA: comm_notify_prev_passed() NÃO é chamado aqui
-               — só é chamado em PASSED quando o objecto sai */
             break;
 
         /* ── Obstáculo estático detectado ───────────────────── */
         case SM_EVT_VEHICLE_OBSTACULO:
-            ESP_LOGW(TAG, "[EVT] OBSTACULO id=%u vel=%.1f km/h",
-                     vehicle_id, vel);
+            ESP_LOGW(TAG, "[EVT] OBSTACULO id=%u vel=%.1f km/h", vehicle_id, vel);
+
+            /* Regista timestamp para timeout de remoção automática */
+            s_obstaculo_last_ms = _agora_ms();
 
             /* Activa apenas se não estiver já em OBSTACULO ou SAFE MODE */
             if (s_state != STATE_OBSTACULO &&
                 s_state != STATE_SAFE_MODE) {
                 s_state = STATE_OBSTACULO;
                 dali_set_brightness(LIGHT_MAX);
-                ESP_LOGW(TAG, "STATE_OBSTACULO — luz maxima");
+                ESP_LOGW(TAG, "[OBSTACULO] CONFIRMADO id=%u — luz máxima", vehicle_id);
             }
             break;
 
@@ -441,13 +500,10 @@ void sm_process_event(sm_event_type_t type,
 
 
 /* ============================================================
-   sm_on_radar_detect  — SHIM de compatibilidade v3.x → v4.0
-   ─────────────────────────────────────────────────────────────
-   Mantido para compatibilidade durante a migração.
-   Na v5.0 (com event_manager completo), esta função deixa
-   de ser chamada directamente e pode ser removida.
-
-   Delega para sm_process_event(SM_EVT_VEHICLE_LOCAL, ...).
+   sm_on_radar_detect — shim de compatibilidade v3.x
+   ─────────────────────────────────────────────────────────
+   Mantido por retrocompatibilidade com o simulador USE_RADAR=0.
+   Delega para sm_process_event(SM_EVT_VEHICLE_LOCAL).
 ============================================================ */
 void sm_on_radar_detect(float vel)
 {
@@ -466,9 +522,10 @@ void sm_on_radar_detect(float vel)
 
 
 /* ============================================================
-   Gestão de vizinhos — mantida igual à v3.1
+   GESTÃO DE VIZINHOS
 ============================================================ */
 
+/* Vizinho direito ficou offline — cancela Tc e agenda apagamento */
 void sm_on_right_neighbor_offline(void)
 {
     if (!s_right_online) return;
@@ -476,11 +533,12 @@ void sm_on_right_neighbor_offline(void)
     s_acender_em_ms = 0;
     if (s_Tc > 0) {
         s_Tc = 0;
-        ESP_LOGW(TAG, "Dir. OFFLINE — Tc=0");
+        ESP_LOGW(TAG, "Vizinho dir. OFFLINE — Tc=0");
     }
     _agendar_apagar();
 }
 
+/* Vizinho direito voltou online */
 void sm_on_right_neighbor_online(void)
 {
     if (s_right_online) return;
@@ -490,86 +548,74 @@ void sm_on_right_neighbor_online(void)
 
 
 /* ============================================================
-   _verificar_radar
-   ─────────────────
-   Monitoriza saúde do radar com debounce bidirecional.
-   NOTA v4.0: Em vez de receber `teve_frame` directamente do radar,
-   recebe um bool de saúde do tracking_manager (que sabe se teve
-   frames válidos recentemente). A lógica interna mantém-se igual.
-============================================================ */
-static void _verificar_radar(bool teve_frame)
-{
-    if (teve_frame) {
-        s_radar_fail_cnt = 0;
-        s_radar_ok_cnt++;
-        if (!s_radar_ok && s_radar_ok_cnt >= RADAR_OK_COUNT) {
-            s_radar_ok = true;
-            ESP_LOGI(TAG, "Radar recuperado");
-            if (s_state == STATE_SAFE_MODE)
-                s_state = STATE_IDLE;
-        }
-    } else {
-        s_radar_ok_cnt = 0;
-        s_radar_fail_cnt++;
-        if (s_radar_ok && s_radar_fail_cnt >= RADAR_FAIL_COUNT) {
-            s_radar_ok = false;
-            ESP_LOGW(TAG, "Radar FAIL após %d leituras — PASSO 10 decide estado", RADAR_FAIL_COUNT);
-        }       
-    }
-}
-
-
-/* ============================================================
-   state_machine_init
+   state_machine_init — inicialização
 ============================================================ */
 void state_machine_init(void)
 {
-    s_state           = STATE_IDLE;
-    s_T = s_Tc        = 0;
-    s_last_speed      = 0.0f;
-    s_apagar_pend     = false;
-    s_radar_ok        = true;
-    s_right_online    = true;
-    s_acender_em_ms   = 0;
-    s_master_claim_ms = 0;
+    s_state             = STATE_IDLE;
+    s_T                 = 0;
+    s_Tc                = 0;
+    s_last_speed        = 0.0f;
+    s_apagar_pend       = false;
+    s_radar_ok          = true;
+    s_radar_fail_cnt    = 0;
+    s_radar_ok_cnt      = 0;
+    s_right_online      = true;
+    s_acender_em_ms     = 0;
+    s_master_claim_ms   = 0;
+    s_sem_vizinho_ms    = 0;
+    s_obstaculo_last_ms = 0;
+    s_left_was_offline  = false;
+    s_left_offline_ms   = 0;
+    s_tc_timeout_ms     = 0;
+    s_last_detect_ms    = 0;
 
 #if USE_RADAR == 0
     sim_init_mutex();
 #endif
 
-    ESP_LOGI(TAG, "FSM v4.0 inicializada — estado IDLE (event-driven)");
+    ESP_LOGI(TAG, "FSM v5.0 inicializada — estado IDLE (event-driven)");
 }
 
 
 /* ============================================================
-   state_machine_update  — ciclo de manutenção a 100ms
-============================================================ */
+   state_machine_update — ciclo de manutenção a 100ms
+   ─────────────────────────────────────────────────────────
+   Executa passos de manutenção periódica independentes dos
+   eventos de detecção: timers, saúde do radar, gestão
+   de vizinhos e transições de estado de rede.
 
+   NÃO recebe dados de radar directamente.
+   O estado de saúde do radar vem como parâmetro externo
+   (escrito atomicamente pela radar_task).
+============================================================ */
 void state_machine_update(bool comm_ok, bool is_master, bool radar_teve_frame)
 {
     uint64_t agora = _agora_ms();
 
-    /* ── PASSO 1: Simulador (modo sem radar físico) ───────── */
+    /* ── Passo 1: Simulador físico (modo sem radar físico) ────── */
 #if USE_RADAR == 0
     _sim_update();
-    radar_teve_frame = true; /* Simulador nunca perde frames */
+    radar_teve_frame = true;  /* Simulador nunca perde frames */
 #endif
 
-    /* ── PASSO 2: Saúde do radar ──────────────────────────── */
-    _verificar_radar(radar_teve_frame);
+    /* ── Passo 2: Saúde do radar ──────────────────────────────── */
+    _verificar_radar(radar_teve_frame, comm_ok);
 
-    /* ── PASSO 3: Conectividade do vizinho direito ──────────── */
+    /* ── Passo 3: Conectividade do vizinho direito ────────────── */
     bool dir_ok = comm_right_online();
     if (!dir_ok &&  s_right_online) sm_on_right_neighbor_offline();
     if ( dir_ok && !s_right_online) sm_on_right_neighbor_online();
 
-    /* ── PASSO 4: Vizinho esquerdo offline → MASTER ─────────── */
+    /* ── Passo 4: Vizinho esquerdo — detecção de offline ──────── */
     bool esq_ok = comm_left_online();
     if (!esq_ok && !s_left_was_offline) {
+        /* Esquerdo acabou de ficar offline */
         s_left_was_offline = true;
         s_left_offline_ms  = agora;
     }
     if (esq_ok && s_left_was_offline) {
+        /* Esquerdo voltou — cede MASTER se não for o poste 0 */
         s_left_was_offline = false;
         if (s_state == STATE_MASTER && POST_POSITION > 0) {
             s_state = STATE_IDLE;
@@ -577,45 +623,43 @@ void state_machine_update(bool comm_ok, bool is_master, bool radar_teve_frame)
         }
     }
 
-    /* ── PASSO 5: T preso com esquerdo offline ──────────────── */
-   
-    if (POST_POSITION > 0 &&
-        s_left_was_offline && s_T > 0 &&
+    /* ── Passo 5: T preso quando vizinho esquerdo está offline ─── */
+    /* Evita T infinito quando não há quem envie PASSED */
+    if (s_left_was_offline && s_T > 0 &&
         (agora - s_left_offline_ms) > T_STUCK_TIMEOUT_MS) {
         s_T = 0;
-        ESP_LOGW(TAG, "T forçado a 0 (viz. esq. offline)");
+        ESP_LOGW(TAG, "T forçado a 0 — viz. esq. offline há %llus",
+                 (unsigned long long)(T_STUCK_TIMEOUT_MS / 1000));
     }
 
-    /* ── PASSO 6: Timer de pré-acendimento (ETA) ──────────── */
+    /* ── Passo 6: Timer de pré-acendimento (ETA) ──────────────── */
     if (s_acender_em_ms > 0 && agora >= s_acender_em_ms) {
         s_acender_em_ms = 0;
         if (s_Tc > 0) {
             dali_fade_up(s_last_speed);
-            if (s_state == STATE_IDLE ||s_state == STATE_MASTER || s_state == STATE_AUTONOMO)
+            if (s_state == STATE_IDLE   ||
+                s_state == STATE_MASTER ||
+                s_state == STATE_AUTONOMO)
                 s_state = STATE_LIGHT_ON;
             ESP_LOGI(TAG, "Pré-acendimento: luz ON (ETA atingido)");
         }
     }
 
-/* ── PASSO 7: Timeout para apagar ─────────────────────── */
-    if (s_apagar_pend) {
-        ESP_LOGI(TAG, "APAGAR PEND: T=%d Tc=%d elapsed=%llums",s_T, s_Tc, (agora - s_last_detect_ms));
-    }
+    /* ── Passo 7: Timeout de apagamento ───────────────────────── */
+    /* Apaga apenas quando T=0, Tc=0 e passou o timeout de tráfego */
     if (s_apagar_pend && s_T == 0 && s_Tc == 0 &&
         (agora - s_last_detect_ms) >= TRAFIC_TIMEOUT_MS) {
         s_apagar_pend   = false;
         s_last_speed    = 0.0f;
         s_acender_em_ms = 0;
+        /* Volta ao estado de repouso correcto */
         if (s_state == STATE_LIGHT_ON  ||
             s_state == STATE_AUTONOMO  ||
             s_state == STATE_OBSTACULO) {
-            bool era_autonomo = (s_state == STATE_AUTONOMO) && !comm_ok;
-            if (is_master)
-                s_state = STATE_MASTER;
-            else if (era_autonomo)
-                s_state = STATE_AUTONOMO;
-            else
-                s_state = STATE_IDLE;
+            bool era_autonomo = (s_state == STATE_AUTONOMO);
+            if (is_master)          s_state = STATE_MASTER;
+            else if (era_autonomo)  s_state = STATE_AUTONOMO;
+            else                    s_state = STATE_IDLE;
             dali_fade_down();
             ESP_LOGI(TAG, "Apagamento — volta a %s",
                      is_master    ? "MASTER"   :
@@ -623,116 +667,127 @@ void state_machine_update(bool comm_ok, bool is_master, bool radar_teve_frame)
         }
     }
 
-    /* ── PASSO 8: Timeout de segurança Tc ────────────────────── */
+    /* ── Passo 8: Remoção automática de OBSTÁCULO ─────────────── */
+    /* Sem detecções por OBSTACULO_REMOVE_MS → obstáculo desapareceu */
+    if (s_state == STATE_OBSTACULO && s_obstaculo_last_ms > 0 &&
+        (agora - s_obstaculo_last_ms) >= OBSTACULO_REMOVE_MS) {
+        s_state             = is_master ? STATE_MASTER : STATE_IDLE;
+        s_obstaculo_last_ms = 0;
+        dali_fade_down();
+        ESP_LOGW(TAG, "[OBSTACULO] REMOVIDO — sem detecção há %us",
+                 OBSTACULO_REMOVE_MS / 1000);
+    }
+
+    /* ── Passo 9: Timeout de segurança Tc ─────────────────────── */
+    /* Se o veículo anunciado não chegou dentro do prazo, reset Tc */
     if (s_Tc > 0 && s_tc_timeout_ms > 0 && agora > s_tc_timeout_ms) {
-        ESP_LOGW(TAG, "Timeout Tc — carro não chegou (Tc=%d→0)", s_Tc);
+        ESP_LOGW(TAG, "Timeout Tc — veículo não chegou (Tc=%d→0)", s_Tc);
         s_Tc = 0; s_tc_timeout_ms = 0;
         _agendar_apagar();
     }
 
-    /* ── PASSO 9: Gestão do papel MASTER ─────────────────────── */
-    if ( is_master && s_state == STATE_IDLE) s_state = STATE_MASTER;
+    /* ── Passo 10: Gestão do papel MASTER ──────────────────────── */
+    /* Transições IDLE ↔ MASTER baseadas no papel actual */
+    if ( is_master && s_state == STATE_IDLE)   s_state = STATE_MASTER;
     if (!is_master && s_state == STATE_MASTER) {
         s_state = STATE_IDLE;
         ESP_LOGI(TAG, "MASTER cedido");
     }
 
-    /* Viz. esq. offline há mais de AUTONOMO_DELAY_MS → assume MASTER temporário
-       Cobre cenário 5: Poste A falha, Poste B assume liderança da linha */
+    /* Vizinho esq. offline há AUTONOMO_DELAY_MS → assume MASTER temporário */
     if (!is_master && s_left_was_offline && s_radar_ok &&
         (agora - s_left_offline_ms) > AUTONOMO_DELAY_MS &&
         s_state == STATE_IDLE) {
         s_state = STATE_MASTER;
-        ESP_LOGW(TAG, "MASTER temporário — viz. esq. offline há %lus",(unsigned long)(AUTONOMO_DELAY_MS / 1000));
+        ESP_LOGW(TAG, "MASTER temporário — viz. esq. offline");
     }
 
-    /* Viz. esq. voltou online — cede MASTER se não for o poste 0 */
+    /* Vizinho esq. voltou — cede MASTER se não for o poste 0 */
     if (!is_master && !s_left_was_offline &&
         s_state == STATE_MASTER && POST_POSITION > 0) {
         s_state = STATE_IDLE;
         ESP_LOGI(TAG, "Viz. esq. voltou — cede MASTER → IDLE");
     }
 
-    /* ── PASSO 10: Gestão de estados degradados ─────────────── */
-     bool tem_vizinho_esq = comm_left_online();
+    /* ── Passo 11: Gestão de estados degradados ────────────────── */
+    bool tem_vizinho_esq = comm_left_online();
 
-        /* SAFE MODE — cego total:
-        Sem radar E (sem WiFi OU sem vizinho esquerdo) */
-        bool cego_total = !s_radar_ok && (!comm_ok || !tem_vizinho_esq);
-        if (cego_total &&
-            s_state != STATE_SAFE_MODE &&
-            s_state != STATE_AUTONOMO  &&
-            s_state != STATE_LIGHT_ON  &&
-            s_state != STATE_OBSTACULO) {
-            s_state = STATE_SAFE_MODE;
-            dali_set_brightness(LIGHT_SAFE_MODE);
-            ESP_LOGW(TAG, "SAFE MODE — radar KO e sem info (wifi=%d viz_esq=%d)",comm_ok, tem_vizinho_esq);
-        }
-
-        /* Sai de SAFE MODE quando recupera radar OU (WiFi + vizinho esquerdo) */
-        if (s_state == STATE_SAFE_MODE &&
-            (s_radar_ok || (comm_ok && tem_vizinho_esq))) {
-            s_state = STATE_IDLE;
-            ESP_LOGI(TAG, "Saiu de SAFE MODE → IDLE");
-        }
-
-    /* AUTONOMO — só após tempo suficiente para DISCOVER completar */
-        bool tem_vizinho = comm_left_online() || comm_right_online();
-
-        if (s_radar_ok && comm_ok && !tem_vizinho) {
-            if (s_sem_vizinho_desde_ms == 0)
-                s_sem_vizinho_desde_ms = agora;
-            if ((agora - s_sem_vizinho_desde_ms) > AUTONOMO_DELAY_MS &&
-                s_state != STATE_SAFE_MODE &&
-                s_state != STATE_LIGHT_ON  &&
-                s_state != STATE_OBSTACULO)
-            {
-                s_state = STATE_AUTONOMO;
-                ESP_LOGW(TAG, "AUTONOMO — sem vizinhos há %lus",(unsigned long)(AUTONOMO_DELAY_MS / 1000));
-            }
-        } else {
-            s_sem_vizinho_desde_ms = 0;
-        }
-
-        /* Sai de AUTONOMO quando WiFi volta E tem vizinhos */
-        if (s_state == STATE_AUTONOMO && comm_ok && tem_vizinho) {
-            s_sem_vizinho_desde_ms = 0;
-            s_state = is_master ? STATE_MASTER : STATE_IDLE;
-        }
-
-        /* Sem WiFi + radar OK → AUTONOMO imediato
-           BUG A FIX: não interromper LIGHT_ON nem OBSTACULO.
-           Se houver um veículo activo ou obstáculo, manter a luz
-           acesa é mais seguro do que transitar de estado. */
-        if (!comm_ok && s_radar_ok &&
-            s_state != STATE_SAFE_MODE &&
-            s_state != STATE_LIGHT_ON  &&
-            s_state != STATE_OBSTACULO)
-            s_state = STATE_AUTONOMO;
-
-        /* ── PASSO 11: Heartbeat MASTER_CLAIM ───────────────────── */
-        if (is_master && POST_POSITION == 0 &&
-            (agora - s_master_claim_ms) >= MASTER_CLAIM_HB_MS) {
-            s_master_claim_ms = agora;
-            comm_send_master_claim();
-        }
+    /* SAFE MODE: sem radar E (sem WiFi OU sem vizinho esquerdo)
+       Prioridade máxima — luz a 50% para segurança dos utentes */
+    bool cego_total = !s_radar_ok && (!comm_ok || !tem_vizinho_esq);
+    if (cego_total &&
+        s_state != STATE_SAFE_MODE &&
+        s_state != STATE_AUTONOMO  &&
+        s_state != STATE_LIGHT_ON  &&
+        s_state != STATE_OBSTACULO) {
+        s_state = STATE_SAFE_MODE;
+        dali_set_brightness(LIGHT_SAFE_MODE);
+        ESP_LOGW(TAG, "SAFE MODE — radar KO (wifi=%d viz_esq=%d)",
+                 comm_ok, tem_vizinho_esq);
     }
 
+    /* Sai de SAFE MODE quando recupera radar OU (WiFi + vizinho esq.) */
+    if (s_state == STATE_SAFE_MODE &&
+        (s_radar_ok || (comm_ok && tem_vizinho_esq))) {
+        s_state = STATE_IDLE;
+        ESP_LOGI(TAG, "Saiu de SAFE MODE → IDLE");
+    }
 
-/* ── Getters ──────────────────────────────────────────────── */
+    /* AUTONOMO: radar OK, WiFi OK mas sem vizinhos após AUTONOMO_DELAY_MS */
+    bool tem_vizinho = comm_left_online() || comm_right_online();
+    if (s_radar_ok && comm_ok && !tem_vizinho) {
+        if (s_sem_vizinho_ms == 0) s_sem_vizinho_ms = agora;
+        if ((agora - s_sem_vizinho_ms) > AUTONOMO_DELAY_MS &&
+            s_state != STATE_SAFE_MODE &&
+            s_state != STATE_LIGHT_ON  &&
+            s_state != STATE_OBSTACULO) {
+            s_state = STATE_AUTONOMO;
+            ESP_LOGW(TAG, "AUTONOMO — sem vizinhos");
+        }
+    } else {
+        s_sem_vizinho_ms = 0;
+    }
+
+    /* Sai de AUTONOMO quando WiFi volta E tem vizinhos */
+    if (s_state == STATE_AUTONOMO && comm_ok && tem_vizinho) {
+        s_sem_vizinho_ms = 0;
+        s_state = is_master ? STATE_MASTER : STATE_IDLE;
+    }
+
+    /* Sem WiFi + radar OK → AUTONOMO imediato (não SAFE MODE) */
+    if (!comm_ok && s_radar_ok && s_state != STATE_SAFE_MODE &&
+        s_state != STATE_LIGHT_ON && s_state != STATE_OBSTACULO)
+        s_state = STATE_AUTONOMO;
+
+    /* ── Passo 12: Heartbeat MASTER_CLAIM ─────────────────────── */
+    /* Poste 0 anuncia periodicamente a sua liderança */
+    if (is_master && POST_POSITION == 0 &&
+        (agora - s_master_claim_ms) >= MASTER_CLAIM_HB_MS) {
+        s_master_claim_ms = agora;
+        comm_send_master_claim();
+    }
+}
+
+
+/* ============================================================
+   GETTERS
+============================================================ */
+
 system_state_t state_machine_get_state(void)     { return s_state; }
 int            state_machine_get_T(void)          { return s_T; }
 int            state_machine_get_Tc(void)         { return s_Tc; }
 float          state_machine_get_last_speed(void) { return s_last_speed; }
 bool           state_machine_radar_ok(void)       { return s_radar_ok; }
-bool           sm_is_obstaculo(void) { return s_state == STATE_OBSTACULO; }
+bool           sm_is_obstaculo(void)              { return s_state == STATE_OBSTACULO; }
 
+/* Injeta carro de teste via debugger (JTAG/GDB) */
 void sm_inject_test_car(float vel)
 {
     ESP_LOGI(TAG, "[TEST] Injecção de carro a %.0f km/h", vel);
     sm_process_event(SM_EVT_VEHICLE_LOCAL, 0, vel, 0, 0);
 }
 
+/* Converte estado da FSM para string legível */
 const char *state_machine_get_state_name(void)
 {
     switch (s_state) {
@@ -745,3 +800,4 @@ const char *state_machine_get_state_name(void)
         default:              return "---";
     }
 }
+

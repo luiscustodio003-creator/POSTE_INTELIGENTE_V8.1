@@ -100,8 +100,6 @@ typedef struct {
     bool        event_approach_pending;   /* VEHICLE_APPROACHING       */
     bool        event_passed_pending;     /* VEHICLE_PASSED            */
     bool        event_obstaculo_pending;  /* VEHICLE_OBSTACULO         */
-    bool        event_recuou_pending;    /* veículo recuou — T=0 imediato */
-    
 
 } tracked_vehicle_t;
 

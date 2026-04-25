@@ -1,20 +1,50 @@
 /* ============================================================
    MÓDULO     : state_machine
    FICHEIRO   : state_machine.h — Declarações públicas
-   VERSÃO     : 4.0  |  2026-04-17
+   VERSÃO     : 5.0  |  2026-04-24
    PROJECTO   : Poste Inteligente v8
    AUTORES    : Luis Custódio | Tiago Moreno
    PLATAFORMA : ESP32 (ESP-IDF v5.x)
 
-   MUDANÇAS v3.1 → v4.0:
-   ─────────────────────────
-   1. sm_event_type_t — enumeração dos tipos de evento da FSM.
-   2. sm_process_event() — novo ponto de entrada event-driven.
-      Substitui a leitura directa do radar pela FSM.
-   3. state_machine_update() — assinatura alterada: recebe
-      radar_teve_frame como parâmetro (em vez de ler o radar).
-   4. sm_on_radar_detect() mantido como shim de compatibilidade.
-      Será removido na v5.0 após integração do event_manager.
+   RESPONSABILIDADE:
+   ─────────────────
+   Máquina de estados finita (FSM) central do poste.
+   Recebe eventos do tracking_manager e mensagens UDP,
+   controla a iluminação DALI e mantém os contadores T/Tc
+   matematicamente correctos.
+
+   PIPELINE DE DADOS:
+   ──────────────────
+   radar_manager → tracking_manager → state_machine_task
+                                            ↓
+                                     sm_process_event()
+                                            ↓
+                                      dali_manager
+                                            ↓
+                                     comm_manager (UDP)
+
+   PROTOCOLO T/Tc:
+   ───────────────
+   T  = veículos detectados localmente pelo radar
+   Tc = veículos anunciados via UDP (a caminho)
+   Luz liga quando T>0 ou Tc>0
+   Luz apaga TRAFIC_TIMEOUT_MS após T=0 e Tc=0
+
+   ESTADOS DA FSM:
+   ───────────────
+   IDLE      → repouso, luz no mínimo
+   LIGHT_ON  → veículo detectado, luz máxima
+   MASTER    → líder da cadeia (pos=0 ou viz. esq. offline)
+   AUTONOMO  → sem vizinhos UDP, opera localmente
+   SAFE_MODE → falha de radar E sem info UDP
+   OBSTACULO → objecto parado, luz máxima fixa
+
+   MUDANÇAS v4.0 → v5.0:
+   ──────────────────────
+   - Constantes TC_TIMEOUT_MS e T_STUCK_TIMEOUT_MS movidas para
+     system_config.h (fonte única de verdade)
+   - sm_on_radar_detect() marcado deprecated com aviso de compilação
+   - Cabeçalho de dependências actualizado
 ============================================================ */
 
 #ifndef STATE_MACHINE_H
@@ -29,29 +59,29 @@
    ESTADOS DA FSM
 ============================================================ */
 typedef enum {
-    STATE_IDLE       = 0,  /* Repouso — luz apagada ou em mínimo   */
-    STATE_LIGHT_ON,        /* Detecção activa — luz acesa           */
-    STATE_SAFE_MODE,       /* Falha dupla radar+UDP — luz máxima    */
-    STATE_MASTER,          /* Líder da cadeia de postes             */
-    STATE_AUTONOMO,        /* UDP em falha, radar OK — modo local   */
-    STATE_OBSTACULO,       /* Objecto estático — luz máxima         */
+    STATE_IDLE       = 0,  /* Repouso — luz apagada ou no mínimo  */
+    STATE_LIGHT_ON,        /* Detecção activa — luz acesa          */
+    STATE_SAFE_MODE,       /* Falha dupla radar+UDP — luz máxima   */
+    STATE_MASTER,          /* Líder da cadeia de postes            */
+    STATE_AUTONOMO,        /* UDP em falha, radar OK — modo local  */
+    STATE_OBSTACULO,       /* Objecto estático — luz máxima        */
 } system_state_t;
 
 
 /* ============================================================
-   TIPOS DE EVENTO  ← NOVO v4.0
-   ──────────────────────────────
-   Produzidos pelo event_manager e consumidos por sm_process_event.
-   Transportam os dados do veículo do tracking_manager para a FSM.
+   TIPOS DE EVENTO
+   ──────────────────────────────────────────────────────────
+   Produzidos pelo tracking_manager e consumidos por sm_process_event.
+   Transportam os dados do veículo para a FSM de forma desacoplada.
 ============================================================ */
 typedef enum {
-    SM_EVT_VEHICLE_DETECTED = 0,
-    SM_EVT_VEHICLE_APPROACHING,
-    SM_EVT_VEHICLE_PASSED,       /* saiu pela frente → aguarda B */
-    SM_EVT_VEHICLE_RECUOU,       /* saiu por trás → T=0 imediato */
-    SM_EVT_VEHICLE_LOCAL,
-    SM_EVT_VEHICLE_OBSTACULO,   /* Objecto parado na zona — activar STATE_OBSTACULO */
+    SM_EVT_VEHICLE_DETECTED  = 0, /* Veículo confirmado pelo tracking   */
+    SM_EVT_VEHICLE_APPROACHING,   /* Veículo em aproximação activa       */
+    SM_EVT_VEHICLE_PASSED,        /* Veículo saiu da zona do sensor      */
+    SM_EVT_VEHICLE_LOCAL,         /* Veículo detectado localmente        */
+    SM_EVT_VEHICLE_OBSTACULO,     /* Objecto parado — activar OBSTACULO  */
 } sm_event_type_t;
+
 
 
 /* ============================================================
@@ -63,7 +93,7 @@ void state_machine_init(void);
 
 /**
  * @brief Ciclo de manutenção a 100ms (timers, vizinhos, MASTER).
- *        v4.0: NÃO lê radar directamente.
+ *        NÃO lê radar directamente — recebe estado de saúde externo.
  *
  * @param comm_ok          true se UDP operacional.
  * @param is_master        true se este poste tem papel de MASTER.
@@ -78,13 +108,14 @@ void state_machine_task_start(void);
 
 
 /* ============================================================
-   PROCESSAMENTO DE EVENTOS  ← NOVO v4.0
+   PROCESSAMENTO DE EVENTOS
+   ──────────────────────────────────────────────────────────
+   Ponto central de entrada event-driven da FSM.
+   Chamado pela state_machine_task após desencapsular do tracking.
 ============================================================ */
 
 /**
- * @brief Processa um evento do pipeline tracking → event_manager.
- *        Ponto central de entrada event-driven da FSM.
- *        Chamado pelo event_manager após desencapsular da queue.
+ * @brief Processa um evento do pipeline tracking → FSM.
  *
  * @param type       Tipo de evento (SM_EVT_*)
  * @param vehicle_id ID estável do veículo (tracking_manager)
@@ -100,41 +131,47 @@ void sm_process_event(sm_event_type_t type,
 
 
 /* ============================================================
-   EVENTOS EXTERNOS (mantidos por compatibilidade)
+   EVENTOS EXTERNOS — GESTÃO DE VIZINHOS
 ============================================================ */
 
-/**
- * @brief Shim de compatibilidade v3.x → v4.0.
- *        Delega para sm_process_event(SM_EVT_VEHICLE_LOCAL).
- *        Será removido na v5.0.
- * @deprecated Usar sm_process_event() directamente.
- */
-void sm_on_radar_detect(float vel);
-
+/** @brief Chamado quando vizinho direito fica offline. */
 void sm_on_right_neighbor_offline(void);
+
+/** @brief Chamado quando vizinho direito volta online. */
 void sm_on_right_neighbor_online(void);
 
 /**
  * @brief Injeta carro de teste sem radar nem simulador.
- *        Delega para sm_process_event(SM_EVT_VEHICLE_LOCAL).
+ *        Útil para validação via JTAG/GDB em bancada.
+ * @param vel Velocidade simulada em km/h
  */
 void sm_inject_test_car(float vel);
 
+/**
+ * @brief Shim de compatibilidade v3.x → v4.0.
+ *        Delega para sm_process_event(SM_EVT_VEHICLE_LOCAL).
+ * @deprecated Usar sm_process_event() directamente.
+ */
+void sm_on_radar_detect(float vel);
+
 
 /* ============================================================
-   GETTERS
+   GETTERS — ESTADO CORRENTE
 ============================================================ */
-system_state_t state_machine_get_state(void);
-const char    *state_machine_get_state_name(void);
-int            state_machine_get_T(void);
-int            state_machine_get_Tc(void);
-float          state_machine_get_last_speed(void);
-bool           state_machine_radar_ok(void);
-bool           sm_is_obstaculo(void);
+system_state_t state_machine_get_state(void);      /* Estado da FSM          */
+const char    *state_machine_get_state_name(void); /* Nome em texto          */
+int            state_machine_get_T(void);          /* Contador T             */
+int            state_machine_get_Tc(void);         /* Contador Tc            */
+float          state_machine_get_last_speed(void); /* Última velocidade km/h */
+bool           state_machine_radar_ok(void);       /* Saúde do radar         */
+bool           sm_is_obstaculo(void);              /* true se em OBSTACULO   */
 
 
 /* ============================================================
    SIMULADOR — apenas USE_RADAR == 0
+   ──────────────────────────────────────────────────────────
+   Funções de simulação física de veículos para testes em bancada.
+   O simulador gera carros virtuais com velocidades realistas.
 ============================================================ */
 #if USE_RADAR == 0
 void sim_init_mutex(void);

@@ -7,7 +7,15 @@
    Estudantes: Luis Custodio | Tiago Moreno
    Plataforma: ESP32 (ESP-IDF v5.x)
 
-  
+   Camada de abstracção sobre o udp_manager.
+   A state_machine chama estas funções sem conhecer IPs.
+   O comm_manager resolve o vizinho correcto e calcula ETA.
+
+   Alterações v1.x → v2.0:
+   ─────────────────────────
+   1. comm_send_tc_inc() e comm_send_spd() aceitam x_mm.
+      Propaga posição lateral do alvo ao poste seguinte.
+   2. comm_notify_prev_passed() mantém assinatura (não usa x_mm).
 ============================================================ */
 #ifndef COMM_MANAGER_H
 #define COMM_MANAGER_H
