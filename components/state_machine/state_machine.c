@@ -6,21 +6,7 @@
    AUTORES    : Luis Custódio | Tiago Moreno
    PLATAFORMA : ESP32 (ESP-IDF v5.x)
 
-   MELHORIAS v4.0 → v5.0:
-   ──────────────────────────────────────────────────────────
-   1. Log excessivo corrigido: UPDATE início removido do ciclo
-      a 100ms (causava flood no monitor série).
-   2. TC_TIMEOUT_MS e T_STUCK_TIMEOUT_MS movidos para system_config.h
-      (fonte única de verdade — eliminadas duplicações).
-   3. AUTONOMO_DELAY_MS e OBSTACULO_REMOVE_MS lidos de system_config.h.
-   4. Modo OBSTÁCULO: timeout de remoção automática implementado
-      com base em OBSTACULO_REMOVE_MS (antes não havia remoção).
-   5. Comentários em todos os blocos lógicos — código mais legível.
-      - Sem WiFi + radar OK → AUTONOMO imediato ocorria antes de
-        verificar SAFE MODE — reordenado para prioridade correcta.
-   7. Comentários em todos os blocos lógicos — código mais legível.
-   8. ESP_LOGI de APAGAR_PEND removido do ciclo quente (reduz UART).
-   9. s_radar_degradado removido (variável sem uso após v4.0).
+  
 ============================================================ */
 
 #include "state_machine.h"
@@ -412,7 +398,7 @@ void sm_process_event(sm_event_type_t type,
             }
             break;
 
-        /* ── Veículo em aproximação activa ──────────────────── */
+       /* ── Veículo em aproximação activa ──────────────────── */
         case SM_EVT_VEHICLE_APPROACHING:
             ESP_LOGI(TAG, "[EVT] APPROACHING id=%u vel=%.1f km/h eta=%lums",
                      vehicle_id, vel, (unsigned long)eta_ms);
@@ -433,12 +419,9 @@ void sm_process_event(sm_event_type_t type,
             s_last_speed     = vel;
             s_last_detect_ms = _agora_ms();
             s_apagar_pend    = false;
-
-            /* Propaga para vizinho direito se disponível */
-            if (s_right_online) {
-                comm_send_tc_inc(vel, x_mm);
-                comm_send_spd(vel, x_mm);
-            }
+            /* Sem propagação UDP — APPROACHING só agenda pré-acendimento local.
+               TC_INC é enviado exclusivamente por EVT_LOCAL e EVT_DETECTED. */
+            
             break;
 
         /* ── Veículo saiu da zona do radar ─────────────────── */

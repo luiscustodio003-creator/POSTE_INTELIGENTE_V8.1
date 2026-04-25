@@ -275,8 +275,8 @@ void tracking_manager_update(const radar_data_t *data)
                 if (sl->pub.speed_signed <= AFASTAR_THRESHOLD_KMH) {
                     sl->pub.state = TRK_STATE_APPROACHING;
                     sl->pub.event_approach_pending = true;
-                    sl->pub.eta_ms = _calcular_eta(sl->pub.distance_m,
-                                                   sl->pub.speed_kmh);
+                    sl->pub.eta_ms = _calcular_eta(sl->pub.distance_m,sl->pub.speed_kmh);
+                    
                     ESP_LOGI(TAG, "[ID %u] APPROACHING vel=%.1f km/h dist=%.1fm ETA=%lums",
                              sl->pub.id, sl->pub.speed_kmh,
                              sl->pub.distance_m, (unsigned long)sl->pub.eta_ms);

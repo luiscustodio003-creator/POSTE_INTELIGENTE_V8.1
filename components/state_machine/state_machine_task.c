@@ -226,26 +226,26 @@ static void fsm_task(void *arg)
         if (tracking_manager_get_vehicles(veiculos, &count)) {
             for (uint8_t i = 0; i < count; i++) {
                 tracked_vehicle_t *v = &veiculos[i];
-                if (v->event_detected_pending) {
+
+                if (v->event_detected_pending)
                     sm_process_event(SM_EVT_VEHICLE_DETECTED,
                         v->id, v->speed_kmh, v->eta_ms, (int16_t)v->x_mm);
-                    tracking_manager_clear_events(v->id);
-                }
-                if (v->event_approach_pending) {
+
+                if (v->event_approach_pending)
                     sm_process_event(SM_EVT_VEHICLE_APPROACHING,
                         v->id, v->speed_kmh, v->eta_ms, (int16_t)v->x_mm);
-                    tracking_manager_clear_events(v->id);
-                }
-                if (v->event_passed_pending) {
+
+                if (v->event_passed_pending)
                     sm_process_event(SM_EVT_VEHICLE_PASSED,
                         v->id, v->speed_kmh, 0, (int16_t)v->x_mm);
-                    tracking_manager_clear_events(v->id);
-                }
-                if (v->event_obstaculo_pending) {
+
+                if (v->event_obstaculo_pending)
                     sm_process_event(SM_EVT_VEHICLE_OBSTACULO,
                         v->id, v->speed_kmh, 0, (int16_t)v->x_mm);
-                    tracking_manager_clear_events(v->id);
-                }
+
+                /* Limpa todas as flags só depois de processar todos os eventos */
+                tracking_manager_clear_events(v->id);
+                
             }
         }
 
