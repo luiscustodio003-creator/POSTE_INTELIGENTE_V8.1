@@ -1,13 +1,18 @@
 idf_component_register(
     SRCS
-        "state_machine.c"
-        "state_machine_task.c"
+        "fsm_core.c"
+        "fsm_events.c"
+        "fsm_network.c"
+        "fsm_timer.c"
+        "fsm_sim.c"
+        "fsm_task.c"
     INCLUDE_DIRS "."
     REQUIRES
         dali_manager
         comm_manager
         radar_manager
         display_manager
+        tracking_manager
         system_monitor
         config
         freertos

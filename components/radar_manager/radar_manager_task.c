@@ -110,7 +110,7 @@ static void radar_task(void *arg)
         /* true  = frame válido COM alvos → radar activo e com dados
            false = frame inválido OU sem alvos → radar pode estar
                    degradado (a FSM distingue com RADAR_FAIL_COUNT) */
-        tracking_manager_task_notify_frame(ok && dados.count > 0);
+        tracking_manager_task_notify_frame(ok);
 
 #else
         /* Modo USE_RADAR=0: simulador corre na fsm_task (v4.0).

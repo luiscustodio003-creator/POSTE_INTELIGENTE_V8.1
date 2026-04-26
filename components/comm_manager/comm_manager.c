@@ -49,32 +49,39 @@ bool comm_init(void)
 ============================================================ */
 bool comm_status_ok(void)
 {
-    /* Socket inválido — comm offline */
-    if (s_iniciado) {
-        if (udp_manager_get_socket() < 0) {
-            s_iniciado = false;
-            ESP_LOGW(TAG, "Socket UDP inválido — comm offline");
-        }
+    /* Socket inválido — reseta estado */
+    if (s_iniciado && udp_manager_get_socket() < 0) {
+        s_iniciado = false;
+        ESP_LOGW(TAG, "Socket UDP inválido — comm offline");
     }
 
-    /* Sem vizinhos conhecidos após inicialização — comm degradado.
-     * Força AUTONOMO na FSM até descobrir pelo menos um vizinho. */
-    if (s_iniciado) {
-        neighbor_t *viz_esq = udp_manager_get_neighbor_by_pos(POST_POSITION - 1);
-        neighbor_t *viz_dir = udp_manager_get_neighbor_by_pos(POST_POSITION + 1);
+    if (!s_iniciado) return false;
 
-        bool tem_vizinho = (viz_esq && viz_esq->active &&
-                            viz_esq->status != NEIGHBOR_OFFLINE) ||
-                           (viz_dir && viz_dir->active &&
-                            viz_dir->status != NEIGHBOR_OFFLINE);
+    /* Período de graça — aguarda DISCOVER completar antes
+       de verificar vizinhos. Evita AUTONOMO prematuro. */
+    static uint64_t s_init_ms = 0;
+    if (s_init_ms == 0)
+        s_init_ms = (uint64_t)(esp_timer_get_time() / 1000ULL);
 
-        if (!tem_vizinho) {
-            /* Sem vizinhos — comporta-se como offline para a FSM */
-            return false;
-        }
+    uint64_t agora = (uint64_t)(esp_timer_get_time() / 1000ULL);
+    if ((agora - s_init_ms) < (uint64_t)AUTONOMO_DELAY_MS)
+        return true;  /* ← ainda no período de graça — não verifica vizinhos */
+
+    /* Após período de graça — verifica vizinhos normalmente */
+    neighbor_t *viz_esq = udp_manager_get_neighbor_by_pos(POST_POSITION - 1);
+    neighbor_t *viz_dir = udp_manager_get_neighbor_by_pos(POST_POSITION + 1);
+
+    bool tem_vizinho = (viz_esq && viz_esq->active &&
+                        viz_esq->status != NEIGHBOR_OFFLINE) ||
+                       (viz_dir && viz_dir->active &&
+                        viz_dir->status != NEIGHBOR_OFFLINE);
+
+    if (!tem_vizinho) {
+        ESP_LOGD(TAG, "comm_status_ok: sem vizinhos — AUTONOMO");
+        return false;
     }
 
-    return s_iniciado;
+    return true;
 }
 
 /* ============================================================
@@ -208,4 +215,11 @@ void comm_send_master_claim(void)
     if (!ip) return;
     udp_manager_send_master_claim(ip);
     ESP_LOGI(TAG, "MASTER_CLAIM → %s", ip);
+}
+
+bool comm_left_known(void)
+{
+    if (POST_POSITION == 0) return false;
+    neighbor_t *v = udp_manager_get_neighbor_by_pos(POST_POSITION - 1);
+    return (v != NULL && v->active);
 }

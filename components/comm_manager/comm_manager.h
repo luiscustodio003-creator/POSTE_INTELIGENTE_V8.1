@@ -77,5 +77,7 @@ void comm_notify_prev_passed(float speed);
  */
 void comm_send_master_claim(void);
 
+bool comm_left_known(void);
+
 #endif /* COMM_MANAGER_H */
 

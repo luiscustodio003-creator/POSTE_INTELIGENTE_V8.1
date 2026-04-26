@@ -42,9 +42,9 @@
    ATENÇÃO: POST_POSITION deve ser único e sequencial.
             POSTE_ID     deve ser único em toda a rede.
 ============================================================ */
-#define POSTE_ID              2
-#define POSTE_NAME            "POSTE 02"
-#define POST_POSITION         1
+#define POSTE_ID              1
+#define POSTE_NAME            "POSTE 01"
+#define POST_POSITION         0
 
 
 /* ============================================================
@@ -88,7 +88,7 @@
    RADAR_DETECT_M → distância a que se considera "detecção local"
                     usada para calcular ETA para o próximo poste
 ============================================================ */
-#define POSTE_DIST_M          50
+#define POSTE_DIST_M          2         /* Distancia entre postes  */
 #define RADAR_MAX_M           2         /* TESTE: 2m | PRODUÇÃO: 10 */
 #define RADAR_MAX_MM          (RADAR_MAX_M * 1000)
 #define RADAR_DETECT_M        1

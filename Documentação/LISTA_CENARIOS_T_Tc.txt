@@ -1,0 +1,278 @@
+===============================================================================
+        POSTE INTELIGENTE v8 — LISTA COMPLETA DE CENÁRIOS T/Tc
+===============================================================================
+Projecto  : Poste Inteligente v8
+Autores   : Luis Custódio | Tiago Moreno
+Data      : 2026-04-26
+===============================================================================
+
+LEGENDA:
+  T   = veículos detectados localmente pelo radar deste poste
+  Tc  = veículos anunciados via UDP (a caminho)
+  →   = transição de estado
+  ✓   = condição satisfeita
+  [A] = acção executada
+
+===============================================================================
+CENÁRIO 1 — OPERAÇÃO NORMAL — N POSTES
+===============================================================================
+Topologia : P0(MASTER) → P1(IDLE) → P2(IDLE) → ... → PN(IDLE)
+Condição  : Todos os postes com radar e WiFi operacionais
+Veículo   : Desloca-se de P0 para PN a velocidade constante
+
+───────────────────────────────────────────────────────────────────────────────
+PASSO 1 — P0 detecta veículo (EVT_LOCAL)
+───────────────────────────────────────────────────────────────────────────────
+  P0  : T=0→1  Tc=0    MASTER → LIGHT_ON   [fade up]
+  P1  : T=0    Tc=0→1  IDLE               [pré-acende com ETA]
+  P2  : T=0    Tc=0    IDLE
+  PN  : T=0    Tc=0    IDLE
+  UDP : P0 → P1 : TC_INC + SPD
+
+───────────────────────────────────────────────────────────────────────────────
+PASSO 2 — P1 detecta veículo (EVT_LOCAL)
+───────────────────────────────────────────────────────────────────────────────
+  P0  : T=1→0  Tc=0    LIGHT_ON → MASTER   [fade down após TRAFIC_TIMEOUT]
+  P1  : T=0→1  Tc=1→0  IDLE → LIGHT_ON     [fade up]
+  P2  : T=0    Tc=0→1  IDLE               [pré-acende com ETA]
+  PN  : T=0    Tc=0    IDLE
+  UDP : P1 → P0 : PASSED (T-- em P0)
+        P1 → P2 : TC_INC + SPD
+
+───────────────────────────────────────────────────────────────────────────────
+PASSO 3 — P2 detecta veículo (EVT_LOCAL)
+───────────────────────────────────────────────────────────────────────────────
+  P0  : T=0    Tc=0    MASTER
+  P1  : T=1→0  Tc=0    LIGHT_ON → IDLE     [fade down após TRAFIC_TIMEOUT]
+  P2  : T=0→1  Tc=1→0  IDLE → LIGHT_ON     [fade up]
+  P3  : T=0    Tc=0→1  IDLE               [pré-acende com ETA]
+  PN  : T=0    Tc=0    IDLE
+  UDP : P2 → P1 : PASSED (T-- em P1)
+        P2 → P3 : TC_INC + SPD
+
+───────────────────────────────────────────────────────────────────────────────
+PASSO N — PN detecta veículo (EVT_LOCAL) — FIM DE LINHA
+───────────────────────────────────────────────────────────────────────────────
+  P0    : T=0  Tc=0    MASTER
+  P1    : T=0  Tc=0    IDLE
+  ...
+  PN-1  : T=1→0  Tc=0  LIGHT_ON → IDLE   [fade down após TRAFIC_TIMEOUT]
+  PN    : T=0→1  Tc=1→0  IDLE → LIGHT_ON [fade up]
+  UDP   : PN → PN-1 : PASSED (T-- em PN-1)
+          PN não envia TC_INC — sem vizinho direito
+
+───────────────────────────────────────────────────────────────────────────────
+PASSO N+1 — Veículo sai da zona de PN (EVT_PASSED) — FIM DE LINHA
+───────────────────────────────────────────────────────────────────────────────
+  P0    : T=0  Tc=0    MASTER
+  P1    : T=0  Tc=0    IDLE
+  ...
+  PN-1  : T=0  Tc=0    IDLE
+  PN    : T=1→0  Tc=0  LIGHT_ON           [agenda apagamento]
+          Após TRAFIC_TIMEOUT_MS → IDLE   [fade down]
+  UDP   : PN → PN-1 : SPD (sem TC_INC)
+
+  NOTA: Este comportamento aplica-se ao POSTE N — qualquer que
+        seja o último poste activo, independentemente do total.
+
+
+===============================================================================
+CENÁRIO 1.1 — FALHA DE POSTE INTERMÉDIO
+===============================================================================
+Topologia : PA(AUTONOMO) — PB(OFFLINE) — PC(MASTER) → PD(IDLE)
+Condição  : Poste B sem funcionamento — linha parte-se em dois segmentos
+
+───────────────────────────────────────────────────────────────────────────────
+SEGMENTO ESQUERDO — PA opera em modo AUTONOMO
+───────────────────────────────────────────────────────────────────────────────
+  SUB-CENÁRIO: PA com Radar ON + WiFi OFF
+    PA  : T=0    Tc=0    AUTONOMO
+    [veículo detectado]
+    PA  : T=0→1  Tc=0    AUTONOMO → LIGHT_ON  [fade up]
+    [veículo sai — EVT_PASSED]
+    PA  : T=1→0  Tc=0    LIGHT_ON             [agenda apagamento]
+          Após TRAFIC_TIMEOUT_MS → AUTONOMO   [fade down]
+    UDP : nenhum — sem WiFi
+
+───────────────────────────────────────────────────────────────────────────────
+POSTE B — OFFLINE (3 sub-cenários)
+───────────────────────────────────────────────────────────────────────────────
+  B1 — Radar OFF + WiFi OFF:
+    PB  : T=0  Tc=0    SAFE_MODE  [DALI 50%, nunca apaga]
+    Saída: só quando radar recupera → IDLE
+
+  B2 — Radar ON + WiFi OFF:
+    PB  : T=0    Tc=0    AUTONOMO
+    [veículo detectado]
+    PB  : T=0→1  Tc=0    AUTONOMO → LIGHT_ON  [fade up]
+    [veículo sai]
+    PB  : T=1→0  Tc=0    LIGHT_ON             [agenda apagamento]
+          Após TRAFIC_TIMEOUT_MS → AUTONOMO   [fade down]
+    UDP : nenhum — sem WiFi
+
+  B3 — Radar OFF + WiFi ON:
+    PB  : T=0  Tc=0    SAFE_MODE  [DALI 50%, nunca apaga]
+    Saída: só quando radar recupera → IDLE
+    Razão: sem radar o poste está cego — WiFi não compensa
+
+───────────────────────────────────────────────────────────────────────────────
+SEGMENTO DIREITO — PC assume MASTER temporário
+───────────────────────────────────────────────────────────────────────────────
+  Condição: viz. esq. (PB) offline há > AUTONOMO_DELAY_MS
+  PC  : T=0  Tc=0    IDLE → MASTER  [assume liderança]
+  [veículo detectado em PC — EVT_LOCAL]
+  PC  : T=0→1  Tc=0    MASTER → LIGHT_ON  [fade up]
+  PD  : T=0    Tc=0→1  IDLE              [pré-acende com ETA]
+  UDP : PC → PD : TC_INC + SPD
+  [veículo detectado em PD — EVT_LOCAL]
+  PC  : T=1→0  Tc=0    LIGHT_ON → MASTER  [fade down após TRAFIC_TIMEOUT]
+  PD  : T=0→1  Tc=1→0  IDLE → LIGHT_ON    [fade up]
+  UDP : PD → PC : PASSED (T-- em PC)
+        PD sem vizinho direito — não envia TC_INC
+  [veículo sai de PD — EVT_PASSED]
+  PD  : T=1→0  Tc=0    LIGHT_ON           [agenda apagamento]
+        Após TRAFIC_TIMEOUT_MS → IDLE     [fade down]
+
+
+===============================================================================
+CENÁRIO 2 — OBSTÁCULO PARADO NA ZONA DO RADAR
+===============================================================================
+Topologia : PA(MASTER) → PB(IDLE) → PC(IDLE)
+Condição  : Veículo para dentro da zona de PA antes de sair
+
+───────────────────────────────────────────────────────────────────────────────
+FASE 1 — Detecção inicial (comportamento normal)
+───────────────────────────────────────────────────────────────────────────────
+  PA  : T=0→1  Tc=0    MASTER → LIGHT_ON   [fade up]
+  PB  : T=0    Tc=0→1  IDLE              [pré-acende com ETA]
+  UDP : PA → PB : TC_INC + SPD
+
+───────────────────────────────────────────────────────────────────────────────
+FASE 2 — Veículo para — EVT_OBSTACULO detectado em PA
+───────────────────────────────────────────────────────────────────────────────
+  Condição: vel ≤ 5 km/h durante OBSTACULO_MIN_FRAMES consecutivos
+  PA  : T=1    Tc=0    LIGHT_ON → OBSTACULO  [DALI 100%, posição fixa display]
+  PB  : T=0    Tc=1→0  IDLE                 [fade down — veículo cancelado]
+  UDP : PA → PB : PASSED (cancela Tc=1 em PB)
+
+───────────────────────────────────────────────────────────────────────────────
+FASE 3 — Outros veículos passam enquanto obstáculo activo
+───────────────────────────────────────────────────────────────────────────────
+  [novo veículo ID diferente entra na zona de PA]
+  PA  : T=1→2  Tc=0    OBSTACULO  [luz já 100% — não muda]
+  PB  : T=0    Tc=0→1  IDLE       [pré-acende com ETA]
+  UDP : PA → PB : TC_INC + SPD   [fluxo normal — obstáculo não bloqueia]
+  [novo veículo detectado em PB — EVT_LOCAL]
+  PA  : T=2→1  Tc=0    OBSTACULO
+  PB  : T=0→1  Tc=1→0  IDLE → LIGHT_ON  [fade up]
+  UDP : PB → PA : PASSED (T-- em PA: 2→1)
+
+───────────────────────────────────────────────────────────────────────────────
+FASE 4 — Remoção automática do obstáculo
+───────────────────────────────────────────────────────────────────────────────
+  Condição: sem detecção do obstáculo durante OBSTACULO_REMOVE_MS
+  PA  : T=1→0  Tc=0    OBSTACULO → MASTER  [fade down, display limpa]
+  [T=1 porque o obstáculo original ainda está contado]
+  [T decrementará quando EVT_PASSED chegar ou T_STUCK_TIMEOUT disparar]
+
+
+===============================================================================
+CENÁRIO 3 — DOIS POSTES (CASO MÍNIMO)
+===============================================================================
+Topologia : PA(MASTER) → PB(IDLE)
+Condição  : Só dois postes activos na linha
+
+───────────────────────────────────────────────────────────────────────────────
+PASSO 1 — PA detecta veículo
+───────────────────────────────────────────────────────────────────────────────
+  PA  : T=0→1  Tc=0    MASTER → LIGHT_ON  [fade up]
+  PB  : T=0    Tc=0→1  IDLE              [pré-acende com ETA]
+  UDP : PA → PB : TC_INC + SPD
+
+───────────────────────────────────────────────────────────────────────────────
+PASSO 2 — PB detecta veículo
+───────────────────────────────────────────────────────────────────────────────
+  PA  : T=1→0  Tc=0    LIGHT_ON → MASTER  [fade down após TRAFIC_TIMEOUT]
+  PB  : T=0→1  Tc=1→0  IDLE → LIGHT_ON    [fade up]
+  UDP : PB → PA : PASSED (T-- em PA: 1→0)
+        PB sem vizinho direito — não envia TC_INC
+
+───────────────────────────────────────────────────────────────────────────────
+PASSO 3 — Veículo sai da zona de PB (EVT_PASSED)
+───────────────────────────────────────────────────────────────────────────────
+  PA  : T=0  Tc=0    MASTER
+  PB  : T=1→0  Tc=0  LIGHT_ON            [agenda apagamento]
+        Após TRAFIC_TIMEOUT_MS → IDLE    [fade down]
+  UDP : PB → PA : SPD (sem TC_INC)
+
+  Estado final:
+  PA  : T=0  Tc=0    MASTER
+  PB  : T=0  Tc=0    IDLE
+
+
+===============================================================================
+CENÁRIO 4 — SAFE MODE COM RECUPERAÇÃO
+===============================================================================
+Topologia : PA(MASTER) → PB(IDLE) → PC(IDLE)
+Condição  : PB perde radar — depois recupera
+
+───────────────────────────────────────────────────────────────────────────────
+FASE 1 — PB perde radar
+───────────────────────────────────────────────────────────────────────────────
+  PA  : T=0  Tc=0    MASTER
+  PB  : T=0  Tc=0    IDLE → SAFE_MODE  [DALI 50% após RADAR_FAIL_COUNT ciclos]
+  PC  : T=0  Tc=0    IDLE → MASTER     [viz. esq. KO após AUTONOMO_DELAY_MS]
+
+  Fluxo de veículos durante SAFE_MODE de PB:
+  PA  detecta → LIGHT_ON → TC_INC para PB → PB ignora (SAFE_MODE)
+  PC  detecta como MASTER → LIGHT_ON → TC_INC para PC+1 se existir
+
+───────────────────────────────────────────────────────────────────────────────
+FASE 2 — PB recupera radar
+───────────────────────────────────────────────────────────────────────────────
+  PB  : T=0  Tc=0    SAFE_MODE → IDLE  [radar OK após RADAR_OK_COUNT frames]
+  PC  : T=0  Tc=0    MASTER → IDLE     [viz. esq. voltou — cede MASTER]
+  PA  : T=0  Tc=0    MASTER            [mantém liderança — posição 0]
+  Fluxo normal restabelecido em toda a cadeia.
+
+
+===============================================================================
+RESUMO DOS CONTADORES POR EVENTO
+===============================================================================
+
+  EVENTO            │ T deste poste │ Tc deste poste │ UDP enviado
+  ──────────────────┼───────────────┼────────────────┼─────────────────────
+  EVT_LOCAL         │ T++           │ Tc-- (se Tc>0) │ PASSED → esq.
+                    │               │                │ TC_INC + SPD → dir.
+  EVT_DETECTED      │ —             │ —              │ —
+  EVT_APPROACHING   │ —             │ —              │ —
+  EVT_PASSED        │ T-- (se T>0)  │ —              │ SPD → dir. (se online)
+  EVT_OBSTACULO     │ —             │ —              │ PASSED → dir. (1ª vez)
+  on_tc_inc_received│ —             │ Tc++           │ —
+  on_prev_passed    │ T-- (se T>0)  │ —              │ —
+
+
+===============================================================================
+CONDIÇÕES DE TRANSIÇÃO DE ESTADO
+===============================================================================
+
+  ESTADO ACTUAL │ CONDIÇÃO                          │ ESTADO SEGUINTE
+  ──────────────┼───────────────────────────────────┼─────────────────
+  IDLE          │ is_master=true                    │ MASTER
+  IDLE          │ EVT_LOCAL ou EVT_APPROACHING      │ LIGHT_ON
+  IDLE          │ !radar_ok                         │ SAFE_MODE
+  IDLE          │ !comm_ok && radar_ok              │ AUTONOMO
+  IDLE          │ sem vizinhos > AUTONOMO_DELAY_MS  │ AUTONOMO
+  MASTER        │ EVT_LOCAL ou EVT_APPROACHING      │ LIGHT_ON
+  MASTER        │ !radar_ok                         │ SAFE_MODE
+  LIGHT_ON      │ T=0 && Tc=0 && TRAFIC_TIMEOUT    │ IDLE ou MASTER
+  LIGHT_ON      │ EVT_OBSTACULO                     │ OBSTACULO
+  AUTONOMO      │ comm_ok && tem_vizinho            │ IDLE ou MASTER
+  AUTONOMO      │ !radar_ok                         │ SAFE_MODE
+  SAFE_MODE     │ radar_ok                          │ IDLE
+  OBSTACULO     │ sem detecção > OBSTACULO_REMOVE_MS│ IDLE ou MASTER
+
+
+===============================================================================
+FIM DO DOCUMENTO
+===============================================================================
