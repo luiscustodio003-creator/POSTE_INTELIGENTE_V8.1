@@ -745,8 +745,11 @@ static void ui_create(void)
 
     /* ── ZONA HARDWARE (y: 37..92) ──────────────────────────── */
     /* WiFi, estado radar, vizinhos, barra DALI */
-    label_wifi     = _label_novo(scr,   8, 39, COR_CINZENTO, "WiFi: ---");
-    label_radar_st = _label_novo(scr, 130, 39, COR_CINZENTO, "Radar: ---");
+    //label_wifi     = _label_novo(scr,   8, 39, COR_CINZENTO, "WiFi: ---");
+    label_wifi = _label_novo(scr, 8, 39, COR_CINZENTO, LV_SYMBOL_WIFI " ---");
+
+    //label_radar_st = _label_novo(scr, 130, 39, COR_CINZENTO, "Radar: ---");
+    label_radar_st = _label_novo(scr, 130, 39, COR_CINZENTO, LV_SYMBOL_EYE_OPEN " ---");
 
     /* Linha de vizinhos */
     lv_obj_t *div_neb = lv_obj_create(scr);
@@ -756,9 +759,17 @@ static void ui_create(void)
     lv_obj_set_style_border_width(div_neb, 0, 0);
     lv_obj_set_style_pad_all(div_neb, 0, 0);
 
-    label_neb_esq = _label_novo(scr,   8, 57, COR_CINZ_CLARO, "E: ---");
+    
+
+    label_neb_esq = _label_novo(scr,   8, 57, COR_CINZ_CLARO, LV_SYMBOL_LEFT " ---");
+    label_neb_dir = _label_novo(scr, LCD_H_RES/2+4, 57, COR_CINZ_CLARO, LV_SYMBOL_RIGHT " ---");
+    label_dali = _label_novo(scr, 8, 76, COR_CINZENTO, LV_SYMBOL_TINT "  0%");
+
+    
+    /*label_neb_esq = _label_novo(scr,   8, 57, COR_CINZ_CLARO, "E: ---");
     label_neb_dir = _label_novo(scr, LCD_H_RES/2+4, 57, COR_CINZ_CLARO, "D: ---");
-    label_dali    = _label_novo(scr,   8, 76, COR_CINZENTO,   "DALI:  0%");
+    label_dali    = _label_novo(scr,   8, 76, COR_CINZENTO,   "DALI:  0%");*/
+  
 
     /* Barra de brilho DALI */
     bar_dali = lv_bar_create(scr);
@@ -964,66 +975,59 @@ void display_manager_task(void)
                 if (!label_wifi) break;
                 if (msg.wifi.connected) {
                     char buf[36];
-                    snprintf(buf, sizeof(buf), "WiFi: %s",
-                             msg.wifi.ip[0] ? msg.wifi.ip : "---");
-                    lv_label_set_text(label_wifi, buf);
-                    lv_obj_set_style_text_color(label_wifi,
-                        lv_color_hex(COR_VERDE), 0);
+                    snprintf(buf, sizeof(buf), "WiFi: %s",msg.wifi.ip[0] ? msg.wifi.ip : "---");
+                    //lv_label_set_text(label_wifi, buf);
+                    lv_label_set_text_fmt(label_wifi, LV_SYMBOL_WIFI " %s", msg.wifi.ip);
+                    lv_obj_set_style_text_color(label_wifi,lv_color_hex(COR_VERDE), 0);
                 } else {
-                    lv_label_set_text(label_wifi, "WiFi: OFF");
-                    lv_obj_set_style_text_color(label_wifi,
-                        lv_color_hex(COR_VERMELHO), 0);
+                    //lv_label_set_text(label_wifi, "WiFi: OFF");
+                    lv_label_set_text(label_wifi, LV_SYMBOL_WIFI " OFF");
+                    lv_obj_set_style_text_color(label_wifi,lv_color_hex(COR_VERMELHO), 0);
                 }
                 break;
 
             case DM_MSG_NEIGHBORS:
-                if (label_neb_esq) {
-                    char buf[32];
-                    if (msg.neb.nebL[0] && strcmp(msg.neb.nebL, "---") != 0) {
-                        snprintf(buf, sizeof(buf), "E: %s", msg.neb.nebL);
-                        lv_obj_set_style_text_color(label_neb_esq,
-                            lv_color_hex(msg.neb.leftOk ? COR_VERDE : COR_VERMELHO), 0);
-                    } else {
-                        snprintf(buf, sizeof(buf), "E: ---");
-                        lv_obj_set_style_text_color(label_neb_esq,
-                            lv_color_hex(COR_CINZ_CLARO), 0);
+                    if (label_neb_esq) {
+                        if (msg.neb.nebL[0] && strcmp(msg.neb.nebL, "---") != 0) {
+                            lv_label_set_text_fmt(label_neb_esq,
+                                LV_SYMBOL_LEFT " %s", msg.neb.nebL);
+                            lv_obj_set_style_text_color(label_neb_esq,
+                                lv_color_hex(msg.neb.leftOk ? COR_VERDE : COR_VERMELHO), 0);
+                        } else {
+                            lv_label_set_text(label_neb_esq, LV_SYMBOL_LEFT " ---");
+                            lv_obj_set_style_text_color(label_neb_esq,
+                                lv_color_hex(COR_CINZ_CLARO), 0);
+                        }
                     }
-                    lv_label_set_text(label_neb_esq, buf);
-                }
-                if (label_neb_dir) {
-                    char buf[32];
-                    if (msg.neb.nebR[0] && strcmp(msg.neb.nebR, "---") != 0) {
-                        snprintf(buf, sizeof(buf), "D: %s", msg.neb.nebR);
-                        lv_obj_set_style_text_color(label_neb_dir,
-                            lv_color_hex(msg.neb.rightOk ? COR_VERDE : COR_VERMELHO), 0);
-                    } else {
-                        snprintf(buf, sizeof(buf), "D: ---");
-                        lv_obj_set_style_text_color(label_neb_dir,
-                            lv_color_hex(COR_CINZ_CLARO), 0);
+                    if (label_neb_dir) {
+                        if (msg.neb.nebR[0] && strcmp(msg.neb.nebR, "---") != 0) {
+                            lv_label_set_text_fmt(label_neb_dir,
+                                LV_SYMBOL_RIGHT " %s", msg.neb.nebR);
+                            lv_obj_set_style_text_color(label_neb_dir,
+                                lv_color_hex(msg.neb.rightOk ? COR_VERDE : COR_VERMELHO), 0);
+                        } else {
+                            lv_label_set_text(label_neb_dir, LV_SYMBOL_RIGHT " ---");
+                            lv_obj_set_style_text_color(label_neb_dir,
+                                lv_color_hex(COR_CINZ_CLARO), 0);
+                        }
                     }
-                    lv_label_set_text(label_neb_dir, buf);
-                }
-                break;
+                    break;
 
-            case DM_MSG_HARDWARE:
+                case DM_MSG_HARDWARE:
                 if (label_radar_st) {
-                    char rbuf[20];
-                    snprintf(rbuf, sizeof(rbuf), "Radar: %s", msg.hw.radar_st);
-                    lv_label_set_text(label_radar_st, rbuf);
+                    lv_label_set_text_fmt(label_radar_st, "%s %s",
+                        msg.hw.radar_ok ? LV_SYMBOL_EYE_OPEN : LV_SYMBOL_EYE_CLOSE,
+                        msg.hw.radar_st);
                     uint32_t cor = COR_VERMELHO;
                     if (msg.hw.radar_ok)
                         cor = (msg.hw.radar_st[0] == 'S') ? 0xFFAA00 : COR_VERDE;
-                    lv_obj_set_style_text_color(label_radar_st,
-                        lv_color_hex(cor), 0);
+                    lv_obj_set_style_text_color(label_radar_st, lv_color_hex(cor), 0);
                 }
                 if (label_dali) {
-                    char buf[14];
-                    snprintf(buf, sizeof(buf), "DALI: %3d%%", msg.hw.brightness);
-                    lv_label_set_text(label_dali, buf);
+                    lv_label_set_text_fmt(label_dali, LV_SYMBOL_TINT " %3d%%", msg.hw.brightness);
                     lv_obj_set_style_text_color(label_dali,
-                        lv_color_hex(msg.hw.brightness > 10
-                                     ? COR_AMARELO : COR_CINZENTO), 0);
-                }
+                        lv_color_hex(msg.hw.brightness > 10 ? COR_AMARELO : COR_CINZENTO), 0);
+                    }
                 if (bar_dali)
                     lv_bar_set_value(bar_dali, (int)msg.hw.brightness, LV_ANIM_ON);
                 break;
