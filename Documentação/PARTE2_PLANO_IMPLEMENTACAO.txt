@@ -1,0 +1,585 @@
+===============================================================================
+        POSTE INTELIGENTE v8 — PARTE 2 — PLANO DE IMPLEMENTAÇÃO
+        MÓDULO DE MONITORIZAÇÃO E ANÁLISE ENERGÉTICA
+===============================================================================
+Projecto  : Poste Inteligente v8
+Autores   : Luis Custódio | Tiago Moreno
+Data      : 2026-04-25
+Versão    : 1.0
+===============================================================================
+
+
+===============================================================================
+1. CONTEXTO E OBJECTIVO
+===============================================================================
+
+A Parte 1 do projecto implementou o sistema de iluminação inteligente com:
+  - Protocolo T/Tc para propagação de tráfego entre postes
+  - Controlo DALI para regulação de brilho
+  - Comunicação UDP entre postes
+  - Gestão de estados (IDLE, LIGHT_ON, SAFE_MODE, OBSTACULO, AUTONOMO, MASTER)
+  - Radar HLK-LD2450 para detecção de veículos
+  - Display ST7789 para monitorização local
+
+A Parte 2 tem como objectivo implementar um sistema de monitorização e análise
+energética que permita:
+  1. Quantificar a energia consumida pelo sistema inteligente
+  2. Comparar com o consumo de uma instalação SAP 250W tradicional
+  3. Calcular a poupança energética e financeira obtida
+  4. Recolher dados de todos os postes da linha de forma automática
+  5. Apresentar os resultados de forma clara e acessível
+
+
+===============================================================================
+2. PREMISSAS TÉCNICAS
+===============================================================================
+
+INSTALAÇÃO DE REFERÊNCIA (antes da reabilitação):
+  Tecnologia    : Sódio de Alta Pressão (SAP) 250W
+  Consumo total : 280W por poste (250W lâmpada + 30W balastro)
+  Regulação     : Impossível — sempre a 100% quando ligado
+  Custo/noite   : 280W * 8h * 0.22€/kWh = 0.4928 €/poste/noite
+
+INSTALAÇÃO DO PROJECTO:
+  Tecnologia    : LED Dimável 100W com driver DALI integrado
+  Regulação     : 10% a 100% via protocolo DALI
+  Nível mínimo  : 15% → ~10W consumo real
+  Custo/noite   : ~0.248 kWh * 0.22€ = 0.0546 €/poste/noite (perfil típico)
+
+POUPANÇA ESTIMADA:
+  vs SAP 250W   : 88.9% de poupança energética
+  vs LED fixo   : 69.0% de poupança energética
+  ROI estimado  : 3.4 anos vs SAP existente
+
+PARÂMETROS DE OPERAÇÃO:
+  Período nocturno  : variável — depende do país, estação e horário
+  Horas típicas PT  : Inverno ~14h | Verão ~9h
+  Custo kWh PT 2025 : 0.22 €/kWh (configurável)
+  Factor CO2 PT 2024: 0.233 kg CO2/kWh
+
+
+===============================================================================
+3. PROBLEMA DO PERÍODO NOCTURNO — GESTÃO DA HORA
+===============================================================================
+
+PROBLEMA IDENTIFICADO:
+  O período de operação (luzes acesas) varia ao longo do ano e depende de:
+    - País e localização geográfica (latitude/longitude)
+    - Estação do ano (pôr e nascer do sol)
+    - Horário de verão/inverno
+    - Estado do WiFi (sem WiFi não há NTP)
+
+CENÁRIOS POSSÍVEIS:
+  1. WiFi OK          → NTP disponível → hora exacta → cálculo astronómico
+  2. WiFi OFF         → sem NTP → usar RTC interno + última hora NVS
+  3. SAFE_MODE longo  → sem hora fiável → usar horários fixos de fallback
+  4. Primeiro arranque→ sem histórico NVS → usar horários fixos config.h
+
+HIERARQUIA DE FALLBACK PARA A HORA:
+  1º NTP via WiFi                          ← mais preciso
+  2º RTC interno ESP32 + última hora NVS   ← razoável (deriva pequena)
+  3º Horários fixos guardados na NVS       ← aceitável
+  4º Horários fixos em system_config.h     ← último recurso
+
+SOLUÇÃO ADOPTADA:
+  Combinação de NTP (quando disponível) com fallback para RTC interno
+  e horários fixos configuráveis. Sem hardware adicional.
+
+
+===============================================================================
+4. PROBLEMA DA RECOLHA DE DADOS EM CADEIA
+===============================================================================
+
+PROBLEMA IDENTIFICADO:
+  Com uma linha de N postes, cada poste guarda os seus dados localmente.
+  Não há forma centralizada de recolher dados de todos os postes.
+  Postes em SAFE_MODE (sem WiFi) não podem enviar dados remotamente.
+
+SOLUÇÃO ADOPTADA — RECOLHA EM CADEIA:
+  Durante o dia (luzes apagadas), quando o UDP está livre de tráfego
+  de veículos, os postes enviam os dados energéticos em cadeia:
+
+  FASE 1 — RECOLHA (sentido último poste → poste 0):
+    Poste N   → envia dados próprios ao poste N-1
+    Poste N-1 → agrega dados N + próprios → envia ao poste N-2
+    ...
+    Poste 0   → recebe dados de toda a linha → envia ao servidor
+
+  FASE 2 — CONFIRMAÇÃO (sentido poste 0 → último poste):
+    Poste 0   → envia ACK ao poste 1 (dados recebidos)
+    Poste 1   → envia ACK ao poste 2
+    ...
+    Poste N   → recebe ACK → apaga dados da NVS (confirmado)
+
+  TIMING:
+    06h00 → Luzes apagam
+    06h10 → Início da recolha (margem configurável)
+    ~06h25 → Recolha completa para linha de 10 postes
+    06h30 → ACK em cadeia completo
+    ~16h restantes → margem até próxima sessão nocturna
+
+  POSTES OFFLINE (SAFE_MODE sem WiFi):
+    → Dado ausente na cadeia (marcado como "offline" no servidor)
+    → Quando WiFi recuperar → envia histórico acumulado na NVS
+    → Servidor agrega retroactivamente
+
+
+===============================================================================
+5. ARQUITECTURA DOS NOVOS MÓDULOS
+===============================================================================
+
+FICHEIROS A CRIAR:
+  time_manager.h          — declarações do gestor de hora
+  time_manager.c          — NTP, RTC interno, fallback NVS
+  energy_monitor.h        — declarações do monitor energético
+  energy_monitor.c        — acumuladores, cálculos, persistência NVS
+  energy_collector.h      — declarações do colector em cadeia
+  energy_collector.c      — protocolo de recolha D→A e ACK A→D
+  energy_web_server.h     — declarações do servidor HTTP
+  energy_web_server.c     — página web local no poste 0
+
+FICHEIROS A MODIFICAR:
+  system_config.h         — adicionar parâmetros energéticos e de hora
+  system_monitor.c        — inicializar novos módulos e NTP
+  state_machine_task.c    — adicionar chamada ao energy_monitor
+  CMakeLists.txt          — registar novos módulos
+
+
+===============================================================================
+6. MÓDULO 1 — time_manager
+===============================================================================
+
+FICHEIROS   : time_manager.h + time_manager.c
+DEPENDÊNCIAS: wifi_manager, nvs_flash, esp_sntp (ESP-IDF)
+PRIORIDADE  : 1ª a implementar — base de tudo
+
+RESPONSABILIDADES:
+  - Sincronizar hora via NTP quando WiFi disponível
+  - Manter RTC interno ESP32 actualizado
+  - Guardar/restaurar última hora conhecida na NVS
+  - Calcular pôr e nascer do sol para a localização configurada
+  - Determinar se é período nocturno ou diurno
+  - Detectar mudança de horário de verão/inverno
+  - Fornecer hora actual a todos os módulos
+
+API PÚBLICA PREVISTA:
+  void     time_manager_init(void)
+  void     time_manager_sync_ntp(void)
+  bool     time_manager_is_synced(void)
+  bool     time_manager_is_night(void)
+  uint64_t time_manager_get_epoch(void)
+  void     time_manager_get_datetime(struct tm *out)
+  uint32_t time_manager_sunrise_epoch(void)
+  uint32_t time_manager_sunset_epoch(void)
+
+PARÂMETROS EM system_config.h:
+  POSTE_LATITUDE           — latitude em graus decimais (ex: 38.7169)
+  POSTE_LONGITUDE          — longitude em graus decimais (ex: -9.1395)
+  NTP_SERVER               — servidor NTP (ex: "pool.ntp.org")
+  NTP_SYNC_INTERVAL_H      — intervalo de ressincronização (ex: 24h)
+  HORA_LIGAR_FALLBACK      — hora de ligar sem NTP (ex: 18)
+  HORA_APAGAR_FALLBACK     — hora de apagar sem NTP (ex: 7)
+  MARGEM_LIGAR_MIN         — minutos após pôr do sol para ligar (ex: 15)
+  MARGEM_APAGAR_MIN        — minutos após nascer do sol para apagar (ex: 15)
+
+INTEGRAÇÃO EM system_monitor.c:
+  /* Na inicialização: */
+  time_manager_init();
+
+  /* Quando WiFi conecta (já existe este bloco): */
+  if (wifi_manager_is_connected() && !s_comm_ok) {
+      comm_init();
+      time_manager_sync_ntp();   /* ← adicionar */
+  }
+
+
+===============================================================================
+7. MÓDULO 2 — energy_monitor
+===============================================================================
+
+FICHEIROS   : energy_monitor.h + energy_monitor.c
+DEPENDÊNCIAS: state_machine, dali_manager, tracking_manager,
+              time_manager, nvs_flash
+PRIORIDADE  : 2ª a implementar
+
+RESPONSABILIDADES:
+  - Acumular tempo em cada estado FSM a cada 100ms
+  - Calcular energia consumida real com curva DALI logarítmica
+  - Calcular energia de referência (SAP 250W e LED 100W fixo)
+  - Calcular poupança energética e financeira
+  - Contar veículos detectados e acendimentos por sessão
+  - Detectar início e fim da sessão nocturna via time_manager
+  - Guardar resumo diário na NVS às 06h00
+  - Manter histórico dos últimos 30 dias na NVS
+  - Fornecer dados ao energy_collector e à página web
+
+ESTRUTURA DE DADOS — SESSÃO NOCTURNA:
+  typedef struct {
+      uint32_t data_epoch;          /* timestamp da sessão */
+      uint8_t  poste_id;            /* ID do poste */
+      uint8_t  poste_position;      /* posição na cadeia */
+
+      /* Tempo acumulado por estado (segundos) */
+      uint32_t seg_idle;
+      uint32_t seg_light_on;
+      uint32_t seg_safe_mode;
+      uint32_t seg_obstaculo;
+      uint32_t seg_autonomo;
+      uint32_t seg_total;           /* total da sessão */
+
+      /* Energia (Wh) */
+      float    wh_consumidos;       /* consumo real com DALI */
+      float    wh_referencia_sap;   /* se fosse SAP 250W */
+      float    wh_referencia_led;   /* se fosse LED 100W fixo */
+      float    poupanca_wh_sap;     /* diferença vs SAP */
+      float    poupanca_wh_led;     /* diferença vs LED fixo */
+
+      /* Custo (euros) */
+      float    custo_real_eur;
+      float    custo_sap_eur;
+      float    custo_led_eur;
+      float    poupanca_eur_sap;
+      float    poupanca_eur_led;
+
+      /* CO2 (kg) */
+      float    co2_real_kg;
+      float    co2_evitado_sap_kg;
+
+      /* Tráfego */
+      uint32_t num_veiculos;
+      uint32_t num_acendimentos;
+      float    vel_media_kmh;
+
+      /* Qualidade dos dados */
+      bool     hora_sincronizada;   /* NTP disponível na sessão */
+      bool     dados_completos;     /* sem falhas de NVS */
+      uint8_t  dias_sem_wifi;       /* dias offline acumulados */
+  } energy_session_t;
+
+API PÚBLICA PREVISTA:
+  void              energy_monitor_init(void)
+  void              energy_monitor_add_sample(system_state_t, uint8_t dali)
+  void              energy_monitor_session_close(void)
+  energy_session_t *energy_monitor_get_today(void)
+  energy_session_t *energy_monitor_get_history(uint8_t days_ago)
+  float             energy_monitor_get_monthly_kwh(void)
+  float             energy_monitor_get_annual_kwh(void)
+  float             energy_monitor_get_monthly_savings_eur(void)
+
+INTEGRAÇÃO EM state_machine_task.c:
+  /* No loop da fsm_task, após heartbeat: */
+  energy_monitor_add_sample(
+      state_machine_get_state(),
+      dali_get_brightness()
+  );
+
+CURVA DALI — RELAÇÃO NÍVEL → CONSUMO REAL:
+  A norma IEC 62386 define curva logarítmica:
+    100% DALI → 100% potência → 100W
+     50% DALI →  ~42% potência →  42W
+     30% DALI →  ~22% potência →  22W
+     15% DALI →  ~10% potência →  10W
+  Fórmula: consumo_W = LAMPADA_LED_WATTS * pow(dali_pct/100.0, 1.7)
+
+
+===============================================================================
+8. MÓDULO 3 — energy_collector
+===============================================================================
+
+FICHEIROS   : energy_collector.h + energy_collector.c
+DEPENDÊNCIAS: energy_monitor, time_manager, udp_manager,
+              comm_manager, nvs_flash
+PRIORIDADE  : 3ª a implementar
+
+RESPONSABILIDADES:
+  - Detectar início do período diurno via time_manager
+  - Aguardar margem configurável após apagamento
+  - Iniciar recolha se for o último poste activo (sem vizinho direito)
+  - Receber dados do poste seguinte e agregar com os próprios
+  - Enviar pacote agregado ao poste anterior
+  - Gerir retransmissões (3 tentativas) em caso de falha
+  - Processar ACK do poste anterior e propagar ao seguinte
+  - Após ACK confirmado, limpar dados da NVS
+  - Guardar dados não confirmados para reenvio no dia seguinte
+
+PROTOCOLO DE MENSAGENS UDP (novos tipos):
+  ENERGY_DATA:<id>:<pos>:<json_dados>   — envio de dados energéticos
+  ENERGY_ACK:<id>:<data_epoch>          — confirmação de recepção
+  ENERGY_NACK:<id>:<motivo>             — rejeição (dados inválidos)
+
+FLUXO DO ÚLTIMO POSTE (sem vizinho direito):
+  1. time_manager detecta nascer do sol + margem
+  2. energy_collector_start() é chamado
+  3. Prepara pacote com dados próprios (energy_monitor_get_today)
+  4. Envia ENERGY_DATA ao vizinho esquerdo
+  5. Aguarda ENERGY_ACK (timeout: 30 segundos)
+  6. Se ACK recebido → limpa NVS → fim
+  7. Se timeout → retry (máx 3x) → guarda para amanhã
+
+FLUXO DO POSTE INTERMÉDIO:
+  1. Recebe ENERGY_DATA do vizinho direito
+  2. Agrega com os seus próprios dados
+  3. Envia pacote agregado ao vizinho esquerdo
+  4. Aguarda ENERGY_ACK do esquerdo
+  5. Se ACK recebido → envia ENERGY_ACK ao direito → limpa NVS
+  6. Se timeout → retry → guarda para amanhã
+
+FLUXO DO POSTE 0 (MASTER):
+  1. Recebe ENERGY_DATA com dados de toda a linha
+  2. Guarda na NVS local (página web)
+  3. Se WiFi disponível → envia ao servidor externo (HTTP POST)
+  4. Envia ENERGY_ACK em cadeia
+
+API PÚBLICA PREVISTA:
+  void energy_collector_init(void)
+  void energy_collector_start(void)
+  void energy_collector_on_data_received(const char *json, const char *ip)
+  void energy_collector_on_ack_received(uint32_t epoch)
+  bool energy_collector_is_busy(void)
+
+
+===============================================================================
+9. MÓDULO 4 — energy_web_server
+===============================================================================
+
+FICHEIROS   : energy_web_server.h + energy_web_server.c
+DEPENDÊNCIAS: energy_monitor, energy_collector, time_manager,
+              wifi_manager, esp_http_server (ESP-IDF)
+PRIORIDADE  : 4ª a implementar
+
+RESPONSABILIDADES:
+  - Servir página web HTTP no poste 0 (ou em qualquer poste com WiFi)
+  - Apresentar dados energéticos diários, mensais e anuais
+  - Comparar consumo real vs SAP 250W vs LED 100W fixo
+  - Mostrar histórico dos últimos 30 dias em gráfico de barras
+  - Mostrar dados de todos os postes da linha (agregados)
+  - Actualizar automaticamente a cada 60 segundos
+  - Acessível em: http://192.168.x.x/energia
+
+ESTRUTURA DA PÁGINA WEB:
+  SECÇÃO 1 — Cabeçalho
+    Nome do poste, ID, posição, hora actual, estado WiFi
+
+  SECÇÃO 2 — Estado em tempo real
+    Estado FSM actual, nível DALI actual (%), consumo instantâneo (W)
+    Tempo em cada estado hoje (barra de progresso)
+    Velocidade média dos veículos, nº veículos detectados hoje
+
+  SECÇÃO 3 — Análise comparativa (hoje)
+    Tabela: Sistema inteligente vs SAP 250W vs LED 100W fixo
+    Colunas: Consumo (kWh), Custo (€), CO2 (kg)
+    Linhas: Hoje, Este mês, Este ano
+    Poupança destacada em verde
+
+  SECÇÃO 4 — Historial (últimos 7 dias)
+    Gráfico de barras com consumo diário real
+    Linha de referência SAP e LED fixo
+    Tabela com valores por dia
+
+  SECÇÃO 5 — Linha completa (só no poste 0)
+    Tabela com dados de cada poste da linha
+    Estado de recolha (confirmado / pendente / offline)
+    Totais da linha
+
+  SECÇÃO 6 — Configuração
+    Potência LED (W), custo kWh (€), latitude/longitude
+    Botão "Forçar sincronização NTP"
+    Botão "Forçar recolha agora"
+
+TECNOLOGIA:
+  - HTML/CSS/JS embebido em string C (sem ficheiros externos)
+  - Gráficos com Chart.js via CDN (quando WiFi disponível)
+  - Fallback para tabelas HTML simples (sem internet)
+  - Auto-refresh via meta tag ou JavaScript
+
+
+===============================================================================
+10. ALTERAÇÕES AOS MÓDULOS EXISTENTES
+===============================================================================
+
+system_config.h — ADICIONAR:
+  /* Localização para cálculo astronómico */
+  #define POSTE_LATITUDE           38.7169
+  #define POSTE_LONGITUDE          -9.1395
+
+  /* Horários fixos de fallback */
+  #define HORA_LIGAR_FALLBACK      18
+  #define HORA_APAGAR_FALLBACK      7
+
+  /* Margens operacionais (minutos) */
+  #define MARGEM_LIGAR_MIN         15
+  #define MARGEM_APAGAR_MIN        15
+  #define ENERGY_COLLECT_DELAY_MIN 10
+
+  /* NTP */
+  #define NTP_SERVER               "pool.ntp.org"
+  #define NTP_SYNC_INTERVAL_H      24
+
+  /* Lâmpada e custos */
+  #define LAMPADA_LED_WATTS        100
+  #define LAMPADA_SAP_WATTS        280
+  #define CUSTO_KWH_EUROS          0.22f
+  #define FACTOR_CO2_KG_KWH        0.233f
+  #define ENERGY_HISTORY_DAYS      30
+
+system_monitor.c — ADICIONAR:
+  /* Na inicialização (system_monitor_start): */
+  time_manager_init();
+  energy_monitor_init();
+  energy_collector_init();
+  energy_web_server_init();   /* só no poste 0 */
+
+  /* Quando WiFi conecta (_monitor_task): */
+  time_manager_sync_ntp();
+
+state_machine_task.c — ADICIONAR:
+  /* No loop da fsm_task, após heartbeat: */
+  energy_monitor_add_sample(
+      state_machine_get_state(),
+      dali_get_brightness()
+  );
+
+CMakeLists.txt — ADICIONAR:
+  time_manager
+  energy_monitor
+  energy_collector
+  energy_web_server
+
+
+===============================================================================
+11. O QUE JÁ ESTÁ DISPONÍVEL NO SISTEMA ACTUAL
+===============================================================================
+
+GETTERS EXISTENTES QUE O MÓDULO ENERGÉTICO USA:
+  state_machine_get_state()       — estado FSM actual
+  state_machine_get_T()           — veículos detectados localmente
+  state_machine_get_last_speed()  — velocidade último veículo
+  dali_get_brightness()           — nível DALI actual (0-100%)
+  tracking_manager_get_stats()    — total_vehicles_tracked, frames
+  wifi_manager_is_connected()     — estado WiFi
+  comm_left_online()              — vizinho esquerdo online
+  comm_right_online()             — vizinho direito online
+
+INFRAESTRUTURA DISPONÍVEL:
+  NVS flash     — padrão já implementado em post_config.c
+  WiFi STA      — já implementado em wifi_manager.c
+  UDP           — já implementado em udp_manager.c
+  Loop 100ms    — fsm_task já existente em state_machine_task.c
+  Dual-core     — estrutura de tasks já definida em system_monitor.c
+  esp_http_server — disponível no ESP-IDF sem hardware adicional
+  esp_sntp      — disponível no ESP-IDF para NTP
+
+HARDWARE DISPONÍVEL SEM ALTERAÇÕES:
+  ESP32         — RTC interno para manter hora sem WiFi
+  Flash 4MB     — suficiente para 30 dias de histórico na NVS
+  WiFi          — NTP + servidor HTTP + envio de dados
+  Display ST7789— pode mostrar resumo energético local
+
+
+===============================================================================
+12. PLANO DE TRABALHO — PARTE 2
+===============================================================================
+
+FASE 1 — Gestor de hora (time_manager)
+  [ ] Implementar time_manager.h e time_manager.c
+  [ ] Integrar NTP via esp_sntp do ESP-IDF
+  [ ] Implementar persistência de hora na NVS
+  [ ] Implementar cálculo astronómico (pôr/nascer do sol)
+  [ ] Implementar detecção de horário de verão/inverno
+  [ ] Integrar em system_monitor.c
+  [ ] Testar fallback sem WiFi
+  [ ] Actualizar system_config.h com parâmetros de hora
+
+FASE 2 — Monitor energético (energy_monitor)
+  [ ] Implementar energy_monitor.h e energy_monitor.c
+  [ ] Implementar acumuladores de tempo por estado (100ms)
+  [ ] Implementar curva DALI IEC 62386 para consumo real
+  [ ] Implementar cálculos de referência SAP e LED fixo
+  [ ] Implementar poupança em kWh, euros e CO2
+  [ ] Implementar persistência de sessão diária na NVS
+  [ ] Implementar histórico de 30 dias na NVS
+  [ ] Integrar em state_machine_task.c
+  [ ] Testar acumulação correcta por estado
+
+FASE 3 — Recolha em cadeia (energy_collector)
+  [ ] Implementar energy_collector.h e energy_collector.c
+  [ ] Implementar detecção de período diurno via time_manager
+  [ ] Implementar protocolo ENERGY_DATA e ENERGY_ACK no udp_manager
+  [ ] Implementar lógica de último poste (inicia recolha)
+  [ ] Implementar lógica de poste intermédio (agrega e propaga)
+  [ ] Implementar lógica do poste 0 (recebe e serve)
+  [ ] Implementar retransmissões e timeout
+  [ ] Implementar reenvio de dados não confirmados
+  [ ] Testar com linha de 4 postes em laboratório
+
+FASE 4 — Página web (energy_web_server)
+  [ ] Implementar energy_web_server.h e energy_web_server.c
+  [ ] Implementar servidor HTTP com esp_http_server
+  [ ] Implementar página HTML/CSS/JS embebida
+  [ ] Implementar endpoint /energia com dados em tempo real
+  [ ] Implementar endpoint /energia/history com histórico
+  [ ] Implementar endpoint /energia/line com dados da linha
+  [ ] Implementar auto-refresh da página
+  [ ] Testar acesso via browser em rede local
+
+FASE 5 — Integração e validação
+  [ ] Integrar todos os módulos em system_monitor.c
+  [ ] Actualizar CMakeLists.txt
+  [ ] Testar cenário completo com 4 postes
+  [ ] Validar poupança calculada vs medição real (multímetro)
+  [ ] Documentar resultados reais vs estimados
+  [ ] Elaborar relatório comparativo final
+
+
+===============================================================================
+13. DEPENDÊNCIAS ENTRE MÓDULOS
+===============================================================================
+
+  system_config.h
+       │
+       ├──→ time_manager
+       │         │
+       │         ├──→ energy_monitor
+       │         │         │
+       │         │         ├──→ energy_collector
+       │         │         │         │
+       │         │         │         └──→ udp_manager (já existe)
+       │         │         │
+       │         │         └──→ energy_web_server
+       │         │
+       │         └──→ energy_web_server
+       │
+       ├──→ state_machine (já existe) ──→ energy_monitor
+       ├──→ dali_manager  (já existe) ──→ energy_monitor
+       ├──→ wifi_manager  (já existe) ──→ time_manager
+       └──→ nvs_flash     (já existe) ──→ time_manager + energy_monitor
+
+
+===============================================================================
+14. RESUMO EXECUTIVO
+===============================================================================
+
+  MÓDULOS NOVOS A CRIAR : 4
+    time_manager         — gestão da hora e período nocturno
+    energy_monitor       — acumulação e cálculo energético
+    energy_collector     — recolha em cadeia entre postes
+    energy_web_server    — apresentação web dos resultados
+
+  MÓDULOS EXISTENTES A MODIFICAR : 3
+    system_config.h      — parâmetros energéticos e de hora
+    system_monitor.c     — inicialização dos novos módulos
+    state_machine_task.c — chamada ao energy_monitor a 100ms
+
+  HARDWARE ADICIONAL    : Nenhum
+    Tudo implementado por software no ESP32 existente
+
+  RESULTADO ESPERADO:
+    Página web acessível em http://192.168.x.x/energia
+    mostrando em tempo real a poupança energética obtida
+    pelo sistema Poste Inteligente v8 face à instalação
+    tradicional SAP 250W, com histórico de 30 dias e
+    projecções mensais e anuais em kWh e euros.
+
+===============================================================================
+FIM DO DOCUMENTO
+===============================================================================

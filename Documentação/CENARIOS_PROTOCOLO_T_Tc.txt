@@ -1,0 +1,309 @@
+===============================================================================
+        POSTE INTELIGENTE v8 — PROTOCOLO T/Tc — CENÁRIOS DE OPERAÇÃO
+===============================================================================
+Projecto  : Poste Inteligente v8
+Autores   : Luis Custódio | Tiago Moreno
+Data      : 2026-04-25
+Módulos   : state_machine.c / state_machine_task.c / tracking_manager.c
+===============================================================================
+
+
+===============================================================================
+CONCEITOS BASE
+===============================================================================
+
+T  — Contador local. Incrementa quando o radar deste poste detecta um veículo.
+     Decrementa quando o poste seguinte confirma que o veículo chegou (PASSED).
+     Quando T=0 e Tc=0, o poste agenda o apagamento da luz.
+
+Tc — Contador de propagação UDP. Incrementa quando este poste recebe um TC_INC
+     do poste anterior, significando que um veículo está a caminho.
+     Decrementa quando o veículo chega fisicamente ao radar deste poste (EVT_LOCAL).
+
+REGRA FUNDAMENTAL:
+     TC_INC só é enviado UMA VEZ por veículo — quando o radar o detecta
+     localmente (EVT_LOCAL). Nunca é reenviado em cascata por outros motivos.
+
+CONDIÇÃO DE APAGAMENTO:
+     A luz só apaga quando:
+       T == 0  AND  Tc == 0  AND  elapsed >= TRAFIC_TIMEOUT_MS
+
+ESTADOS POSSÍVEIS:
+     IDLE      — Repouso. Sem veículos. Luz apagada ou em mínimo.
+     MASTER    — Líder da cadeia. Poste 0 ou primeiro activo à direita de uma falha.
+     LIGHT_ON  — Veículo detectado. Luz acesa com brilho proporcional à velocidade.
+     AUTONOMO  — Sem WiFi mas radar OK. Opera localmente sem propagação UDP.
+     SAFE_MODE — Radar em falha. Luz a 50% por segurança. Nunca apaga sozinho.
+     OBSTACULO — Objecto parado detectado. Luz a 100%. Posição fixa no display.
+
+
+===============================================================================
+CENÁRIO 1 — OPERAÇÃO NORMAL (4 POSTES)
+===============================================================================
+
+Topologia: A(MASTER) → B(IDLE) → C(IDLE) → D(IDLE)
+Situação : Todos os postes com radar e WiFi operacionais.
+Veículo  : Desloca-se de A para D a velocidade constante.
+
+───────────────────────────────────────────────────────────────────────────────
+PASSO 1 — Radar de A detecta o veículo
+───────────────────────────────────────────────────────────────────────────────
+
+  Evento : EVT_LOCAL em A
+  Acção  : A faz T=1, acende (LIGHT_ON), envia TC_INC a B
+           B recebe TC_INC → Tc=1, pré-agenda acendimento (ETA)
+
+  Estado dos postes:
+  A: T=1 Tc=0 LIGHT_ON (fade up)
+  B: T=0 Tc=1 IDLE (pré-acende quando ETA chegar)
+  C: T=0 Tc=0 IDLE
+  D: T=0 Tc=0 IDLE
+
+───────────────────────────────────────────────────────────────────────────────
+PASSO 2 — Radar de B detecta o veículo
+───────────────────────────────────────────────────────────────────────────────
+
+  Evento : EVT_LOCAL em B
+  Acção  : B faz Tc-- (Tc=0), T++ (T=1), acende (LIGHT_ON)
+           B envia PASSED a A → A faz T-- (T=0), agenda apagamento
+           B envia TC_INC a C → C faz Tc=1
+
+  Estado dos postes:
+  A: T=0 Tc=0 MASTER (fade down após TRAFIC_TIMEOUT_MS)
+  B: T=1 Tc=0 LIGHT_ON (fade up)
+  C: T=0 Tc=1 IDLE (pré-acende quando ETA chegar)
+  D: T=0 Tc=0 IDLE
+
+───────────────────────────────────────────────────────────────────────────────
+PASSO 3 — Radar de C detecta o veículo
+───────────────────────────────────────────────────────────────────────────────
+
+  Evento : EVT_LOCAL em C
+  Acção  : C faz Tc-- (Tc=0), T++ (T=1), acende (LIGHT_ON)
+           C envia PASSED a B → B faz T-- (T=0), agenda apagamento
+           C envia TC_INC a D → D faz Tc=1
+
+  Estado dos postes:
+  A: T=0 Tc=0 MASTER
+  B: T=0 Tc=0 IDLE (fade down após TRAFIC_TIMEOUT_MS)
+  C: T=1 Tc=0 LIGHT_ON (fade up)
+  D: T=0 Tc=1 IDLE (pré-acende quando ETA chegar)
+
+───────────────────────────────────────────────────────────────────────────────
+PASSO 4 — Radar de D detecta o veículo
+───────────────────────────────────────────────────────────────────────────────
+
+  Evento : EVT_LOCAL em D
+  Acção  : D faz Tc-- (Tc=0), T++ (T=1), acende (LIGHT_ON)
+           D envia PASSED a C → C faz T-- (T=0), agenda apagamento
+           D é fim de linha — sem vizinho direito — não envia TC_INC
+
+  Estado dos postes:
+  A: T=0 Tc=0 MASTER
+  B: T=0 Tc=0 IDLE
+  C: T=0 Tc=0 IDLE (fade down após TRAFIC_TIMEOUT_MS)
+  D: T=1 Tc=0 LIGHT_ON (fade up)
+
+───────────────────────────────────────────────────────────────────────────────
+PASSO 5 — Veículo sai da zona de D (fim de linha)
+───────────────────────────────────────────────────────────────────────────────
+
+  Evento : EVT_PASSED em D
+  Acção  : D faz T-- (T=0), agenda apagamento
+           D envia PASSED a C (C já estava a 0 — sem efeito)
+           D não tem vizinho direito — não envia TC_INC
+           Após TRAFIC_TIMEOUT_MS: D faz fade down → IDLE, T=0 Tc=0
+
+  Estado final:
+  A: T=0 Tc=0 MASTER
+  B: T=0 Tc=0 IDLE
+  C: T=0 Tc=0 IDLE
+  D: T=0 Tc=0 IDLE (fade down)
+
+  NOTA: Esta lógica aplica-se ao poste N — qualquer que seja o último
+        poste activo da cadeia. Não é exclusiva do poste D.
+
+
+===============================================================================
+CENÁRIO 1.1 — FALHA DE POSTE INTERMÉDIO (POSTE B OFFLINE)
+===============================================================================
+
+Topologia: A(AUTONOMO) — B(OFFLINE) — C(MASTER) → D(IDLE)
+Situação : Poste B sem funcionamento. A linha parte-se em dois segmentos.
+
+───────────────────────────────────────────────────────────────────────────────
+POSTE A — AUTONOMO
+───────────────────────────────────────────────────────────────────────────────
+
+  Condição: Radar OK + WiFi OFF (sem vizinhos disponíveis)
+  Estado  : AUTONOMO
+  Comportamento:
+    - Detecta veículo → T=1 → LIGHT_ON (fade up)
+    - Veículo sai → EVT_PASSED → T=0 → agenda apagamento
+    - Após TRAFIC_TIMEOUT_MS → fade down → AUTONOMO
+    - Não envia TC_INC (sem WiFi)
+    - Não informa nenhum poste seguinte
+    - Opera completamente de forma local e autónoma
+
+───────────────────────────────────────────────────────────────────────────────
+POSTE B — OFFLINE (3 sub-cenários)
+───────────────────────────────────────────────────────────────────────────────
+
+  SUB-CENÁRIO B1 — Radar OFF + WiFi OFF:
+    Estado  : SAFE_MODE
+    Acção   : Luz fixa a 50% (LIGHT_SAFE_MODE)
+    Saída   : Só quando radar recupera → IDLE
+    Nota    : Nunca apaga sozinho. Requer intervenção física.
+
+  SUB-CENÁRIO B2 — Radar ON + WiFi OFF:
+    Estado  : AUTONOMO
+    Acção   : Detecta veículo → LIGHT_ON → veículo sai → apaga → AUTONOMO
+    Nota    : Não informa postes seguintes. Opera localmente.
+              T e Tc resetam após TRAFIC_TIMEOUT_MS.
+
+  SUB-CENÁRIO B3 — Radar OFF + WiFi ON:
+    Estado  : SAFE_MODE
+    Acção   : Luz fixa a 50% (LIGHT_SAFE_MODE)
+    Razão   : Sem radar o poste está cego — não sabe o que passa.
+              Mesmo com WiFi, não pode confirmar nem propagar veículos.
+    Saída   : Só quando radar recupera → IDLE
+
+  REGRA GERAL: Sem radar = SAFE_MODE sempre, independentemente do WiFi.
+
+───────────────────────────────────────────────────────────────────────────────
+POSTE C — MASTER TEMPORÁRIO
+───────────────────────────────────────────────────────────────────────────────
+
+  Condição: Vizinho esquerdo (B) offline há mais de AUTONOMO_DELAY_MS
+  Estado  : MASTER (assumido automaticamente)
+  Comportamento:
+    - Detecta veículo → T=1 Tc=0 → LIGHT_ON
+    - Envia TC_INC a D → D faz Tc=1
+    - Fluxo normal a partir daqui
+
+  Quando B recuperar:
+    - C detecta vizinho esquerdo online → cede MASTER → IDLE
+
+───────────────────────────────────────────────────────────────────────────────
+POSTE D — FIM DE LINHA (comportamento igual ao Cenário 1)
+───────────────────────────────────────────────────────────────────────────────
+
+  Recebe TC_INC de C → Tc=1 → pré-acende
+  Radar detecta → EVT_LOCAL → T=1 Tc=0 → LIGHT_ON
+  Veículo sai → EVT_PASSED → T=0 Tc=0 → apaga → IDLE
+
+  NOTA: D não sabe que B está offline. Para D, C é o MASTER
+        e o fluxo é exactamente igual ao Cenário 1.
+
+
+===============================================================================
+CENÁRIO 2 — OBSTÁCULO PARADO NA ZONA DO RADAR
+===============================================================================
+
+Situação: Veículo começa a deslocar-se, é detectado pelo radar de A,
+          informa B, mas para antes de sair da zona de A.
+
+───────────────────────────────────────────────────────────────────────────────
+FASE 1 — Detecção inicial (comportamento normal)
+───────────────────────────────────────────────────────────────────────────────
+
+  Radar de A detecta veículo a 50 km/h → EVT_LOCAL
+  A: T=1 Tc=0 LIGHT_ON
+  B: T=0 Tc=1 (pré-acende — aguarda veículo)
+
+───────────────────────────────────────────────────────────────────────────────
+FASE 2 — Veículo para dentro da zona de A
+───────────────────────────────────────────────────────────────────────────────
+
+  Tracking_manager detecta velocidade <= 5 km/h durante OBSTACULO_MIN_FRAMES
+  → activa EVT_OBSTACULO em A
+
+  Acções de A:
+    1. Envia PASSED a B → B faz Tc-- (Tc=0) — cancela o veículo anunciado
+    2. Muda para STATE_OBSTACULO
+    3. Luz sobe para 100% (LIGHT_MAX)
+    4. Display de A fixa a posição do obstáculo — não actualiza mais
+
+  Estado dos postes:
+  A: T=1 Tc=0 OBSTACULO (luz 100%)
+  B: T=0 Tc=0 IDLE (fade down — veículo cancelado)
+  C: T=0 Tc=0 IDLE
+  D: T=0 Tc=0 IDLE
+
+───────────────────────────────────────────────────────────────────────────────
+FASE 3 — Outros veículos passam enquanto obstáculo está activo
+───────────────────────────────────────────────────────────────────────────────
+
+  Um segundo veículo (ID diferente) entra na zona de A:
+    - Tracking_manager cria slot independente para o novo veículo
+    - EVT_LOCAL gerado para o novo veículo
+    - A envia TC_INC a B normalmente — fluxo normal
+    - Luz de A já está a 100% — não muda
+    - B, C, D processam o novo veículo normalmente
+
+  REGRA: O obstáculo NÃO bloqueia o fluxo de outros veículos.
+         Cada veículo tem o seu próprio slot no tracking_manager.
+
+───────────────────────────────────────────────────────────────────────────────
+FASE 4 — Remoção automática do obstáculo
+───────────────────────────────────────────────────────────────────────────────
+
+  Sem detecções do obstáculo durante OBSTACULO_REMOVE_MS (configurável):
+    - A sai de STATE_OBSTACULO
+    - Volta a STATE_MASTER ou STATE_IDLE
+    - Luz faz fade down
+    - Display limpa posição fixa do obstáculo
+    - T e Tc resetam para 0
+
+───────────────────────────────────────────────────────────────────────────────
+DISPLAY — COMPORTAMENTO COM OBSTÁCULO
+───────────────────────────────────────────────────────────────────────────────
+
+  Poste A (detectou o obstáculo):
+    - Mostra posição fixa do obstáculo no radar
+    - Se outros veículos passarem, mostra-os também em movimento
+    - Quando obstáculo remove, limpa o ponto fixo
+
+  Postes B, C, D:
+    - Não sabem que existe um obstáculo em A
+    - Mostram apenas os veículos que chegam normalmente
+
+
+===============================================================================
+RESUMO DAS REGRAS DO PROTOCOLO T/Tc
+===============================================================================
+
+1. TC_INC só é enviado UMA VEZ por veículo — em EVT_LOCAL (detecção física).
+2. on_tc_inc_received apenas faz Tc++ — nunca reenvia TC_INC.
+3. EVT_APPROACHING não envia TC_INC — só agenda pré-acendimento local.
+4. EVT_PASSED envia apenas SPD (ETA) — não envia TC_INC.
+5. EVT_OBSTACULO envia PASSED ao vizinho direito — cancela Tc do veículo parado.
+6. Sem radar = SAFE_MODE sempre, independentemente do WiFi.
+7. Qualquer poste sem vizinho esquerdo assume MASTER automaticamente.
+8. O último poste activo da linha apaga autonomamente após TRAFIC_TIMEOUT_MS.
+9. Cada veículo tem slot independente no tracking_manager — IDs únicos.
+10. O obstáculo não bloqueia o fluxo de outros veículos em movimento.
+
+
+===============================================================================
+ALTERAÇÕES IMPLEMENTADAS NOS MÓDULOS
+===============================================================================
+
+state_machine.c:
+  - EVT_APPROACHING: removido comm_send_tc_inc() e comm_send_spd()
+  - EVT_PASSED: substituído comm_send_tc_inc() por comm_send_spd()
+  - EVT_OBSTACULO: adicionado comm_notify_prev_passed() na primeira activação
+  - on_tc_inc_received: removido reenvio de TC_INC e SPD
+  - Passo 11: SAFE_MODE simplificado — condição !s_radar_ok apenas
+  - Passo 11: AUTONOMO reestruturado — dois sub-casos explícitos
+
+state_machine_task.c:
+  - tracking_manager_clear_events() movido para depois de todos os if
+    de processamento de eventos — evita perda de flags pendentes
+
+tracking_manager.c:
+  - Sem alterações — implementação correcta desde o início
+
+===============================================================================
+FIM DO DOCUMENTO
+===============================================================================

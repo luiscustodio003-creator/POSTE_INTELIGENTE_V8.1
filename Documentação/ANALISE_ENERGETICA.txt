@@ -1,0 +1,296 @@
+===============================================================================
+        POSTE INTELIGENTE v8 — ANÁLISE ENERGÉTICA COMPARATIVA
+===============================================================================
+Projecto  : Poste Inteligente v8
+Autores   : Luis Custódio | Tiago Moreno
+Data      : 2026-04-25
+Módulo    : energy_monitor.c / energy_web_server.c
+===============================================================================
+
+
+===============================================================================
+1. PREMISSAS E PARÂMETROS BASE
+===============================================================================
+
+INSTALAÇÃO EXISTENTE (referência — antes da reabilitação):
+  Lâmpada        : Sódio de Alta Pressão (SAP) 250W
+  Balastro       : 30W (ferromagnético — consumo fixo)
+  Consumo total  : 280W por poste (lâmpada + balastro)
+  Regulação      : Não é possível — sempre a 100% quando ligado
+  Vida útil      : 15.000 a 24.000 horas
+  Índice de cor  : Ra 25 (luz amarelada — baixa qualidade visual)
+  Temperatura cor: 2200K
+
+INSTALAÇÃO PROPOSTA (Poste Inteligente v8):
+  Lâmpada        : LED Dimável 100W com driver DALI integrado
+  Consumo nominal: 100W a 100% (nível DALI 254)
+  Regulação      : 10% a 100% via protocolo DALI (PWM interno)
+  Mínimo DALI    : 15% → consumo real aproximado de 10W
+  Vida útil      : 50.000 a 100.000 horas
+  Índice de cor  : Ra 80 (luz branca — boa qualidade visual)
+  Temperatura cor: 4000K
+
+PARÂMETROS DE OPERAÇÃO:
+  Horas de funcionamento por noite : 8 horas (22h00 às 06h00)
+  Dias de funcionamento por ano    : 365 dias
+  Custo do kWh em Portugal         : 0.22 € (tarifa média 2025)
+  Número de postes na simulação    : 1 poste (multiplicar pelo nº real)
+
+NOTA SOBRE A CURVA DALI (relação nível → consumo real):
+  O DALI não é linear. A norma IEC 62386 define uma curva logarítmica.
+  Aproximação utilizada nos cálculos:
+    100% DALI → 100% potência → 100W
+     50% DALI →  42% potência →  42W
+     30% DALI →  22% potência →  22W
+     15% DALI →  10% potência →  10W  ← mínimo do sistema
+
+
+===============================================================================
+2. PERFIL DE OPERAÇÃO DO SISTEMA INTELIGENTE
+===============================================================================
+
+O sistema opera em 4 estados com níveis de iluminação distintos:
+
+  IDLE / MASTER  — Sem tráfego detectado
+    Nível DALI   : 15% (mínimo regulamentar)
+    Consumo real : 10W
+    Contexto     : Poste aguarda detecção. Luz de presença mínima.
+
+  LIGHT_ON       — Veículo detectado e em trânsito
+    Nível DALI   : 80% a 100% (proporcional à velocidade)
+    Consumo real : 80W a 100W
+    Contexto     : Activo durante detecção + TRAFIC_TIMEOUT após passagem.
+
+  SAFE_MODE      — Radar em falha
+    Nível DALI   : 50%
+    Consumo real : 42W
+    Contexto     : Segurança — poste cego mas mantém iluminação parcial.
+
+  OBSTACULO      — Objecto parado na via
+    Nível DALI   : 100%
+    Consumo real : 100W
+    Contexto     : Máxima visibilidade. Situação de perigo.
+
+DISTRIBUIÇÃO TÍPICA NUMA NOITE DE 8 HORAS (estimativa autoestrada):
+  Período de maior tráfego (22h-00h) : 2h → 80% em LIGHT_ON
+  Período nocturno baixo (00h-05h)   : 5h → 90% em IDLE
+  Período de manhã (05h-06h)         : 1h → 50% em LIGHT_ON
+
+  Cálculo do tempo médio por estado (8h = 480 minutos):
+    LIGHT_ON  : (2h * 80%) + (1h * 50%) = 2.1h  →  126 minutos
+    IDLE      : 480 - 126 = 354 minutos           →  5.9h
+    SAFE_MODE : ocasional — não considerado na média
+    OBSTACULO : ocasional — não considerado na média
+
+  Consumo médio ponderado por noite:
+    LIGHT_ON  : 2.1h * 90W (média 80-100%) =  189 Wh
+    IDLE      : 5.9h * 10W                 =   59 Wh
+    TOTAL     :                               248 Wh  =  0.248 kWh/noite
+
+
+===============================================================================
+3. COMPARAÇÃO ENERGÉTICA — POR POSTE
+===============================================================================
+
+───────────────────────────────────────────────────────────────────────────────
+3.1 CONSUMO DIÁRIO (por poste, por noite de 8 horas)
+───────────────────────────────────────────────────────────────────────────────
+
+  SAP 250W sempre aceso    : 280W * 8h = 2.240 kWh
+  LED 100W sempre aceso    : 100W * 8h = 0.800 kWh
+  LED 100W com DALI intelig: ~          0.248 kWh  (perfil típico acima)
+
+  Poupança LED inteligente vs SAP sempre aceso:
+    2.240 - 0.248 = 1.992 kWh/noite   →  88.9% de poupança
+
+  Poupança LED inteligente vs LED sempre aceso:
+    0.800 - 0.248 = 0.552 kWh/noite   →  69.0% de poupança
+
+───────────────────────────────────────────────────────────────────────────────
+3.2 CUSTO DIÁRIO (por poste)
+───────────────────────────────────────────────────────────────────────────────
+
+  SAP 250W sempre aceso    : 2.240 kWh * 0.22€ = 0.4928 €/noite
+  LED 100W sempre aceso    : 0.800 kWh * 0.22€ = 0.1760 €/noite
+  LED 100W com DALI intelig: 0.248 kWh * 0.22€ = 0.0546 €/noite
+
+───────────────────────────────────────────────────────────────────────────────
+3.3 CONSUMO E CUSTO MENSAL (por poste — 30 noites)
+───────────────────────────────────────────────────────────────────────────────
+
+  SAP 250W sempre aceso    : 67.20 kWh  →  14.78 €/mês
+  LED 100W sempre aceso    : 24.00 kWh  →   5.28 €/mês
+  LED 100W com DALI intelig:  7.44 kWh  →   1.64 €/mês
+
+  Poupança mensal vs SAP   : 59.76 kWh  →  13.15 €/mês por poste
+  Poupança mensal vs LED   : 16.56 kWh  →   3.64 €/mês por poste
+
+───────────────────────────────────────────────────────────────────────────────
+3.4 CONSUMO E CUSTO ANUAL (por poste — 365 noites)
+───────────────────────────────────────────────────────────────────────────────
+
+  SAP 250W sempre aceso    : 817.6 kWh  →  179.87 €/ano
+  LED 100W sempre aceso    : 292.0 kWh  →   64.24 €/ano
+  LED 100W com DALI intelig:  90.5 kWh  →   19.91 €/ano
+
+  Poupança anual vs SAP    : 727.1 kWh  →  159.96 €/ano por poste
+  Poupança anual vs LED    : 201.5 kWh  →   44.33 €/ano por poste
+
+
+===============================================================================
+4. COMPARAÇÃO ENERGÉTICA — LINHA COMPLETA
+===============================================================================
+
+Simulação para linhas de diferentes dimensões:
+
+───────────────────────────────────────────────────────────────────────────────
+4.1 LINHA DE 10 POSTES
+───────────────────────────────────────────────────────────────────────────────
+
+                          SAP 250W       LED 100W       LED DALI
+                          sempre aceso   sempre aceso   inteligente
+  Consumo diário (kWh) :    22.40          8.00           2.48
+  Consumo mensal (kWh) :   672.0          240.0           74.4
+  Consumo anual (kWh)  :  8.176,0        2.920,0          905.2
+  Custo diário (€)     :     4.93           1.76           0.55
+  Custo mensal (€)     :   147.84          52.80          16.37
+  Custo anual (€)      : 1.798,72         643.20         199.14
+
+  Poupança anual vs SAP:                              1.599,58 €/ano
+  Poupança anual vs LED:                                443.06 €/ano
+
+───────────────────────────────────────────────────────────────────────────────
+4.2 LINHA DE 50 POSTES
+───────────────────────────────────────────────────────────────────────────────
+
+                          SAP 250W       LED 100W       LED DALI
+                          sempre aceso   sempre aceso   inteligente
+  Consumo diário (kWh) :   112.0           40.0          12.40
+  Consumo mensal (kWh) :  3.360,0        1.200,0         372.0
+  Consumo anual (kWh)  : 40.880,0       14.600,0       4.526,0
+  Custo diário (€)     :    24.64           8.80           2.73
+  Custo mensal (€)     :   739.20         264.00          81.84
+  Custo anual (€)      : 8.993,60       3.212,00         995.72
+
+  Poupança anual vs SAP:                              7.997,88 €/ano
+  Poupança anual vs LED:                              2.216,28 €/ano
+
+───────────────────────────────────────────────────────────────────────────────
+4.3 LINHA DE 100 POSTES
+───────────────────────────────────────────────────────────────────────────────
+
+                          SAP 250W       LED 100W       LED DALI
+                          sempre aceso   sempre aceso   inteligente
+  Consumo diário (kWh) :   224.0           80.0          24.80
+  Consumo mensal (kWh) :  6.720,0        2.400,0         744.0
+  Consumo anual (kWh)  : 81.760,0       29.200,0       9.052,0
+  Custo diário (€)     :    49.28          17.60           5.46
+  Custo mensal (€)     :  1.478,40        528.00         163.68
+  Custo anual (€)      : 17.987,20      6.424,00       1.991,44
+
+  Poupança anual vs SAP:                             15.995,76 €/ano
+  Poupança anual vs LED:                              4.432,56 €/ano
+
+
+===============================================================================
+5. IMPACTO AMBIENTAL — EMISSÕES CO2 EVITADAS
+===============================================================================
+
+Factor de emissão da rede eléctrica portuguesa (2024): 0.233 kg CO2/kWh
+
+Por poste, por ano:
+  SAP 250W sempre aceso    : 817.6 kWh * 0.233 = 190.5 kg CO2/ano
+  LED 100W sempre aceso    : 292.0 kWh * 0.233 =  68.0 kg CO2/ano
+  LED 100W com DALI intelig:  90.5 kWh * 0.233 =  21.1 kg CO2/ano
+
+  CO2 evitado vs SAP       : 169.4 kg CO2/ano por poste
+  CO2 evitado vs LED       :  46.9 kg CO2/ano por poste
+
+Para 100 postes:
+  CO2 evitado vs SAP       : 16.940 kg CO2/ano  →  16.9 toneladas/ano
+  CO2 evitado vs LED       :  4.690 kg CO2/ano  →   4.7 toneladas/ano
+
+
+===============================================================================
+6. RETORNO DO INVESTIMENTO (ROI) ESTIMADO
+===============================================================================
+
+Custo estimado de reabilitação por poste:
+  Luminária LED 100W DALI  :  350 €
+  Controlador ESP32 + radar:  120 €
+  Instalação e cablagem    :   80 €
+  TOTAL por poste          :  550 €
+
+Poupança anual vs SAP 250W : 159.96 €/ano por poste
+Poupança anual vs LED fixo :  44.33 €/ano por poste
+
+Período de retorno vs SAP  : 550 / 159.96 = 3.4 anos
+Período de retorno vs LED  : 550 /  44.33 = 12.4 anos
+
+NOTA: O retorno vs SAP é muito atractivo — 3.4 anos — porque
+      elimina simultaneamente o consumo excessivo do sódio E
+      acrescenta a inteligência do controlo DALI. A comparação
+      correcta para novas instalações é sempre vs SAP existente.
+
+
+===============================================================================
+7. MÓDULO DE MONITORIZAÇÃO — O QUE O SISTEMA REGISTA
+===============================================================================
+
+O módulo energy_monitor.c acumula em tempo real:
+
+  Por ciclo de 100ms (fsm_task):
+    - Estado actual da FSM (IDLE, LIGHT_ON, SAFE_MODE, OBSTACULO)
+    - Nível DALI actual (0-100%)
+    - Consumo instantâneo calculado (W)
+
+  Por sessão nocturna (reset às 06h00):
+    - Tempo total em cada estado (segundos)
+    - Energia consumida real (Wh)
+    - Energia que teria sido consumida (SAP referência)
+    - Número de veículos detectados
+    - Número de acendimentos (transições IDLE→LIGHT_ON)
+    - Poupança da sessão (Wh e €)
+
+  Histórico persistido na NVS (flash do ESP32):
+    - Últimos 30 dias de dados diários
+    - Totais mensais e anuais acumulados
+
+  Página web (HTTP no ESP32):
+    - Dashboard com consumos diários, mensais e anuais
+    - Gráfico de barras dos últimos 7 dias
+    - Comparação em tempo real vs SAP e vs LED fixo
+    - Poupança em kWh e em euros
+    - Emissões CO2 evitadas
+
+
+===============================================================================
+8. RESUMO EXECUTIVO
+===============================================================================
+
+  A substituição de lâmpadas SAP 250W por LED 100W com controlo
+  DALI inteligente (Poste Inteligente v8) representa:
+
+  ┌─────────────────────────────────────────────────────────────┐
+  │  POUPANÇA ENERGÉTICA vs SAP 250W sempre aceso              │
+  │                                                             │
+  │  Por poste:                                                 │
+  │    Diária   :   1.992 kWh  →   0.44 €/dia                 │
+  │    Mensal   :  59.76 kWh   →  13.15 €/mês                 │
+  │    Anual    : 727.1 kWh    → 159.96 €/ano                  │
+  │                                                             │
+  │  100 postes:                                                │
+  │    Anual    : 72.710 kWh   → 15.996 €/ano                  │
+  │    CO2      : 16.940 kg CO2 evitados/ano                   │
+  │                                                             │
+  │  Retorno do investimento: 3.4 anos                         │
+  │  Poupança total em 10 anos (100 postes): ~143.000 €        │
+  └─────────────────────────────────────────────────────────────┘
+
+  O sistema é economicamente viável, ambientalmente responsável
+  e tecnicamente robusto. A poupança de 88.9% face ao sistema
+  SAP existente justifica amplamente o investimento.
+
+===============================================================================
+FIM DO DOCUMENTO
+===============================================================================

@@ -143,19 +143,36 @@ static void _atualiza_radar_display(void)
     uint8_t count = 0;
 
     if (tracking_manager_get_vehicles(veiculos, &count) && count > 0) {
-        /* Converte tracked_vehicle_t → radar_obj_t para o display */
         radar_obj_t objs[TRK_MAX_VEHICLES];
         uint8_t n_objs = 0;
+        bool em_obstaculo = sm_is_obstaculo();
 
         for (uint8_t i = 0; i < count && i < TRK_MAX_VEHICLES; i++) {
-            /* Só mostra veículos confirmados ou em aproximação
-               (ignora TENTATIVE — podem ser ruído) */
-            if (veiculos[i].state == TRK_STATE_TENTATIVE) continue;
+            tracked_vehicle_t *v = &veiculos[i];
 
-            objs[n_objs].x_mm      = (int)veiculos[i].x_mm;
-            objs[n_objs].y_mm      = (int)veiculos[i].y_mm;
-            objs[n_objs].speed_kmh = veiculos[i].speed_kmh;
-            n_objs++;
+            /* Ignora TENTATIVE — pode ser ruído */
+            if (v->state == TRK_STATE_TENTATIVE) continue;
+
+            if (em_obstaculo) {
+                /* Obstáculo activo — mostra posição fixa sem movimento preditivo.
+                   speed=0 garante que o interpolador do display não move o ponto. */
+                if (v->state == TRK_STATE_CONFIRMED  ||
+                    v->state == TRK_STATE_APPROACHING) {
+                    objs[n_objs].x_mm      = (int)v->x_mm;
+                    objs[n_objs].y_mm      = (int)v->y_mm;
+                    objs[n_objs].speed_kmh = 0.0f;
+                    n_objs++;
+                }
+            } else {
+                /* Modo normal — mostra veículos em movimento */
+                if (v->state == TRK_STATE_CONFIRMED  ||
+                    v->state == TRK_STATE_APPROACHING) {
+                    objs[n_objs].x_mm      = (int)v->x_mm;
+                    objs[n_objs].y_mm      = (int)v->y_mm;
+                    objs[n_objs].speed_kmh = v->speed_kmh;
+                    n_objs++;
+                }
+            }
         }
 
         display_manager_set_radar(n_objs > 0 ? objs : NULL, n_objs);
