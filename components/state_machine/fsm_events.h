@@ -1,30 +1,32 @@
 /* ============================================================
    MÓDULO     : fsm_events
-   FICHEIRO   : fsm_events.h — Declarações de eventos da FSM
-   VERSÃO     : 1.0  |  2026-04-26
+   FICHEIRO   : fsm_events.h
+   VERSÃO     : 2.0  |  2026-04-27
    PROJECTO   : Poste Inteligente v8
    AUTORES    : Luis Custódio | Tiago Moreno
-   PLATAFORMA : ESP32 (ESP-IDF v5.x)
 
    RESPONSABILIDADE:
    ─────────────────
-   Processamento de todos os eventos do pipeline tracking → FSM
-   e dos callbacks UDP recebidos do comm_manager.
+   Processamento de eventos do pipeline tracking→FSM
+   e callbacks UDP recebidos do udp_manager.
 
-   EVENTOS:
-   ────────
-   SM_EVT_VEHICLE_DETECTED   → prepara ETA (sem T++)
-   SM_EVT_VEHICLE_APPROACHING → pré-acendimento local
-   SM_EVT_VEHICLE_PASSED     → T--, SPD ao vizinho direito
-   SM_EVT_VEHICLE_LOCAL      → Tc--, T++, luz ON, propaga
-   SM_EVT_VEHICLE_OBSTACULO  → STATE_OBSTACULO, luz máxima
+   EVENTOS DO RADAR (sm_process_event):
+   ──────────────────────────────────────
+   SM_EVT_VEHICLE_DETECTED   → T++, ETA, luz, TC_INC→dir
+   SM_EVT_VEHICLE_APPROACHING → actualiza ETA local
+   SM_EVT_VEHICLE_PASSED     → T--, PASSED→esq (única fonte)
+   SM_EVT_VEHICLE_LOCAL      → T++, Tc--, luz, TC_INC→dir
+   SM_EVT_VEHICLE_OBSTACULO  → luz máxima, PASSED→dir
 
-   CALLBACKS UDP:
-   ──────────────
-   on_tc_inc_received()      → Tc++
-   on_prev_passed_received() → T--
-   on_spd_received()         → agenda ETA
-   on_master_claim_received()→ log
+   CALLBACKS UDP (chamados pela udp_task):
+   ────────────────────────────────────────
+   on_tc_inc_received()       → Tc++, agenda ETA
+   on_prev_passed_received()  → T--, agenda apagamento
+   on_spd_received()          → refina ETA
+   on_master_claim_received() → log
+   on_radar_fail_received()   → viz notificou radar KO
+                                 viz.esq→AUTONOMO, viz.dir→MASTER
+   on_radar_ok_received()     → viz notificou radar recuperado
 
    DEPENDÊNCIAS:
    ─────────────
@@ -38,16 +40,7 @@
 #include <stdint.h>
 #include "state_machine.h"
 
-/* ── Ponto de entrada principal ───────────────────────────── */
-
-/**
- * @brief Processa um evento do pipeline tracking → FSM.
- * @param type       Tipo de evento (SM_EVT_*)
- * @param vehicle_id ID do veículo (tracking_manager)
- * @param vel        Velocidade em km/h
- * @param eta_ms     ETA em ms (0 se não disponível)
- * @param x_mm       Posição lateral em mm
- */
+/* ── Ponto de entrada de eventos do radar ─────────────────── */
 void sm_process_event(sm_event_type_t type,
                       uint16_t vehicle_id,
                       float vel,
@@ -56,28 +49,41 @@ void sm_process_event(sm_event_type_t type,
 
 /* ── Callbacks UDP ────────────────────────────────────────── */
 
-/** Recebe TC_INC do poste esquerdo → Tc++ */
+/** Poste esquerdo detectou veículo → Tc++, agenda ETA */
 void on_tc_inc_received(float speed, int16_t x_mm);
 
-/** Recebe PASSED do poste direito → T-- */
+/** Poste direito confirmou chegada → T--, agenda apagamento */
 void on_prev_passed_received(void);
 
-/** Recebe SPD → actualiza ETA de pré-acendimento */
+/** Poste esquerdo envia ETA real → refina pré-acendimento */
 void on_spd_received(float speed, uint32_t eta_ms, int16_t x_mm);
 
-/** Recebe MASTER_CLAIM → log */
+/** Poste vizinho reafirma liderança */
 void on_master_claim_received(int from_id);
 
-/* ── Compatibilidade e injecção de teste ─────────────────── */
+/**
+ * @brief Vizinho notificou que o seu radar falhou.
+ *        Se vier do viz.ESQUERDO → este poste entra em AUTONOMO
+ *        (não receberá mais TC_INC nem PASSED desse lado).
+ *        Se vier do viz.DIREITO → este poste assume MASTER
+ *        (viz.dir não conseguirá enviar PASSED de volta).
+ * @param from_left true se a notificação vem do viz. esquerdo
+ */
+void on_radar_fail_received(bool from_left);
 
-/** Shim v3.x → delega para SM_EVT_VEHICLE_LOCAL */
-void sm_on_radar_detect(float vel);
+/**
+ * @brief Vizinho notificou que o seu radar recuperou.
+ *        Repõe o modo normal: AUTONOMO→IDLE, MASTER→IDLE.
+ * @param from_left true se a notificação vem do viz. esquerdo
+ */
+void on_radar_ok_received(bool from_left);
 
-/** Injeta carro de teste via debugger (JTAG/GDB) */
-void sm_inject_test_car(float vel);
-
-/* ── Gestão de vizinhos (chamadas pela fsm_network) ──────── */
+/* ── Gestão de vizinhos ───────────────────────────────────── */
 void sm_on_right_neighbor_offline(void);
 void sm_on_right_neighbor_online(void);
+
+/* ── Compatibilidade e teste ──────────────────────────────── */
+void sm_on_radar_detect(float vel);
+void sm_inject_test_car(float vel);
 
 #endif /* FSM_EVENTS_H */

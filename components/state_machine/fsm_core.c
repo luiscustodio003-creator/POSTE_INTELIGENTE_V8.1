@@ -1,29 +1,33 @@
 /* ============================================================
    MÓDULO     : fsm_core
-   FICHEIRO   : fsm_core.c — Núcleo da FSM
-   VERSÃO     : 1.0  |  2026-04-26
+   FICHEIRO   : fsm_core.c
+   VERSÃO     : 2.0  |  2026-04-27
    PROJECTO   : Poste Inteligente v8
    AUTORES    : Luis Custódio | Tiago Moreno
-   PLATAFORMA : ESP32 (ESP-IDF v5.x)
 
-   RESPONSABILIDADE:
-   ─────────────────
-   - Declaração e inicialização de todas as variáveis de estado
-   - Utilitários internos partilhados (agora_ms, agendar_apagar)
-   - Monitorização da saúde do radar com debounce
-   - Getters públicos do estado da FSM
-   - Ponto de entrada state_machine_update() que delega
-     nos sub-módulos fsm_timer, fsm_network
+   ALTERAÇÕES v1.0 → v2.0:
+   ─────────────────────────
+   1. fsm_verificar_radar(): quando radar muda de estado envia
+      RADAR_FAIL ou RADAR_OK a ambos os vizinhos via
+      comm_notify_radar_status(). Vizinhos reagem imediatamente:
+        viz.esq → AUTONOMO (não pode confiar no PASSED de B)
+        viz.dir → MASTER   (B não vai enviar TC_INC)
+   2. Adicionadas variáveis g_fsm_left_radar_fail e
+      g_fsm_right_radar_fail — flags de notificação recebida.
+   3. state_machine_update(): parâmetro comm_ok removido de
+      fsm_verificar_radar (radar é independente do WiFi).
+   4. Sai de SAFE MODE → IDLE apenas quando radar recupera
+      (não depende do WiFi para esta transição).
 
    DEPENDÊNCIAS:
    ─────────────
-   fsm_core.h, fsm_timer.h, fsm_network.h
+   fsm_core.h, fsm_network.h, fsm_timer.h, fsm_sim.h
    comm_manager.h, dali_manager.h, system_config.h
 ============================================================ */
 
 #include "fsm_core.h"
-#include "fsm_timer.h"
 #include "fsm_network.h"
+#include "fsm_timer.h"
 #include "fsm_sim.h"
 #include "comm_manager.h"
 #include "dali_manager.h"
@@ -37,18 +41,19 @@ static const char *TAG = "FSM";
 
 /* ============================================================
    VARIÁVEIS DE ESTADO — definições
-   Declaradas extern em fsm_core.h para acesso pelos sub-módulos.
 ============================================================ */
-system_state_t g_fsm_state          = STATE_IDLE;
-int            g_fsm_T              = 0;
-int            g_fsm_Tc             = 0;
-float          g_fsm_last_speed     = 0.0f;
-bool           g_fsm_apagar_pend    = false;
-bool           g_fsm_radar_ok       = true;
-int            g_fsm_radar_fail_cnt = 0;
-int            g_fsm_radar_ok_cnt   = 0;
-bool           g_fsm_right_online   = true;
-bool           g_fsm_era_autonomo   = false;
+system_state_t g_fsm_state           = STATE_IDLE;
+int            g_fsm_T               = 0;
+int            g_fsm_Tc              = 0;
+float          g_fsm_last_speed      = 0.0f;
+bool           g_fsm_apagar_pend     = false;
+bool           g_fsm_radar_ok        = true;
+int            g_fsm_radar_fail_cnt  = 0;
+int            g_fsm_radar_ok_cnt    = 0;
+bool           g_fsm_right_online    = true;
+bool           g_fsm_era_autonomo    = false;
+bool           g_fsm_left_radar_fail = false;
+bool           g_fsm_right_radar_fail= false;
 
 uint64_t g_fsm_last_detect_ms    = 0;
 uint64_t g_fsm_left_offline_ms   = 0;
@@ -75,34 +80,61 @@ void fsm_agendar_apagar(void)
     g_fsm_last_detect_ms = fsm_agora_ms();
 }
 
-/* Monitoriza saúde do radar com debounce bidirecional.
-   Exige RADAR_FAIL_COUNT ciclos para declarar falha e
-   RADAR_OK_COUNT frames para declarar recuperação. */
-void fsm_verificar_radar(bool teve_frame, bool comm_ok)
+/* ============================================================
+   fsm_verificar_radar
+   ──────────────────────────────────────────────────────────
+   Debounce bidirecional:
+     FAIL : RADAR_FAIL_COUNT ciclos (100ms) sem frame → radar KO
+            → SAFE MODE + envia RADAR_FAIL a viz.esq e viz.dir
+     OK   : RADAR_OK_COUNT frames consecutivos → radar recuperado
+            → IDLE + envia RADAR_OK a viz.esq e viz.dir
+
+   Vizinhos reagem ao RADAR_FAIL/OK via callbacks UDP:
+     on_radar_fail_received() em fsm_events.c
+============================================================ */
+void fsm_verificar_radar(bool teve_frame)
 {
     if (teve_frame) {
         g_fsm_radar_fail_cnt = 0;
         g_fsm_radar_ok_cnt++;
+
         if (!g_fsm_radar_ok && g_fsm_radar_ok_cnt >= RADAR_OK_COUNT) {
             g_fsm_radar_ok = true;
-            ESP_LOGI(TAG, "Radar recuperado após %d frames", RADAR_OK_COUNT);
+            ESP_LOGI(TAG, "Radar RECUPERADO — envia RADAR_OK a vizinhos");
+
+            /* Avisa ambos os vizinhos que o radar recuperou */
+            comm_notify_radar_status(true);
+
+            /* Sai de SAFE MODE → IDLE */
             if (g_fsm_state == STATE_SAFE_MODE)
                 g_fsm_state = STATE_IDLE;
         }
     } else {
         g_fsm_radar_ok_cnt = 0;
         g_fsm_radar_fail_cnt++;
+
         if (g_fsm_radar_ok && g_fsm_radar_fail_cnt >= RADAR_FAIL_COUNT) {
             g_fsm_radar_ok = false;
-            ESP_LOGW(TAG, "Radar FAIL após %d ciclos", RADAR_FAIL_COUNT);
+            ESP_LOGW(TAG, "Radar FAIL — envia RADAR_FAIL a vizinhos");
+
+            /* Avisa ambos os vizinhos que o radar falhou.
+               viz.esq → AUTONOMO  (não pode confiar em PASSED de B)
+               viz.dir → MASTER    (B não vai enviar TC_INC) */
+            comm_notify_radar_status(false);
+
+            /* Entra em SAFE MODE — cego, luz 50% */
+            if (g_fsm_state != STATE_OBSTACULO) {
+                g_fsm_era_autonomo = false;
+                g_fsm_state = STATE_SAFE_MODE;
+                dali_set_brightness(LIGHT_SAFE_MODE);
+            }
         }
     }
-    (void)comm_ok;
 }
 
 
 /* ============================================================
-   state_machine_init — inicialização de todas as variáveis
+   state_machine_init
 ============================================================ */
 void state_machine_init(void)
 {
@@ -116,6 +148,8 @@ void state_machine_init(void)
     g_fsm_radar_ok_cnt      = 0;
     g_fsm_right_online      = true;
     g_fsm_era_autonomo      = false;
+    g_fsm_left_radar_fail   = false;
+    g_fsm_right_radar_fail  = false;
     g_fsm_acender_em_ms     = 0;
     g_fsm_master_claim_ms   = 0;
     g_fsm_sem_vizinho_ms    = 0;
@@ -129,35 +163,43 @@ void state_machine_init(void)
     fsm_sim_init();
 #endif
 
-    ESP_LOGI(TAG, "FSM v1.0 inicializada — estado IDLE");
+    ESP_LOGI(TAG, "FSM v2.0 inicializada — estado IDLE");
 }
 
 
 /* ============================================================
    state_machine_update — ciclo de manutenção a 100ms
-   Delega nos sub-módulos por responsabilidade.
+   ──────────────────────────────────────────────────────────
+   Ordem de execução:
+     1. Simulador (USE_RADAR=0)
+     2. Saúde do radar (debounce + RADAR_FAIL/OK UDP)
+     3. Vizinhos (online/offline)
+     4. Timers (ETA, apagamento, Tc timeout, MASTER_CLAIM)
+     5. Papel MASTER
+     6. Estados degradados (AUTONOMO, SAFE_MODE)
 ============================================================ */
 void state_machine_update(bool comm_ok, bool is_master,
                           bool radar_teve_frame)
 {
+    /* 1. Simulador — substitui radar físico em bancada */
 #if USE_RADAR == 0
     fsm_sim_update();
     radar_teve_frame = true;
 #endif
 
-    /* Passo 2: saúde do radar */
-    fsm_verificar_radar(radar_teve_frame, comm_ok);
+    /* 2. Saúde do radar — debounce + notifica vizinhos */
+    fsm_verificar_radar(radar_teve_frame);
 
-    /* Passos 3-5: gestão de vizinhos e T preso */
+    /* 3. Vizinhos — detecta online/offline viz.esq e viz.dir */
     fsm_network_vizinhos(comm_ok, is_master);
 
-    /* Passos 6-9,12: timers, apagamento, obstáculo, Tc, MASTER_CLAIM */
+    /* 4. Timers — ETA pré-acendimento, apagamento, Tc, MASTER_CLAIM */
     fsm_timer_update(comm_ok, is_master);
 
-    /* Passo 10: papel MASTER */
+    /* 5. Papel MASTER — IDLE↔MASTER conforme topologia */
     fsm_network_master(comm_ok, is_master);
 
-    /* Passo 11: estados degradados SAFE_MODE / AUTONOMO */
+    /* 6. Estados degradados — AUTONOMO e SAFE_MODE */
     fsm_network_estados_degradados(comm_ok, is_master);
 }
 
@@ -165,17 +207,12 @@ void state_machine_update(bool comm_ok, bool is_master,
 /* ============================================================
    GETTERS PÚBLICOS
 ============================================================ */
-system_state_t state_machine_get_state(void)
-{
-    return g_fsm_state;
-}
-
-int state_machine_get_T(void)   { return g_fsm_T; }
-int state_machine_get_Tc(void)  { return g_fsm_Tc; }
-
-float state_machine_get_last_speed(void) { return g_fsm_last_speed; }
-bool  state_machine_radar_ok(void)       { return g_fsm_radar_ok; }
-bool  sm_is_obstaculo(void) { return g_fsm_state == STATE_OBSTACULO; }
+system_state_t state_machine_get_state(void)     { return g_fsm_state; }
+int            state_machine_get_T(void)          { return g_fsm_T; }
+int            state_machine_get_Tc(void)         { return g_fsm_Tc; }
+float          state_machine_get_last_speed(void) { return g_fsm_last_speed; }
+bool           state_machine_radar_ok(void)       { return g_fsm_radar_ok; }
+bool           sm_is_obstaculo(void) { return g_fsm_state == STATE_OBSTACULO; }
 
 const char *state_machine_get_state_name(void)
 {

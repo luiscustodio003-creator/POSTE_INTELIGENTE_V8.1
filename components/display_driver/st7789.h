@@ -1,11 +1,25 @@
 /* ============================================================
    ST7789 — DECLARAÇÃO
    @file      st7789.h
-   @brief     Driver SPI para display TFT ST7789 240x240/240x320
-   @version   4.1  |  2026-04-17
+   @version   5.0  |  2026-04-27
    PROJECTO   : Poste Inteligente v8
    AUTORES    : Luis Custódio | Tiago Moreno
-   PLATAFORMA : ESP32 (ESP-IDF v5.x)
+
+   NOVIDADE v5.0 — AUTO-DETECÇÃO DE RESOLUÇÃO:
+   ─────────────────────────────────────────────
+   st7789_init() lê LCD_V_RES da NVS automaticamente.
+   Se não encontrar valor gravado, usa 240px por omissão.
+
+   Para configurar um poste com ecrã 240×320:
+     st7789_set_resolution(320);   ← chamar UMA VEZ
+   O valor fica gravado na NVS (namespace "hw_cfg", chave
+   "lcd_v_res") e é restaurado em todos os arranques seguintes.
+
+   Para repor o valor por omissão (240px):
+     st7789_set_resolution(240);
+
+   A resolução actual pode ser consultada com:
+     st7789_get_resolution();  → devolve 240 ou 320
 
    CONFIGURAÇÃO NECESSÁRIA em lv_conf.h:
    ────────────────────────────────────────
@@ -20,8 +34,8 @@
      #define LCD_PIN_DC    32   (DC)
      #define LCD_PIN_RST   33   (RST)
      #define LCD_PIN_BL    25   (Backlight)
-     #define LCD_H_RES    240
-     #define LCD_V_RES    240
+     #define LCD_H_RES    240   (fixo)
+     LCD_V_RES             →   variável global g_lcd_v_res (NVS)
 ============================================================ */
 
 #ifndef ST7789_H
@@ -31,27 +45,26 @@
 #include <stdbool.h>
 
 /* ============================================================
-   REGISTOS DO ST7789 (comandos principais)
+   REGISTOS DO ST7789
 ============================================================ */
-#define ST7789_SWRESET   0x01   /* Software Reset              */
-#define ST7789_SLPIN     0x10   /* Sleep In                    */
-#define ST7789_SLPOUT    0x11   /* Sleep Out                   */
-#define ST7789_INVOFF    0x20   /* Display Inversion Off       */
-#define ST7789_INVON     0x21   /* Display Inversion On        */
-#define ST7789_DISPON    0x29   /* Display On                  */
-#define ST7789_CASET     0x2A   /* Column Address Set          */
-#define ST7789_RASET     0x2B   /* Row Address Set             */
-#define ST7789_RAMWR     0x2C   /* Memory Write                */
-#define ST7789_MADCTL    0x36   /* Memory Data Access Control  */
-#define ST7789_COLMOD    0x3A   /* Interface Pixel Format      */
+#define ST7789_SWRESET   0x01
+#define ST7789_SLPIN     0x10
+#define ST7789_SLPOUT    0x11
+#define ST7789_INVOFF    0x20
+#define ST7789_INVON     0x21
+#define ST7789_DISPON    0x29
+#define ST7789_CASET     0x2A
+#define ST7789_RASET     0x2B
+#define ST7789_RAMWR     0x2C
+#define ST7789_MADCTL    0x36
+#define ST7789_COLMOD    0x3A
 
-/* MADCTL bits */
-#define ST7789_MADCTL_MY     0x80   /* Row address order    */
-#define ST7789_MADCTL_MX     0x40   /* Column address order */
-#define ST7789_MADCTL_MV     0x20   /* Row/Column exchange  */
-#define ST7789_MADCTL_ML     0x10   /* Vertical refresh     */
-#define ST7789_MADCTL_BGR    0x08   /* BGR filter (0=RGB)   */
-#define ST7789_MADCTL_MH     0x04   /* Horizontal refresh   */
+#define ST7789_MADCTL_MY     0x80
+#define ST7789_MADCTL_MX     0x40
+#define ST7789_MADCTL_MV     0x20
+#define ST7789_MADCTL_ML     0x10
+#define ST7789_MADCTL_BGR    0x08
+#define ST7789_MADCTL_MH     0x04
 
 
 /* ============================================================
@@ -60,31 +73,37 @@
 
 /**
  * @brief Inicializa o display ST7789.
- *        Configura SPI, GPIO, sequência de init e backlight.
+ *        Lê resolução vertical da NVS (default 240px se não
+ *        encontrar valor gravado). Configura SPI, GPIO e backlight.
  *        Chamar UMA VEZ em display_manager_init().
- *
- *        Configuração aplicada:
- *          MADCTL = 0x00  (RGB, orientação normal)
- *          INVON  = activo (necessário para cores correctas)
- *          LV_COLOR_16_SWAP = 1 em lv_conf.h
  */
 void st7789_init(void);
 
 /**
+ * @brief Grava resolução vertical na NVS e actualiza g_lcd_v_res.
+ *        Chamar apenas uma vez por poste quando se muda o ecrã.
+ *        O valor persiste em todos os arranques seguintes.
+ *
+ * @param v_res  Resolução vertical: 240 ou 320. Outros valores ignorados.
+ */
+void st7789_set_resolution(uint16_t v_res);
+
+/**
+ * @brief Devolve a resolução vertical actualmente configurada.
+ * @return 240 ou 320
+ */
+uint16_t st7789_get_resolution(void);
+
+/**
  * @brief Define janela de escrita no display.
  *        Chamada internamente por st7789_draw_bitmap().
- *
- * @param x0  Coluna inicial
- * @param y0  Linha inicial
- * @param x1  Coluna final (inclusive)
- * @param y1  Linha final (inclusive)
  */
 void st7789_set_window(uint16_t x0, uint16_t y0,
                        uint16_t x1, uint16_t y1);
 
 /**
  * @brief Envia buffer de pixels para o display.
- *        Chamado pelo flush callback do LVGL (st7789_flush_cb).
+ *        Chamado pelo flush callback do LVGL.
  *
  * @param x     Coluna inicial
  * @param y     Linha inicial

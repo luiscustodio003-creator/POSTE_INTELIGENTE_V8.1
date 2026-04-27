@@ -124,10 +124,17 @@ static QueueHandle_t s_fila = NULL;
 /* ============================================================
    DIMENSÕES DO CANVAS DO RADAR
 ============================================================ */
-#define RADAR_W       230
-#define RADAR_H        90
-#define RADAR_X_OFF     5
-#define RADAR_Y_OFF   149
+/* ── DIMENSÕES DO CANVAS DO RADAR — ADAPTATIVAS ──────────────────
+   LCD_V_RES é variável global (g_lcd_v_res) lida da NVS em st7789_init().
+   RADAR_H adapta-se automaticamente:
+     240×240: RADAR_H = 240 - 149 =  91px
+     240×320: RADAR_H = 320 - 149 = 171px
+   Nenhuma alteração necessária ao mudar de ecrã.
+────────────────────────────────────────────────────────────────── */
+#define RADAR_X_OFF   5                          /* margem esquerda fixa  */
+#define RADAR_Y_OFF   149                        /* fim das zonas fixas   */
+#define RADAR_W       (LCD_H_RES - 10)           /* largura do canvas     */
+#define RADAR_H       (LCD_V_RES - RADAR_Y_OFF)  /* altura adaptativa     */
 
 /* Tempo máximo sem frame real antes de apagar o alvo do canvas */
 #define ALVO_HOLD_MS  500
@@ -153,7 +160,11 @@ static lv_obj_t *card_vel;
 static lv_obj_t *canvas_radar;
 
 /* Buffer do canvas — RGB565 */
-static lv_color_t radar_buf[RADAR_W * RADAR_H];
+/* Buffer dimensionado para o maior ecrã suportado (240×320 → 171px).
+   Em runtime apenas RADAR_W × RADAR_H píxeis são usados.
+   230 × 171 = 39.330 entradas × 2 bytes = ~77KB RAM estática. */
+#define RADAR_BUF_MAX  ((LCD_H_RES - 10) * (320 - RADAR_Y_OFF))
+static lv_color_t radar_buf[RADAR_BUF_MAX];
 
 
 /* ============================================================
@@ -289,7 +300,7 @@ static void _radar_mm_to_px(int x_mm, int y_mm,
 {
     const int cx_s  = RADAR_W / 2;
     const int cy_s  = RADAR_H - 2;
-    const int r_max = RADAR_H - 4;
+    const int r_max = RADAR_H - 4;  /* adapta-se com RADAR_H */
 
     float dist_mm = sqrtf((float)x_mm * (float)x_mm +
                           (float)y_mm * (float)y_mm);
@@ -591,12 +602,15 @@ static void _radar_redraw(void)
             }
         }
 
-        /* 6b. Halo duplo em torno do ponto */
-        _halo_px((int)px, (int)py, 5, 10, C_ALV, 50u);
-        _halo_px((int)px, (int)py, 3,  6, C_ALV, 90u);
+        /* 6b. Halo duplo — tamanho adaptativo ao ecrã */
+        int h1     = (RADAR_H > 120) ? 6 : 5;
+        int h2     = (RADAR_H > 120) ? 12 : 10;
+        int r_alvo = (RADAR_H > 120) ? 4 : 3;
+        _halo_px((int)px, (int)py, h1, h2,         C_ALV, 50u);
+        _halo_px((int)px, (int)py, h1-2, h2-4,     C_ALV, 90u);
 
         /* 6c. Ponto principal */
-        _circulo_px((int)px, (int)py, 3, C_ALV);
+        _circulo_px((int)px, (int)py, r_alvo, C_ALV);
         _px_blend((int)px - 1, (int)py - 1, C_ALV_HL, 210u);
         _px_blend((int)px,     (int)py - 1, C_ALV_HL, 160u);
         _px_blend((int)px - 1, (int)py,     C_ALV_HL, 110u);

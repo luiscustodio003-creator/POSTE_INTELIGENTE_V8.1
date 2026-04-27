@@ -171,17 +171,21 @@
 #define AUTONOMO_DELAY_MS       10000ULL
 
 
-/* ============================================================
-   DISPLAY
-   ──────────────────────────────────────────────────────────
-   Resolução do display TFT ST7789.
-   LCD_H_RES → largura em pixels
-   LCD_V_RES → altura em pixels
-   NOTA: para display 240×320 alterar LCD_V_RES para 320.
-============================================================ */
-#define LCD_H_RES             240
-#define LCD_V_RES             240
 
+
+
+
+/* ============================================================
+   DISPLAY — RESOLUÇÃO VERTICAL
+   ──────────────────────────────────────────────────────────
+   LCD_V_RES_CONFIG → resolução vertical do ecrã deste poste.
+   Valores aceites: 240 (ecrã quadrado) ou 320 (ecrã rectangular).
+
+   ▼▼▼ EDITAR AQUI PARA MUDAR O ECRÃ DESTE POSTE ▼▼▼
+   O st7789_init() compara este valor com o da NVS e actualiza
+   automaticamente se forem diferentes. Basta reflashar.
+============================================================ */
+#define LCD_V_RES_CONFIG      320    /* 240 = ecrã 240×240 | 320 = ecrã 240×320 */
 
 
 /* ============================================================

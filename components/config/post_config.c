@@ -95,43 +95,15 @@ static void _persist_name(const char *name)
 ============================================================ */
 void post_config_init(void)
 {
-    nvs_handle_t handle;
-    esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &handle);
+    /* Usa SEMPRE os valores definidos em system_config.h.
+       Não lê da NVS — o system_config.h é a fonte de verdade.
+       Para mudar de poste: editar POSTE_ID/POSTE_NAME e reflashar. */
+    s_post.id = POSTE_ID;
+    strncpy(s_post.name, POSTE_NAME, sizeof(s_post.name) - 1);
+    s_post.name[sizeof(s_post.name) - 1] = '\0';
 
-    if (err == ESP_OK) {
-
-        /* ── ID ── */
-        uint32_t id_lido;
-        if (nvs_get_u32(handle, "post_id", &id_lido) != ESP_OK) {
-            s_post.id = POSTE_ID;
-            nvs_set_u32(handle, "post_id", (uint32_t)s_post.id);
-            ESP_LOGI(TAG, "ID não encontrado na NVS — a usar default: %d", s_post.id);
-        } else {
-            s_post.id = (uint8_t)id_lido;
-        }
-
-        /* ── NOME ── */
-        size_t nome_len = sizeof(s_post.name);
-        if (nvs_get_str(handle, "post_name", s_post.name, &nome_len) != ESP_OK) {
-            strncpy(s_post.name, POSTE_NAME, sizeof(s_post.name) - 1);
-            s_post.name[sizeof(s_post.name) - 1] = '\0';
-            nvs_set_str(handle, "post_name", s_post.name);
-            ESP_LOGI(TAG, "Nome não encontrado na NVS — a usar default: %s", s_post.name);
-        }
-
-        nvs_commit(handle);
-        nvs_close(handle);
-
-        ESP_LOGI(TAG, "Config carregada: ID=%d  Nome=%s", s_post.id, s_post.name);
-
-    } else {
-        /* NVS inacessível — usa defaults em RAM sem persistir */
-        s_post.id = POSTE_ID;
-        strncpy(s_post.name, POSTE_NAME, sizeof(s_post.name) - 1);
-        s_post.name[sizeof(s_post.name) - 1] = '\0';
-        ESP_LOGW(TAG, "NVS inacessível — defaults: ID=%d  Nome=%s",
-                 s_post.id, s_post.name);
-    }
+    ESP_LOGI(TAG, "Config: ID=%d  Nome=%s  Posição=%d",
+             s_post.id, s_post.name, POST_POSITION);
 }
 
 /* ============================================================
