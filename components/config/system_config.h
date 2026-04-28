@@ -42,9 +42,15 @@
    ATENÇÃO: POST_POSITION deve ser único e sequencial.
             POSTE_ID     deve ser único em toda a rede.
 ============================================================ */
-#define POSTE_ID              1
-#define POSTE_NAME            "POSTE 01"
-#define POST_POSITION         0
+#define POSTE_ID              2
+#define POSTE_NAME            "POSTE 02"
+#define POST_POSITION         1
+
+
+/* ============================================================
+   DISPLAY — RESOLUÇÃO VERTICAL
+============================================================ */
+#define LCD_V_RES_CONFIG      240   /* 240 = ecrã 240×240 | 320 = ecrã 240×320 */
 
 
 /* ============================================================
@@ -175,17 +181,6 @@
 
 
 
-/* ============================================================
-   DISPLAY — RESOLUÇÃO VERTICAL
-   ──────────────────────────────────────────────────────────
-   LCD_V_RES_CONFIG → resolução vertical do ecrã deste poste.
-   Valores aceites: 240 (ecrã quadrado) ou 320 (ecrã rectangular).
-
-   ▼▼▼ EDITAR AQUI PARA MUDAR O ECRÃ DESTE POSTE ▼▼▼
-   O st7789_init() compara este valor com o da NVS e actualiza
-   automaticamente se forem diferentes. Basta reflashar.
-============================================================ */
-#define LCD_V_RES_CONFIG      320    /* 240 = ecrã 240×240 | 320 = ecrã 240×320 */
 
 
 /* ============================================================

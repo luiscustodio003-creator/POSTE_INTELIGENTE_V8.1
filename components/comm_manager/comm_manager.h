@@ -1,25 +1,21 @@
+#include <inttypes.h>
 /* ============================================================
    COMM MANAGER — DECLARAÇÃO
    @file      comm_manager.h
-   @version   4.0  |  2026-04-27
-   PROJECTO   : Poste Inteligente v8
-   AUTORES    : Luis Custódio | Tiago Moreno
+   @version   2.0  |  2026-04-07
+   Projecto  : Poste Inteligente v8
+   Estudantes: Luis Custodio | Tiago Moreno
+   Plataforma: ESP32 (ESP-IDF v5.x)
 
-   NOVIDADES v4.0:
-   ────────────────
-   comm_notify_radar_status(ok) — envia RADAR_FAIL ou RADAR_OK
-     a AMBOS os vizinhos (esq e dir).
-   comm_left_was_ever_online()  — true se viz.esq já respondeu
-     pelo menos uma vez (distingue "nunca descoberto" de "offline").
+   Camada de abstracção sobre o udp_manager.
+   A state_machine chama estas funções sem conhecer IPs.
+   O comm_manager resolve o vizinho correcto e calcula ETA.
 
-   PROTOCOLO RADAR_FAIL/RADAR_OK:
-   ────────────────────────────────
-   Quando radar falha → B envia RADAR_FAIL a A e a C.
-     A recebe RADAR_FAIL do dir → AUTONOMO
-     C recebe RADAR_FAIL do esq → MASTER imediato
-   Quando radar recupera → B envia RADAR_OK a A e a C.
-     A recebe RADAR_OK do dir → IDLE (ou MASTER se pos=0)
-     C recebe RADAR_OK do esq → cede MASTER → IDLE
+   Alterações v1.x → v2.0:
+   ─────────────────────────
+   1. comm_send_tc_inc() e comm_send_spd() aceitam x_mm.
+      Propaga posição lateral do alvo ao poste seguinte.
+   2. comm_notify_prev_passed() mantém assinatura (não usa x_mm).
 ============================================================ */
 #ifndef COMM_MANAGER_H
 #define COMM_MANAGER_H
@@ -27,45 +23,61 @@
 #include <stdbool.h>
 #include <stdint.h>
 
-/* ── Ciclo de vida ──────────────────────────────────────── */
-bool comm_init(void);
-
-/* ── Estado ─────────────────────────────────────────────── */
-/** true se socket UDP válido (não depende de vizinhos) */
-bool comm_status_ok(void);
-
-/** true se este poste tem papel MASTER */
-bool comm_is_master(void);
-
-/** true se viz. esquerdo está online */
-bool comm_left_online(void);
-
-/** true se viz. direito está online */
-bool comm_right_online(void);
-
-/** true se viz. esquerdo já respondeu pelo menos uma vez.
-    Distingue "nunca descoberto" de "estava online, ficou offline". */
-bool comm_left_was_ever_online(void);
-
-/* ── Envio de mensagens ──────────────────────────────────── */
-
-/** TC_INC ao viz.dir — anuncia detecção com velocidade e posição */
-void comm_send_tc_inc(float speed, int16_t x_mm);
-
-/** SPD ao viz.dir — envia ETA calculado para pré-acendimento */
-void comm_send_spd(float speed, int16_t x_mm);
-
-/** PASSED ao viz.esq — speed negativo codifica sinal PASSED */
-void comm_notify_prev_passed(float speed);
-
-/** MASTER_CLAIM ao viz.dir — propaga liderança em cadeia */
-void comm_send_master_claim(void);
+/* ── Ciclo de vida ────────────────────────────────────────── */
 
 /**
- * @brief Envia RADAR_FAIL ou RADAR_OK a ambos os vizinhos.
- *        Chamado por fsm_verificar_radar() quando muda estado.
- * @param radar_ok true = RADAR_OK, false = RADAR_FAIL
+ * @brief Inicializa UDP e inicia descoberta de vizinhos.
+ *        Chamar apenas após Wi-Fi com IP obtido.
+ * @return true se socket criado com sucesso
  */
-void comm_notify_radar_status(bool radar_ok);
+bool comm_init(void);
+
+/* ── Estado de rede ───────────────────────────────────────── */
+
+/** true se UDP está operacional (socket válido) */
+bool comm_status_ok(void);
+
+/** true se este poste é MASTER (pos=0 ou viz. esq. offline) */
+bool comm_is_master(void);
+
+/** true se vizinho esquerdo está online */
+bool comm_left_online(void);
+
+/** true se vizinho direito está online */
+bool comm_right_online(void);
+
+/* ── Envio de mensagens ───────────────────────────────────── */
+
+/**
+ * @brief Envia TC_INC ao vizinho direito.
+ *        Inclui x_mm para continuidade visual no canvas.
+ * @param speed Velocidade do carro (km/h)
+ * @param x_mm  Posição lateral do alvo em mm (0 = centro)
+ */
+void comm_send_tc_inc(float speed, int16_t x_mm);
+
+/**
+ * @brief Envia SPD ao vizinho direito com ETA calculado.
+ *        ETA = (POSTE_DIST_M - RADAR_DETECT_M) / (speed/3.6)
+ *        Inclui x_mm para continuidade visual no canvas.
+ * @param speed Velocidade do carro (km/h)
+ * @param x_mm  Posição lateral do alvo em mm
+ */
+void comm_send_spd(float speed, int16_t x_mm);
+
+/**
+ * @brief Notifica vizinho esquerdo que carro chegou (T--).
+ *        Envia TC_INC com velocidade negativa.
+ * @param speed Velocidade do carro (km/h, enviada como negativo)
+ */
+void comm_notify_prev_passed(float speed);
+
+/**
+ * @brief Envia MASTER_CLAIM em cadeia ao vizinho direito.
+ */
+void comm_send_master_claim(void);
+
+bool comm_left_known(void);
 
 #endif /* COMM_MANAGER_H */
+

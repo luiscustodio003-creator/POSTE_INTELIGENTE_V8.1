@@ -6,6 +6,11 @@ Autores   : Luis Custódio | Tiago Moreno
 Data      : 2026-04-26
 ===============================================================================
 
+
+Definicao de ETA
+Este paramentro serve para informar o poste seguinte de quando que o poste
+seguinte deve estar acesso.Ou seja tempo estimado de chegada do vaiculo ao poste seguinte 
+
 LEGENDA:
   T   = veículos detectados localmente pelo radar deste poste
   Tc  = veículos anunciados via UDP (a caminho)

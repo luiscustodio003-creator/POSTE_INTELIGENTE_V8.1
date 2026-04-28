@@ -1,47 +1,16 @@
 /* ============================================================
    MÓDULO     : fsm_network
-   FICHEIRO   : fsm_network.c
-   VERSÃO     : 2.0  |  2026-04-27
+   FICHEIRO   : fsm_network.c — Gestão de rede da FSM
+   VERSÃO     : 1.0  |  2026-04-26
    PROJECTO   : Poste Inteligente v8
    AUTORES    : Luis Custódio | Tiago Moreno
+   PLATAFORMA : ESP32 (ESP-IDF v5.x)
 
-   ALTERAÇÕES v1.0 → v2.0:
-   ─────────────────────────
-   1. fsm_network_vizinhos(): removida chamada a comm_left_known()
-      (função não existia). Substituída por lógica baseada em
-      POST_POSITION + flag g_fsm_left_was_offline.
-      Regra: só marca offline se vizinho já esteve online antes
-      (evita MASTER prematuro no arranque durante DISCOVER).
-
-   2. fsm_network_estados_degradados():
-      AUTONOMO agora tem 3 condições de entrada:
-        a) sem WiFi → imediato
-        b) WiFi OK + sem vizinhos → após AUTONOMO_DELAY_MS
-        c) viz.esq notificou RADAR_FAIL → imediato
-           (g_fsm_left_radar_fail=true, tratado em fsm_events)
-
-      SAFE MODE:
-        Radar KO → sempre SAFE MODE (independente do WiFi).
-        Sai apenas quando radar recupera (on_radar_ok_received).
-
-   3. fsm_network_master():
-      Poste assume MASTER quando:
-        a) is_master (pos=0) — normal
-        b) viz.esq offline há AUTONOMO_DELAY_MS — normal
-        c) viz.dir notificou RADAR_FAIL → imediato
-           (g_fsm_right_radar_fail=true, tratado em on_radar_fail_received)
-      Cede MASTER quando:
-        a) viz.esq volta online E pos>0
-        b) viz.dir notificou RADAR_OK
-           (g_fsm_right_radar_fail=false, tratado em on_radar_ok_received)
-
-   4. T_STUCK_TIMEOUT_MS: força T=0 quando viz.esq offline há
-      demasiado tempo (PASSED nunca chegará).
-
-   DEPENDÊNCIAS:
-   ─────────────
-   fsm_core.h, fsm_events.h, comm_manager.h,
-   dali_manager.h, system_config.h
+   RESPONSABILIDADE:
+   ─────────────────
+   Passos 3, 4, 10 e 11 do state_machine_update().
+   Isola toda a lógica de conectividade UDP e transições
+   de estado relacionadas com a rede.
 ============================================================ */
 
 #include "fsm_network.h"
@@ -54,120 +23,81 @@
 
 static const char *TAG = "FSM_NET";
 
-/* T preso: viz.esq offline → PASSED nunca chegará → força T=0 */
-#define T_STUCK_TIMEOUT_MS   (TRAFIC_TIMEOUT_MS * 3)
-
 
 /* ============================================================
-   fsm_network_vizinhos — detecta mudanças de conectividade
-   ──────────────────────────────────────────────────────────
-   Passo 3: viz. direito online/offline
-   Passo 4: viz. esquerdo online/offline + T preso
-
-   REGRA arranque: g_fsm_left_was_offline só é marcado true
-   depois do viz.esq ter estado online pelo menos uma vez.
-   Antes disso (DISCOVER em curso) não marcamos offline para
-   não assumir MASTER prematuramente.
+   fsm_network_vizinhos — Passos 3 e 4
+   Gestão de conectividade dos vizinhos esquerdo e direito.
 ============================================================ */
 void fsm_network_vizinhos(bool comm_ok, bool is_master)
 {
     uint64_t agora = fsm_agora_ms();
 
-    /* ── Passo 3: Viz. direito ────────────────────────────── */
+    /* ── Passo 3: Vizinho direito ─────────────────────────── */
     bool dir_ok = comm_right_online();
     if (!dir_ok &&  g_fsm_right_online) sm_on_right_neighbor_offline();
     if ( dir_ok && !g_fsm_right_online) sm_on_right_neighbor_online();
 
-    /* ── Passo 4: Viz. esquerdo ───────────────────────────── */
-    /* Poste 0 nunca tem viz. esquerdo */
-    if (POST_POSITION == 0) {
-        g_fsm_left_was_offline = false;
-        g_fsm_left_offline_ms  = 0;
-        (void)comm_ok; (void)is_master;
-        return;
-    }
+    /* ── Passo 4: Vizinho esquerdo ────────────────────────── */
+    bool esq_ok       = comm_left_online();
+    bool esq_conhecido = comm_left_known();
 
-    bool esq_ok = comm_left_online();
-
-    /* Só marca offline se viz.esq já esteve online antes.
-       Estado inicial: g_fsm_left_was_offline=false.
-       Primeira vez que esq_ok fica true → vizinho descoberto.
-       Se depois ficar false → marca offline.                  */
-    if (!esq_ok && !g_fsm_left_was_offline &&
-        comm_left_was_ever_online()) {
+    /* Só marca offline se o vizinho já foi descoberto antes.
+       No arranque, vizinho desconhecido != vizinho offline.
+       Evita assumir MASTER temporário por falsa ausência. */
+    if (!esq_ok && esq_conhecido && !g_fsm_left_was_offline) {
         g_fsm_left_was_offline = true;
         g_fsm_left_offline_ms  = agora;
-        ESP_LOGW(TAG, "Viz. esq. ficou offline");
+        ESP_LOGW(TAG, "Vizinho esq. ficou offline");
     }
-
-    /* Viz. esq. voltou online */
     if (esq_ok && g_fsm_left_was_offline) {
         g_fsm_left_was_offline = false;
-        g_fsm_left_radar_fail  = false;  /* reset flag RADAR_FAIL */
         if (g_fsm_state == STATE_MASTER && POST_POSITION > 0) {
             g_fsm_state = STATE_IDLE;
             comm_send_master_claim();
         }
-        ESP_LOGI(TAG, "Viz. esq. voltou online → IDLE");
+        ESP_LOGI(TAG, "Vizinho esq. voltou online");
+    }
+    /* Vizinho nunca descoberto — garante flag limpa */
+    if (!esq_conhecido && g_fsm_left_was_offline) {
+        g_fsm_left_was_offline = false;
+        g_fsm_left_offline_ms  = 0;
     }
 
-    /* T preso: viz.esq offline há demasiado tempo.
-       PASSED nunca chegará — força T=0 para não manter
-       luz acesa indefinidamente. */
-    if (g_fsm_left_was_offline && g_fsm_T > 0 &&
-        (agora - g_fsm_left_offline_ms) > T_STUCK_TIMEOUT_MS) {
-        ESP_LOGW(TAG, "T forçado a 0 — viz.esq offline há %lus",
-                 (unsigned long)(T_STUCK_TIMEOUT_MS / 1000));
-        g_fsm_T = 0;
-        fsm_agendar_apagar();
-    }
-
-    (void)comm_ok; (void)is_master;
+    (void)comm_ok;
+    (void)is_master;
 }
 
 
 /* ============================================================
-   fsm_network_master — gestão do papel MASTER
-   ──────────────────────────────────────────────────────────
-   MASTER quando:
-     a) is_master (pos=0) — sempre
-     b) viz.esq offline há AUTONOMO_DELAY_MS — temporário
-     c) viz.dir notificou RADAR_FAIL — imediato
-        (já tratado em on_radar_fail_received, flag =true)
-
-   Cede MASTER quando:
-     a) viz.esq volta online E pos>0
-     b) viz.dir notificou RADAR_OK
-        (já tratado em on_radar_ok_received, flag =false)
+   fsm_network_master — Passo 10
+   Gestão do papel MASTER na cadeia.
 ============================================================ */
 void fsm_network_master(bool comm_ok, bool is_master)
 {
     uint64_t agora = fsm_agora_ms();
 
-    /* a) Transição normal IDLE ↔ MASTER */
-    if (is_master && g_fsm_state == STATE_IDLE)
+    /* Transições IDLE ↔ MASTER baseadas no papel actual */
+    if ( is_master && g_fsm_state == STATE_IDLE)
         g_fsm_state = STATE_MASTER;
 
-    if (!is_master && g_fsm_state == STATE_MASTER &&
-        !g_fsm_left_was_offline && !g_fsm_right_radar_fail) {
+    if (!is_master && g_fsm_state == STATE_MASTER) {
         g_fsm_state = STATE_IDLE;
-        ESP_LOGI(TAG, "MASTER cedido → IDLE");
+        ESP_LOGI(TAG, "MASTER cedido");
     }
 
-    /* b) Viz.esq offline há AUTONOMO_DELAY_MS → MASTER temporário */
+    /* Vizinho esq. offline há AUTONOMO_DELAY_MS → assume MASTER temporário */
     if (!is_master && g_fsm_left_was_offline && g_fsm_radar_ok &&
         (agora - g_fsm_left_offline_ms) > AUTONOMO_DELAY_MS &&
         g_fsm_state == STATE_IDLE) {
         g_fsm_state = STATE_MASTER;
-        ESP_LOGW(TAG, "MASTER temporário — viz.esq offline");
+        ESP_LOGW(TAG, "MASTER temporário — viz. esq. offline");
     }
 
-    /* Viz.esq voltou → cede MASTER (se pos>0 e sem RADAR_FAIL dir) */
+    /* Vizinho esq. voltou — cede MASTER se não for o poste 0 */
     if (!is_master && !g_fsm_left_was_offline &&
-        !g_fsm_right_radar_fail &&
         g_fsm_state == STATE_MASTER && POST_POSITION > 0) {
         g_fsm_state = STATE_IDLE;
-        ESP_LOGI(TAG, "Viz.esq voltou → cede MASTER → IDLE");
+        ESP_LOGI(TAG, "Viz. esq. voltou — cede MASTER → IDLE");
     }
 
     (void)comm_ok;
@@ -175,59 +105,50 @@ void fsm_network_master(bool comm_ok, bool is_master)
 
 
 /* ============================================================
-   fsm_network_estados_degradados — AUTONOMO e SAFE_MODE
-   ──────────────────────────────────────────────────────────
-   SAFE_MODE:
-     radar KO → sempre SAFE MODE (independente do WiFi e vizinhos)
-     Sai apenas quando radar recupera (via on_radar_ok_received
-     e fsm_verificar_radar → g_fsm_state = STATE_IDLE).
-
-   AUTONOMO — 3 condições:
-     a) sem WiFi → imediato (radar OK)
-     b) WiFi OK + sem vizinhos → após AUTONOMO_DELAY_MS
-     c) viz.esq RADAR_FAIL → imediato (já em on_radar_fail_received)
-        Aqui apenas mantemos consistência de estado.
-
-   Sai de AUTONOMO quando:
-     - WiFi volta E tem vizinhos E viz.esq sem RADAR_FAIL
-     - on_radar_ok_received(from_left=true) trata o caso (c)
+   fsm_network_estados_degradados — Passo 11
+   Gestão de SAFE_MODE e AUTONOMO.
 ============================================================ */
 void fsm_network_estados_degradados(bool comm_ok, bool is_master)
 {
-    uint64_t agora   = fsm_agora_ms();
-    bool tem_vizinho = comm_left_online() || comm_right_online();
+    uint64_t agora        = fsm_agora_ms();
+    bool tem_vizinho_esq  = comm_left_online();
+    bool tem_vizinho      = tem_vizinho_esq || comm_right_online();
 
-    /* ── SAFE MODE: radar KO ─────────────────────────────────
-       fsm_verificar_radar() já faz a transição e envia RADAR_FAIL.
-       Aqui apenas garantimos que não saímos sem radar recuperado. */
+    /* SAFE MODE — radar KO independentemente do WiFi.
+       Sem radar o poste está sempre cego — luz a 50%.
+       Única excepção: OBSTACULO tem prioridade (luz máxima). */
     if (!g_fsm_radar_ok &&
         g_fsm_state != STATE_SAFE_MODE &&
         g_fsm_state != STATE_OBSTACULO) {
         g_fsm_era_autonomo = false;
         g_fsm_state = STATE_SAFE_MODE;
         dali_set_brightness(LIGHT_SAFE_MODE);
-        ESP_LOGW(TAG, "SAFE MODE — radar KO");
+        ESP_LOGW(TAG, "SAFE MODE — radar KO (wifi=%d viz_esq=%d)",
+                 (int)comm_ok, (int)tem_vizinho_esq);
     }
 
-    /* ── AUTONOMO: sem WiFi → imediato ──────────────────────── */
+    /* Sai de SAFE MODE apenas quando radar recupera */
+    if (g_fsm_state == STATE_SAFE_MODE && g_fsm_radar_ok) {
+        g_fsm_state = STATE_IDLE;
+        ESP_LOGI(TAG, "Saiu de SAFE MODE → IDLE (radar recuperado)");
+    }
+
+    /* AUTONOMO — radar OK + sem WiFi → imediato */
     if (!comm_ok && g_fsm_radar_ok &&
         g_fsm_state != STATE_SAFE_MODE &&
         g_fsm_state != STATE_LIGHT_ON  &&
         g_fsm_state != STATE_OBSTACULO) {
-        if (g_fsm_state != STATE_AUTONOMO) {
-            g_fsm_state = STATE_AUTONOMO;
-            ESP_LOGW(TAG, "AUTONOMO — sem WiFi");
-        }
+        g_fsm_state = STATE_AUTONOMO;
+        ESP_LOGW(TAG, "AUTONOMO — sem WiFi");
     }
 
-    /* ── AUTONOMO: WiFi OK + sem vizinhos → após delay ──────── */
+    /* AUTONOMO — radar OK + WiFi OK + sem vizinhos → após AUTONOMO_DELAY_MS */
     if (g_fsm_radar_ok && comm_ok && !tem_vizinho) {
         if (g_fsm_sem_vizinho_ms == 0) g_fsm_sem_vizinho_ms = agora;
         if ((agora - g_fsm_sem_vizinho_ms) > AUTONOMO_DELAY_MS &&
             g_fsm_state != STATE_SAFE_MODE &&
             g_fsm_state != STATE_LIGHT_ON  &&
-            g_fsm_state != STATE_OBSTACULO &&
-            g_fsm_state != STATE_AUTONOMO) {
+            g_fsm_state != STATE_OBSTACULO) {
             g_fsm_state = STATE_AUTONOMO;
             ESP_LOGW(TAG, "AUTONOMO — sem vizinhos há %lus",
                      (unsigned long)(AUTONOMO_DELAY_MS / 1000));
@@ -236,15 +157,12 @@ void fsm_network_estados_degradados(bool comm_ok, bool is_master)
         g_fsm_sem_vizinho_ms = 0;
     }
 
-    /* ── Sai de AUTONOMO: WiFi volta + vizinhos + esq sem FAIL── */
-    if (g_fsm_state == STATE_AUTONOMO && comm_ok &&
-        tem_vizinho && !g_fsm_left_radar_fail) {
+    /* Sai de AUTONOMO quando WiFi volta E tem vizinhos */
+    if (g_fsm_state == STATE_AUTONOMO && comm_ok && tem_vizinho) {
         g_fsm_sem_vizinho_ms = 0;
         g_fsm_era_autonomo   = false;
         g_fsm_state = is_master ? STATE_MASTER : STATE_IDLE;
         ESP_LOGI(TAG, "Saiu de AUTONOMO → %s",
                  is_master ? "MASTER" : "IDLE");
     }
-
-    (void)is_master;
 }

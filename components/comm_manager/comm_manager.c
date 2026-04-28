@@ -1,105 +1,146 @@
 /* ============================================================
    COMM MANAGER — IMPLEMENTAÇÃO
    @file      comm_manager.c
-   @version   4.0  |  2026-04-27
-   PROJECTO   : Poste Inteligente v8
-   AUTORES    : Luis Custódio | Tiago Moreno
+   @version   2.1  |  2026-04-08
+   Projecto  : Poste Inteligente v8
+   Estudantes: Luis Custodio | Tiago Moreno
+   Plataforma: ESP32 (ESP-IDF v5.x)
 
-   NOVIDADES v4.0:
-   ────────────────
-   1. comm_notify_radar_status(ok): envia MSG_RADAR_FAIL ou
-      MSG_RADAR_OK a AMBOS os vizinhos (esq e dir).
-      Chamado por fsm_verificar_radar() quando radar muda estado.
+   Camada de abstracção sobre o udp_manager.
+   Resolve IPs de vizinhos, calcula ETA e chama as funções
+   de envio correctas sem expor detalhes de protocolo à FSM.
 
-   2. comm_left_was_ever_online(): devolve flag s_left_ever_online
-      que é marcada true quando viz.esq responde pela primeira vez.
-      Usada em fsm_network_vizinhos para distinguir arranque de falha.
-
-   3. comm_status_ok(): não retorna false por ausência de vizinhos.
-      Apenas verifica socket válido. AUTONOMO por "sem vizinhos"
-      é decidido pela FSM com AUTONOMO_DELAY_MS.
+   Alterações v2.0 → v2.1:
+   ─────────────────────────
+   - Corrigido: PRIu32 → %lu + (unsigned long) em comm_send_spd().
+   - Removido #include <inttypes.h>.
 ============================================================ */
 #include "comm_manager.h"
 #include "udp_manager.h"
 #include "system_config.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include <math.h>
 #include <string.h>
 
-static const char *TAG     = "COMM_MGR";
-static bool s_iniciado     = false;
-static bool s_left_ever_online = false;  /* viz.esq já respondeu alguma vez */
+static const char *TAG = "COMM_MGR";
 
-/* ── comm_init ──────────────────────────────────────────── */
+/* Estado: UDP iniciado */
+static bool s_iniciado = false;
+
+/* ============================================================
+   comm_init
+   Inicializa socket UDP e inicia descoberta de vizinhos.
+   Chamado pelo system_monitor quando Wi-Fi disponível.
+============================================================ */
 bool comm_init(void)
 {
     if (s_iniciado) return true;
     s_iniciado = udp_manager_init();
     if (s_iniciado)
-        ESP_LOGI(TAG, "Comm v4.0 iniciado");
+        ESP_LOGI(TAG, "Comm iniciado — protocolo UDP v4.1 activo");
     else
         ESP_LOGE(TAG, "Falha ao iniciar UDP");
     return s_iniciado;
 }
 
-/* ── comm_status_ok — só verifica socket ─────────────────── */
+/* ============================================================
+   comm_status_ok — true se socket UDP válido e operacional
+============================================================ */
 bool comm_status_ok(void)
 {
-    if (!s_iniciado) return false;
-    if (udp_manager_get_socket() < 0) {
+    /* Socket inválido — reseta estado */
+    if (s_iniciado && udp_manager_get_socket() < 0) {
         s_iniciado = false;
-        ESP_LOGW(TAG, "Socket inválido — comm offline");
+        ESP_LOGW(TAG, "Socket UDP inválido — comm offline");
+    }
+
+    if (!s_iniciado) return false;
+
+    /* Período de graça — aguarda DISCOVER completar antes
+       de verificar vizinhos. Evita AUTONOMO prematuro. */
+    static uint64_t s_init_ms = 0;
+    if (s_init_ms == 0)
+        s_init_ms = (uint64_t)(esp_timer_get_time() / 1000ULL);
+
+    uint64_t agora = (uint64_t)(esp_timer_get_time() / 1000ULL);
+    if ((agora - s_init_ms) < (uint64_t)AUTONOMO_DELAY_MS)
+        return true;  /* ← ainda no período de graça — não verifica vizinhos */
+
+    /* Após período de graça — verifica vizinhos normalmente */
+    neighbor_t *viz_esq = udp_manager_get_neighbor_by_pos(POST_POSITION - 1);
+    neighbor_t *viz_dir = udp_manager_get_neighbor_by_pos(POST_POSITION + 1);
+
+    bool tem_vizinho = (viz_esq && viz_esq->active &&
+                        viz_esq->status != NEIGHBOR_OFFLINE) ||
+                       (viz_dir && viz_dir->active &&
+                        viz_dir->status != NEIGHBOR_OFFLINE);
+
+    if (!tem_vizinho) {
+        ESP_LOGD(TAG, "comm_status_ok: sem vizinhos — AUTONOMO");
         return false;
     }
+
     return true;
 }
 
-/* ── comm_is_master ────────────────────────────────────────
-   pos=0 → sempre MASTER.
-   pos>0 → MASTER se viz.esq conhecido E offline.           */
+/* ============================================================
+   comm_is_master
+   True se este poste é o líder da cadeia.
+   Condições: posição 0 OU vizinho esquerdo offline.
+============================================================ */
 bool comm_is_master(void)
 {
+    /* Poste 0 é sempre MASTER independentemente do WiFi */
     if (POST_POSITION == 0) return true;
-    if (!s_iniciado) return false;
-    neighbor_t *v = udp_manager_get_neighbor_by_pos(POST_POSITION - 1);
-    if (!v || !v->active) return false;
-    return (v->status == NEIGHBOR_OFFLINE);
-}
 
-/* ── comm_left_online ─────────────────────────────────────── */
+    /* Sem WiFi — não assume MASTER, vai para AUTONOMO */
+    if (!s_iniciado) return false;
+
+    neighbor_t *viz_esq =
+        udp_manager_get_neighbor_by_pos(POST_POSITION - 1);
+
+    /* Vizinho ainda não descoberto — aguarda DISCOVER */
+    if (!viz_esq || !viz_esq->active) return false;
+
+    /* Vizinho conhecido mas offline — assume MASTER */
+    if (viz_esq->status == NEIGHBOR_OFFLINE) return true;
+
+    return false;
+}
+/* ============================================================
+   comm_left_online — true se vizinho esquerdo online
+============================================================ */
 bool comm_left_online(void)
 {
     if (POST_POSITION == 0) return false;
     neighbor_t *v = udp_manager_get_neighbor_by_pos(POST_POSITION - 1);
-    bool online = v && v->active && v->status == NEIGHBOR_OK;
-    if (online) s_left_ever_online = true;   /* marca descoberto */
-    return online;
+    return v && v->active && v->status == NEIGHBOR_OK;
 }
 
-/* ── comm_right_online ────────────────────────────────────── */
+/* ============================================================
+   comm_right_online — true se vizinho direito online
+============================================================ */
 bool comm_right_online(void)
 {
     neighbor_t *v = udp_manager_get_neighbor_by_pos(POST_POSITION + 1);
     return v && v->active && v->status == NEIGHBOR_OK;
 }
 
-/* ── comm_left_was_ever_online ────────────────────────────── */
-bool comm_left_was_ever_online(void)
-{
-    /* Actualiza a flag antes de devolver */
-    comm_left_online();
-    return s_left_ever_online;
-}
-
-/* ── IPs dos vizinhos ─────────────────────────────────────── */
-static const char *_ip_dir(void)
+/* ============================================================
+   _ip_vizinho_direito — IP do vizinho direito ou NULL
+============================================================ */
+static const char *_ip_vizinho_direito(void)
 {
     neighbor_t *v = udp_manager_get_neighbor_by_pos(POST_POSITION + 1);
     if (!v || !v->active || v->status == NEIGHBOR_OFFLINE) return NULL;
     return v->ip;
 }
 
-static const char *_ip_esq(void)
+/* ============================================================
+   _ip_vizinho_esquerdo — IP do vizinho esquerdo ou NULL
+============================================================ */
+static const char *_ip_vizinho_esquerdo(void)
 {
     if (POST_POSITION == 0) return NULL;
     neighbor_t *v = udp_manager_get_neighbor_by_pos(POST_POSITION - 1);
@@ -107,83 +148,78 @@ static const char *_ip_esq(void)
     return v->ip;
 }
 
-/* ── ETA: (POSTE_DIST_M - RADAR_DETECT_M) / vel ──────────── */
-static uint32_t _eta_ms(float kmh)
+/* ============================================================
+   _calcular_eta_ms
+   ETA = distância restante / velocidade
+   Distância restante = POSTE_DIST_M - RADAR_DETECT_M (metros)
+   Exemplo: 50m postes, 7m detecção, 50 km/h
+     ETA = (50-7) / (50/3.6) * 1000 = 43 / 13.89 * 1000 ≈ 3096ms
+============================================================ */
+static uint32_t _calcular_eta_ms(float speed_kmh)
 {
-    if (kmh < 1.0f) kmh = 1.0f;
-    float d = (float)(POSTE_DIST_M - RADAR_DETECT_M);
-    return (uint32_t)((d / (kmh / 3.6f)) * 1000.0f);
+    if (speed_kmh < 1.0f) speed_kmh = 1.0f;  /* Evita divisão por zero */
+    float dist_m   = (float)(POSTE_DIST_M - RADAR_DETECT_M);
+    float speed_ms = speed_kmh / 3.6f;
+    return (uint32_t)((dist_m / speed_ms) * 1000.0f);
 }
 
-/* ── comm_send_tc_inc ─────────────────────────────────────── */
+/* ============================================================
+   comm_send_tc_inc — envia TC_INC ao vizinho direito
+============================================================ */
 void comm_send_tc_inc(float speed, int16_t x_mm)
 {
-    const char *ip = _ip_dir();
-    if (!ip) { ESP_LOGD(TAG, "TC_INC: sem viz.dir"); return; }
+    const char *ip = _ip_vizinho_direito();
+    if (!ip) {
+        ESP_LOGD(TAG, "TC_INC: sem vizinho direito disponível");
+        return;
+    }
     udp_manager_send_tc_inc(ip, speed, x_mm);
-    ESP_LOGI(TAG, "TC_INC → %s | %.0f km/h | x=%dmm", ip, speed, (int)x_mm);
+    ESP_LOGD(TAG, "TC_INC → %s | %.0f km/h | x=%dmm", ip, speed, (int)x_mm);
 }
 
-/* ── comm_send_spd ────────────────────────────────────────── */
+/* ============================================================
+   comm_send_spd — calcula ETA e envia SPD ao vizinho direito
+   CORRIGIDO v2.1: PRIu32 → %lu + (unsigned long)
+============================================================ */
 void comm_send_spd(float speed, int16_t x_mm)
 {
-    const char *ip = _ip_dir();
-    if (!ip) { ESP_LOGD(TAG, "SPD: sem viz.dir"); return; }
-    uint32_t eta = _eta_ms(speed);
-    udp_manager_send_spd(ip, speed, eta, POSTE_DIST_M, x_mm);
-    ESP_LOGI(TAG, "SPD → %s | %.0f km/h | ETA=%lums", ip, speed, (unsigned long)eta);
+    const char *ip = _ip_vizinho_direito();
+    if (!ip) {
+        ESP_LOGD(TAG, "SPD: sem vizinho direito disponível");
+        return;
+    }
+    uint32_t eta_ms = _calcular_eta_ms(speed);
+    udp_manager_send_spd(ip, speed, eta_ms, POSTE_DIST_M, x_mm);
+    ESP_LOGD(TAG, "SPD → %s | %.0f km/h | ETA=%lums | x=%dmm",
+             ip, speed, (unsigned long)eta_ms, (int)x_mm);
 }
 
-/* ── comm_notify_prev_passed ──────────────────────────────── */
+/* ============================================================
+   comm_notify_prev_passed — notifica vizinho esquerdo (T--)
+   Usa velocidade negativa no TC_INC como sinal de "passed".
+============================================================ */
 void comm_notify_prev_passed(float speed)
 {
-    const char *ip = _ip_esq();
+    const char *ip = _ip_vizinho_esquerdo();
     if (!ip) return;
     udp_manager_send_tc_inc(ip, -speed, 0);
-    ESP_LOGI(TAG, "PASSED → %s", ip);
+    ESP_LOGD(TAG, "PASSED → %s (T-- no poste esquerdo)", ip);
 }
 
-/* ── comm_send_master_claim ───────────────────────────────── */
+/* ============================================================
+   comm_send_master_claim — propaga liderança ao vizinho direito
+============================================================ */
 void comm_send_master_claim(void)
 {
-    const char *ip = _ip_dir();
+    const char *ip = _ip_vizinho_direito();
     if (!ip) return;
     udp_manager_send_master_claim(ip);
     ESP_LOGI(TAG, "MASTER_CLAIM → %s", ip);
 }
 
-/* ── comm_notify_radar_status ─────────────────────────────
-   Envia estado do radar a AMBOS os vizinhos usando a função
-   udp_manager_send_status() já existente no protocolo v4.1.
-
-   Mapeamento de estados (reutiliza neighbor_status_t):
-     radar_ok = false → STATUS:<id>:SAFE  (NEIGHBOR_SAFE)
-     radar_ok = true  → STATUS:<id>:OK    (NEIGHBOR_OK)
-
-   O receptor em _processar_mensagem() já trata STATUS e chama
-   on_radar_fail_received() ou on_radar_ok_received() conforme
-   o estado recebido e o IP de origem (esq ou dir).
-
-   NOTA: udp_manager_send_status envia "STATUS:<id>:<estado>"
-   que o parser já reconhece. Não é necessária nova mensagem.
-──────────────────────────────────────────────────────────── */
-void comm_notify_radar_status(bool radar_ok)
+bool comm_left_known(void)
 {
-    const char       *ip_esq = _ip_esq();
-    const char       *ip_dir = _ip_dir();
-    neighbor_status_t estado = radar_ok ? NEIGHBOR_OK : NEIGHBOR_SAFE;
-
-    if (ip_esq) {
-        udp_manager_send_status(ip_esq, estado);
-        ESP_LOGI(TAG, "RADAR_%s → viz.esq %s",
-                 radar_ok ? "OK" : "FAIL", ip_esq);
-    }
-    if (ip_dir) {
-        udp_manager_send_status(ip_dir, estado);
-        ESP_LOGI(TAG, "RADAR_%s → viz.dir %s",
-                 radar_ok ? "OK" : "FAIL", ip_dir);
-    }
-    if (!ip_esq && !ip_dir)
-        ESP_LOGD(TAG, "RADAR_%s: sem vizinhos para notificar",
-                 radar_ok ? "OK" : "FAIL");
+    if (POST_POSITION == 0) return false;
+    neighbor_t *v = udp_manager_get_neighbor_by_pos(POST_POSITION - 1);
+    return (v != NULL && v->active);
 }
