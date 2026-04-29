@@ -20,6 +20,7 @@
 #include "dali_manager.h"
 #include "system_config.h"
 #include "esp_log.h"
+#include "system_config.h"
 
 static const char *TAG = "FSM_TMR";
 
@@ -116,6 +117,39 @@ static void _passo12_master_heartbeat(uint64_t agora, bool is_master)
     if ((agora - g_fsm_master_claim_ms) >= MASTER_CLAIM_HB_MS) {
         g_fsm_master_claim_ms = agora;
         comm_send_master_claim();
+    }
+}
+
+
+/* ============================================================
+   fsm_timer_process_timeouts
+   ────────────────────────────────────────────────────────────
+   @brief Verifica expiração de tempos de tráfego e iluminação.
+   @param agora_ms Timestamp actual em milissegundos.
+============================================================ */
+void fsm_timer_process_timeouts(uint64_t agora_ms) 
+{
+    // 1. SEGURANÇA DO TRÁFEGO REMOTO (Tc)
+    // Se um poste vizinho avisou que vinha um carro, mas ele nunca 
+    // apareceu no nosso radar, limpamos o contador após o timeout.
+    if (g_fsm_Tc > 0) {
+        if (agora_ms > g_fsm_tc_timeout_ms) {
+            ESP_LOGW("FSM_TMR", "Timeout Tc: Veículo esperado não atingiu este poste.");
+            g_fsm_Tc = 0;
+            
+            // Se não houver mais ninguém, preparamos o desligamento
+            if (g_fsm_T == 0) fsm_agendar_apagar();
+        }
+    }
+
+    // 2. SEGURANÇA DA ILUMINAÇÃO (LIGHT_ON)
+    // Se a luz está ligada mas os contadores estão a zero (ninguém no radar
+    // e ninguém a caminho), forçamos o fade down após o tempo definido.
+    if (g_fsm_state == STATE_LIGHT_ON && g_fsm_T == 0 && g_fsm_Tc == 0) {
+        if ((agora_ms - g_fsm_last_detect_ms) > LIGHT_ON_TIMEOUT_MS) {
+            ESP_LOGI("FSM_TMR", "Timeout Luz: Área deserta, a iniciar fade down.");
+            fsm_agendar_apagar();
+        }
     }
 }
 

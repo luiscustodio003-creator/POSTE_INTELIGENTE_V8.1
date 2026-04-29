@@ -59,13 +59,17 @@ void on_tc_inc_received(float speed, int16_t x_mm)
     }
 }
 
-void on_prev_passed_received(void)
-{
-    if (g_fsm_T > 0) g_fsm_T--;
-    g_fsm_acender_em_ms = 0;
+void on_prev_passed_received(float speed) {
+    if (g_fsm_T > 0) {
+        g_fsm_T--;
+    } else {
+        g_fsm_T = 0; // Proteção contra pacotes duplicados
+    }
     
-    ESP_LOGI(TAG, "[UDP] PASSED: T=%d Tc=%d", g_fsm_T, g_fsm_Tc);
-    fsm_agendar_apagar();
+    // Se tudo estiver limpo, agenda o desligamento
+    if (g_fsm_T == 0 && g_fsm_Tc == 0) {
+        fsm_agendar_apagar(); 
+    }
 }
 
 void on_spd_received(float speed, uint32_t eta_ms, int16_t x_mm)
@@ -114,6 +118,13 @@ void sm_on_right_neighbor_online(void)
    PONTO DE ENTRADA PRINCIPAL (Eventos do Tracking Manager)
 ============================================================ */
 
+/* ============================================================
+   sm_process_event
+   ────────────────────────────────────────────────────────────
+   @brief Ponto central de decisão da FSM para eventos de radar.
+   @note  Versão 4.2: Corrigida transição AUTONOMO -> IDLE e
+          proteção rigorosa de contadores T/Tc.
+============================================================ */
 void sm_process_event(sm_event_type_t type, uint16_t vehicle_id, 
                       float vel, uint32_t eta_ms, int16_t x_mm)
 {
@@ -121,18 +132,30 @@ void sm_process_event(sm_event_type_t type, uint16_t vehicle_id,
 
         case SM_EVT_VEHICLE_DETECTED:
             ESP_LOGI(TAG, "[REAL] DETECTED id=%u vel=%.1f km/h", vehicle_id, vel);
+            
+            // 1. RECUPERAÇÃO DE REDE: Se o poste estava isolado (AUTONOMO) mas
+            // detetou um veículo e sabe que tem vizinhos, tenta voltar ao IDLE.
+            if (g_fsm_state == STATE_AUTONOMO) {
+                if (g_fsm_right_online || comm_left_online()) {
+                    ESP_LOGI(TAG, "Rede detetada durante evento físico. Saindo de AUTONOMO.");
+                    g_fsm_state = STATE_IDLE;
+                }
+            }
+
+            // Incrementa tráfego local (Máximo 3 para evitar fantasmas)
             if (g_fsm_T < 3) g_fsm_T++;
             
             g_fsm_apagar_pend    = false;
             g_fsm_last_detect_ms = fsm_agora_ms();
             g_fsm_last_speed     = vel;
 
+            // Ativa iluminação se estiver em repouso
             if (g_fsm_state == STATE_IDLE || g_fsm_state == STATE_MASTER || g_fsm_state == STATE_AUTONOMO) {
-                g_fsm_era_autonomo = (g_fsm_state == STATE_AUTONOMO);
                 g_fsm_state = STATE_LIGHT_ON;
                 dali_fade_up(vel);
             }
 
+            // Notifica o próximo poste (se existir) que o carro vai chegar
             if (g_fsm_right_online) {
                 comm_send_tc_inc(vel, x_mm);
                 comm_send_spd(vel, x_mm);
@@ -140,40 +163,32 @@ void sm_process_event(sm_event_type_t type, uint16_t vehicle_id,
             break;
 
         case SM_EVT_VEHICLE_LOCAL:
-            // Log de entrada para diagnóstico
             ESP_LOGI(TAG, "[REAL] LOCAL id=%u T=%d Tc=%d", vehicle_id, g_fsm_T, g_fsm_Tc);
             
             g_fsm_acender_em_ms = 0;
             
-            // 1. TRAVA NO Tc: Decrementa apenas se houver veículos esperados.
-            // Isso evita que o contador fique negativo.
-            if (g_fsm_Tc > 0) {
-                g_fsm_Tc--;
-            } else {
-                g_fsm_Tc = 0; // Garantia extra
-            }
+            // 2. LÓGICA DE HANDOVER (Tc -> T):
+            // Se o carro chegou ao "centro" do radar, ele deixa de ser esperado (Tc)
+            // e passa a ser contado como local (T).
+            if (g_fsm_Tc > 0) g_fsm_Tc--;
+            else g_fsm_Tc = 0;
 
-            // 2. TRAVA NO T: Limita o número de veículos locais simultâneos.
-            // O valor 3 é ideal para evitar "fantasmas" de rede ou radar.
-            if (g_fsm_T < 3) {
-                g_fsm_T++;
-            }
+            if (g_fsm_T < 3) g_fsm_T++;
             
             g_fsm_last_speed     = vel;
             g_fsm_last_detect_ms = fsm_agora_ms();
             g_fsm_apagar_pend    = false;
 
-            // 3. GESTÃO DE ESTADO E ILUMINAÇÃO
+            // Garante luz ligada
             if (g_fsm_state != STATE_LIGHT_ON && g_fsm_state != STATE_OBSTACULO) {
                 g_fsm_state = STATE_LIGHT_ON;
                 dali_fade_up(vel);
             }
 
-            // 4. NOTIFICAÇÃO À REDE
-            // Informa o poste anterior (Poste 1) para decrementar o T dele
+            // Avisa o poste anterior que o carro já passou (limpa o T do vizinho)
             comm_notify_prev_passed(vel);
 
-            // Informa o poste seguinte (se houver) para incrementar o Tc
+            // Mantém o poste seguinte em alerta
             if (g_fsm_right_online) {
                 comm_send_tc_inc(vel, x_mm);
                 comm_send_spd(vel, x_mm);
@@ -183,24 +198,34 @@ void sm_process_event(sm_event_type_t type, uint16_t vehicle_id,
         case SM_EVT_VEHICLE_PASSED:
             ESP_LOGI(TAG, "[REAL] PASSED id=%u | T=%d", vehicle_id, g_fsm_T);
             g_fsm_acender_em_ms = 0;
-            if (g_fsm_T > 0) g_fsm_T--;
-
-            if (comm_left_online())
-                comm_notify_prev_passed(vel);
-
-            if (g_fsm_right_online)
-                comm_send_spd(vel, x_mm);
             
+            // Decrementa tráfego local
+            if (g_fsm_T > 0) g_fsm_T--;
+            else g_fsm_T = 0;
+
+            // Notifica vizinho esquerdo (limpeza de rasto UDP)
+            if (comm_left_online()) {
+                comm_notify_prev_passed(vel);
+            }
+
+            // Notifica vizinho direito (última atualização de velocidade)
+            if (g_fsm_right_online) {
+                comm_send_spd(vel, x_mm);
+            }
+            
+            // Tenta apagar a luz se não houver mais ninguém
             fsm_agendar_apagar();
             break;
 
         case SM_EVT_VEHICLE_OBSTACULO:
             g_fsm_obstaculo_last_ms = fsm_agora_ms();
             if (g_fsm_state != STATE_OBSTACULO) {
-                if (g_fsm_right_online) comm_notify_prev_passed(vel);
+                // Se detetar obstáculo, avisa o poste anterior para não esperar por um carro em movimento
+                comm_notify_prev_passed(vel);
+                
                 g_fsm_state = STATE_OBSTACULO;
                 dali_set_brightness(LIGHT_MAX);
-                ESP_LOGW(TAG, "[ALERTA] Obstáculo estático id=%u!", vehicle_id);
+                ESP_LOGW(TAG, "[ALERTA] Obstáculo estático no radar!");
             }
             break;
 

@@ -50,7 +50,7 @@
 /* ============================================================
    DISPLAY — RESOLUÇÃO VERTICAL
 ============================================================ */
-#define LCD_V_RES_CONFIG    320  /* 240 = ecrã 240×240 | 320 = ecrã 240×320 */
+#define LCD_V_RES_CONFIG      /* 240 = ecrã 240×240 | 320 = ecrã 240×320 */
 
 
 /* ============================================================
@@ -167,6 +167,7 @@
    AUTONOMO_DELAY_MS    → atraso antes de assumir modo AUTONOMO
 ============================================================ */
 #define TRAFIC_TIMEOUT_MS       5000
+#define LIGHT_ON_TIMEOUT_MS     5000
 #define DETECTION_TIMEOUT_MS    1000
 #define MARGEM_ACENDER_MS        500
 

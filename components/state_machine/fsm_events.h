@@ -60,7 +60,7 @@ void sm_process_event(sm_event_type_t type,
 void on_tc_inc_received(float speed, int16_t x_mm);
 
 /** Recebe PASSED do poste direito → T-- */
-void on_prev_passed_received(void);
+void on_prev_passed_received(float speed);
 
 /** Recebe SPD → actualiza ETA de pré-acendimento */
 void on_spd_received(float speed, uint32_t eta_ms, int16_t x_mm);

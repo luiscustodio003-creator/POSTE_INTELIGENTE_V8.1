@@ -31,17 +31,42 @@ static const char *TAG = "FSM_TSK";
 /**
  * @brief Helper para atualizar a visualização do radar no display.
  */
-static void _atualiza_radar_display(void) {
+/* ============================================================
+   _atualiza_radar_display
+   ────────────────────────────────────────────────────────────
+   @brief Filtra e envia alvos confirmados para o display.
+   @note  Impede que o Tc (aviso de rede) crie pontos fantasmas
+          no radar antes da detecção física local.
+============================================================ */
+static void _atualiza_radar_display(void) 
+{
     tracked_vehicle_t veiculos[TRK_MAX_VEHICLES];
     uint8_t count = 0;
+    
+    // 1. Obtém os veículos do motor de tracking (thread-safe)
     if (tracking_manager_get_vehicles(veiculos, &count)) {
-        radar_obj_t objs[RADAR_MAX_OBJ];
-        for (int i = 0; i < count && i < RADAR_MAX_OBJ; i++) {
-            objs[i].x_mm = veiculos[i].x_mm;
-            objs[i].y_mm = veiculos[i].y_mm;
-            objs[i].speed_kmh = veiculos[i].speed_kmh;
+        radar_obj_t alvos[RADAR_MAX_OBJ];
+        uint8_t count_filtrado = 0;
+
+        for (int i = 0; i < count && count_filtrado < RADAR_MAX_OBJ; i++) {
+            
+            /* * TRAVA DE SEGURANÇA VISUAL:
+             * Só desenha no radar se o sensor local tiver um alvo sólido.
+             * TRK_STATE_TENTATIVE: Alvo ainda instável.
+             * TRK_STATE_COASTING: Alvo perdido, a usar apenas estimativa.
+             */
+            if (veiculos[i].state == TRK_STATE_CONFIRMED || 
+                veiculos[i].state == TRK_STATE_APPROACHING) {
+                
+                alvos[count_filtrado].x_mm = veiculos[i].x_mm;
+                alvos[count_filtrado].y_mm = veiculos[i].y_mm;
+                alvos[count_filtrado].speed_kmh = veiculos[i].speed_kmh;
+                count_filtrado++;
+            }
         }
-        display_manager_set_radar(objs, count);
+
+        // 2. Envia apenas as detecções reais para o canvas do radar
+        display_manager_set_radar(alvos, count_filtrado);
     }
 }
 
