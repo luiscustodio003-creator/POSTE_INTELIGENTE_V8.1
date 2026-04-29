@@ -1,50 +1,55 @@
 /* ============================================================
-   RADAR MANAGER — TASK INTERNA
+   RADAR MANAGER — TASK DE LEITURA
    @file      radar_manager_task.c
-   @version   4.0  |  2026-04-17
+   @version   5.0  |  2026-04-29
    PROJECTO   : Poste Inteligente v8
    AUTORES    : Luis Custódio | Tiago Moreno
    PLATAFORMA : ESP32 (ESP-IDF v5.x)
 
    RESPONSABILIDADE:
    ─────────────────
-   Lê o HLK-LD2450 a 100ms, alimenta o tracking_manager com
-   cada frame, e notifica a fsm_task sobre a saúde do radar
-   via variável atómica (sem mutex).
+   Lê o sensor HLK-LD2450 via UART a cada 100ms,
+   alimenta o tracking_manager com o frame bruto,
+   e notifica a fsm_task sobre a saúde do radar via atomic_bool.
 
-   MUDANÇAS v1.0 → v4.0:
-   ─────────────────────────
-   - CORRIGIDO: radar_task estava no Core 1 em conflito com
-     fsm_task (também Core 1, Prio 6 > Prio 5).
-     AGORA: radar_task → Core 0, Prio 5.
-     fsm_task          → Core 1, Prio 6.
-     Cada task tem o seu core — sem preempção entre elas.
+   CICLO DE EXECUÇÃO:
+   ───────────────────
+     1. Lê frame UART → radar_read_data() (parse HLK-LD2450)
+     2. Alimenta tracking_manager_update() com o frame
+     3. Notifica fsm_task: tracking_manager_task_notify_frame(ok)
+     4. Heartbeat ao system_monitor
+     5. Aguarda 100ms
 
-   - ADICIONADO: tracking_manager_update(&dados) após cada frame.
-     O tracking_manager é o único consumidor do frame bruto.
-     A fsm_task deixou de chamar radar_read_data_cached().
+   SINCRONIZAÇÃO ENTRE TASKS:
+   ────────────────────────────
+     radar_task (Core 0, Prio 5):
+       radar_read_data()                   → actualiza cache interna (spinlock)
+       tracking_manager_update()           → exclusivo desta task
+       tracking_manager_task_notify_frame() → escreve atomic_bool
 
-   - ADICIONADO: tracking_manager_task_notify_frame(bool) para
-     comunicar saúde do radar à fsm_task via atomic_bool.
+     fsm_task (Core 1, Prio 6):
+       atomic_exchange(&s_radar_teve_frame) → lê e repõe a false
 
-   - MANTIDO: system_monitor_heartbeat(MOD_RADAR) a cada ciclo.
-   - MANTIDO: período de 100ms (alinhado com o HLK-LD2450 a 10Hz).
-   - REMOVIDO: #include <inttypes.h> desnecessário.
+   NOTA — tracking_manager_update() com count=0:
+   ───────────────────────────────────────────────
+     Chamar SEMPRE, mesmo quando ok=false ou count=0.
+     O tracking avança os lost_frames dos slots em COASTING,
+     garantindo que veículos que saíram são declarados EXITED
+     mesmo quando o sensor não retorna frame válido nesse ciclo.
 
-   SINCRONIZAÇÃO:
-   ──────────────
-   radar_task (Core 0, 100ms) → tracking_manager_update()
-                               → tracking_manager_task_notify_frame()
-                                        ↓ atomic_bool
-   fsm_task   (Core 1, 100ms) → state_machine_update(..., radar_frame)
+   NOTA — extern removido:
+   ────────────────────────
+     tracking_manager_task_notify_frame() era declarado com extern
+     directamente no .c (acoplamento silencioso). Em v5.0 é incluído
+     via tracking_manager.h — compilador valida a assinatura.
 
-   NOTA SOBRE PERÍODO:
-   ────────────────────
-   O HLK-LD2450 envia frames a ~10Hz (100ms).
-   A radar_task corre a 100ms — sincronizado com o sensor.
-   O tracking_manager processa cada frame individualmente,
-   pelo que o período de 100ms é adequado para o nearest-neighbour
-   e para os timers TRK_CONFIRM_FRAMES e TRK_LOST_FRAMES.
+   MUDANÇAS v4.0 → v5.0:
+   ──────────────────────
+     - REMOVIDO: bloco #if USE_RADAR / #else (modo simulado)
+     - REMOVIDO: extern void tracking_manager_task_notify_frame()
+     - ADICIONADO: #include "tracking_manager.h" (declaração correcta)
+     - SIMPLIFICADO: radar_task() sem ramificação condicional
+     - MANTIDO: heartbeat, período 100ms, Core 0 Prio 5
 ============================================================ */
 
 #include "radar_manager.h"
@@ -57,71 +62,46 @@
 
 static const char *TAG = "RADAR_TASK";
 
-/* ============================================================
-   Declaração da função de notificação atómica.
-   Definida em state_machine_task.c — exportada sem header
-   dedicado (será centralizada em pipeline_ipc.h na fase 3).
-============================================================ */
-extern void tracking_manager_task_notify_frame(bool teve_dados);
-
 
 /* ============================================================
    radar_task — Core 0, Prioridade 5, Stack 4096B
    ──────────────────────────────────────────────
-   Período: 100ms (alinhado com HLK-LD2450 a 10Hz).
-
-   CICLO:
-     1. Lê frame UART → atualiza cache interna (radar_manager)
-     2. Alimenta tracking_manager com frame bruto
-     3. Notifica fsm_task sobre saúde do radar (atomic_bool)
-     4. Heartbeat ao system_monitor
-     5. Aguarda 100ms
-
-   THREADING:
-     - radar_read_data() actualiza s_last_data com spinlock interno.
-     - tracking_manager_update() acesso exclusivo desta task.
-     - tracking_manager_task_notify_frame() escreve atomic_bool.
-     - Sem mutex necessário entre estes três passos.
+   Período: 100ms — alinhado com o HLK-LD2450 a ~10Hz.
 ============================================================ */
 static void radar_task(void *arg)
 {
-    ESP_LOGI(TAG, "radar_task | Core %d | Prio 5 | 100ms",
+    ESP_LOGI(TAG, "radar_task | Core %d | Prio 5 | 100ms | radar real",
              xPortGetCoreID());
 
     while (1) {
 
-#if USE_RADAR
         /* ── 1. Lê frame UART e actualiza cache interna ──────── */
-        /* radar_read_data() faz parse do frame HLK-LD2450,
-           aplica _hlk_decode_signed(), calcula distância real,
-           detecta obstáculos estáticos e guarda em s_last_data
-           protegida por spinlock (taskENTER/EXIT_CRITICAL).     */
+        /* radar_read_data() faz parse do frame HLK-LD2450:
+             - Descodifica X, Y, velocidade com _hlk_decode_signed()
+             - Formato: bit 15 = sinal, bits 0-14 = magnitude
+             - X positivo = direita do sensor, negativo = esquerda
+             - Y sempre positivo (distância frontal)
+             - Velocidade: bit15=1 → a aproximar-se (negativo)
+           Guarda em s_last_data protegida por spinlock interno. */
         radar_data_t dados = {0};
         bool ok = radar_read_data(&dados, NULL);
 
-        /* ── 2. Alimenta tracking_manager (v4.0) ─────────────── */
-        /* Chamar SEMPRE — mesmo com ok=false ou count=0.
-           O tracking avança lost_frames dos slots em COASTING,
-           garantindo que veículos que saíram são declarados EXITED
-           mesmo quando o radar não retorna frame válido.          */
+        /* ── 2. Alimenta o tracking_manager ──────────────────── */
+        /* Chamado SEMPRE — mesmo com ok=false ou count=0.
+           O tracking precisa de avançar os contadores de lost_frames
+           mesmo em ciclos sem detecções. */
         tracking_manager_update(&dados);
 
-        /* ── 3. Notifica fsm_task sobre saúde do radar ───────── */
-        /* true  = frame válido COM alvos → radar activo e com dados
-           false = frame inválido OU sem alvos → radar pode estar
-                   degradado (a FSM distingue com RADAR_FAIL_COUNT) */
+        /* ── 3. Notifica a fsm_task sobre saúde do radar ─────── */
+        /* true  = frame UART válido (com ou sem alvos)
+           false = frame inválido ou timeout UART
+           A FSM acumula falhas em RADAR_FAIL_COUNT para → SAFE_MODE */
         tracking_manager_task_notify_frame(ok);
 
-#else
-        /* Modo USE_RADAR=0: simulador corre na fsm_task (v4.0).
-           Notifica sempre como "ok" para a FSM não entrar em SAFE_MODE. */
-        tracking_manager_task_notify_frame(true);
-#endif
-
-        /* ── 4. Heartbeat ao monitor ──────────────────────────── */
+        /* ── 4. Heartbeat ao system_monitor ───────────────────── */
         system_monitor_heartbeat(MOD_RADAR);
 
-        /* ── 5. Aguarda próximo período ───────────────────────── */
+        /* ── 5. Aguarda próximo ciclo ──────────────────────────── */
         vTaskDelay(pdMS_TO_TICKS(100));
     }
 }
@@ -130,23 +110,24 @@ static void radar_task(void *arg)
 /* ============================================================
    radar_manager_task_start
    ─────────────────────────
-   CORRIGIDO v4.0: Core 0 (era Core 1 — conflito com fsm_task).
+   @brief Cria a radar_task no Core 0, Prio 5.
 
-   Ordem de arranque recomendada em app_main():
-     1. radar_manager_task_start()   ← Core 0
-     2. state_machine_task_start()   ← Core 1
-        (state_machine_task_start chama tracking_manager_init()
-         antes de criar a fsm_task — garante inicialização antes
-         do primeiro frame da radar_task chegar ao tracking)
+   Deve ser chamado APÓS state_machine_task_start() para garantir
+   que o tracking_manager está inicializado antes do primeiro frame.
 
-   NOTA: tracking_manager_init() é chamado em
-   state_machine_task_start() (state_machine_task.c v4.0).
-   NÃO chamar aqui para evitar dupla inicialização.
+   Pinagem no Core 0 evita preempção com a fsm_task (Core 1).
 ============================================================ */
 void radar_manager_task_start(void)
 {
-    xTaskCreatePinnedToCore(radar_task, "radar_task",
-                            4096, NULL, 5, NULL, 0); /* Core 0 ← CORRIGIDO */
+    xTaskCreatePinnedToCore(
+        radar_task,
+        "radar_task",
+        4096,
+        NULL,
+        5,
+        NULL,
+        0   /* Core 0 — PRO_CPU */
+    );
 
-    ESP_LOGI(TAG, "radar_task v4.0 | Core 0 | Prio 5 | Stack 4096");
+    ESP_LOGI(TAG, "radar_task v5.0 | Core 0 | Prio 5 | Stack 4096B");
 }

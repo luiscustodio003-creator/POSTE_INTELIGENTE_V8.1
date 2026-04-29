@@ -1,3 +1,16 @@
+# ============================================================
+# MÁQUINA DE ESTADOS — BUILD ESP-IDF
+# @file      CMakeLists.txt
+# @version   5.0  |  2026-04-29
+# PROJECTO   : Poste Inteligente v8
+# AUTORES    : Luis Custódio | Tiago Moreno
+#
+# MUDANÇAS v4 → v5:
+#   - REMOVIDO: fsm_sim.c  (simulador eliminado do projecto)
+#   - REMOVIDO: esp_random  (era usado apenas pelo simulador)
+#   - MANTIDO:  esp_system  (esp_timer_get_time via esp_timer)
+# ============================================================
+
 idf_component_register(
     SRCS
         "fsm_core.c"
