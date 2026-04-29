@@ -1,236 +1,122 @@
 /* ============================================================
    MÓDULO     : fsm_task
-   FICHEIRO   : fsm_task.c — Task principal da FSM
-   VERSÃO     : 1.0  |  2026-04-26
+   FICHEIRO   : fsm_task.c — Orquestração da Task FSM
+   VERSÃO     : 2.3 — CORRIGIDO (Handover & Nomenclatura)
    PROJECTO   : Poste Inteligente v8
    AUTORES    : Luis Custódio | Tiago Moreno
    PLATAFORMA : ESP32 (ESP-IDF v5.x)
 
    RESPONSABILIDADE:
    ─────────────────
-   Loop principal da FSM a 100ms (Core 1, Prio 6).
-   - Lê estado atómico do radar (escrito pela radar_task)
-   - Chama state_machine_update()
-   - Lê e processa eventos do tracking_manager
-   - Sincroniza o display com o estado actual
-   - Envia heartbeat ao system_monitor
-   - Suporta injecção de carro de teste via debugger
-
-   NÃO lê radar directamente — responsabilidade da radar_task.
-   NÃO chama tracking_manager_update() — responsabilidade da radar_task.
-
-   SINCRONIZAÇÃO:
-   ──────────────
-   radar_task (Core 0, 10ms) → atomic_bool s_radar_teve_frame
-   fsm_task   (Core 1, 100ms) → lê s_radar_teve_frame
-
-   DEPENDÊNCIAS:
-   ─────────────
-   fsm_core.h, fsm_events.h, fsm_sim.h
-   tracking_manager.h, display_manager.h
-   comm_manager.h, radar_manager.h, dali_manager.h
-   system_monitor.h, system_config.h
+   - Consome eventos do tracking_manager e injeta-os na FSM.
+   - Sincroniza o estado da FSM com o display.
+   - Ponto de entrada para a criação da task.
+   - Resolve o erro de compilação usando 'event_approach_pending'.
 ============================================================ */
 
 #include "fsm_core.h"
 #include "fsm_events.h"
-#include "fsm_sim.h"
-#include "state_machine.h"
 #include "tracking_manager.h"
-#include "system_monitor.h"
+#include "display_manager.h"
 #include "comm_manager.h"
 #include "radar_manager.h"
 #include "dali_manager.h"
-#include "display_manager.h"
-#include "system_config.h"
+#include "system_monitor.h"
+#include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "esp_log.h"
-#include <stdatomic.h>
-#include <string.h>
 
-static const char *TAG = "FSM_TASK";
+static const char *TAG = "FSM_TSK";
 
-/* ============================================================
-   VARIÁVEL ATÓMICA — saúde do radar
-   Escrita pela radar_task a cada frame válido.
-   Lida pela fsm_task a cada ciclo de 100ms.
-============================================================ */
-static _Atomic bool s_radar_teve_frame = false;
-
-/* ============================================================
-   VARIÁVEIS DE TESTE VIA DEBUGGER (JTAG/GDB)
-   Alterar em tempo real:
-     (gdb) set g_test_car = true
-     (gdb) set g_test_car_speed = 80.0
-============================================================ */
-volatile bool  g_test_car       = false;
-volatile float g_test_car_speed = 50.0f;
-
-
-/* ============================================================
-   tracking_manager_task_notify_frame
-   Chamada pela radar_task após cada frame válido do radar.
-   Regista que o radar está activo para a fsm_task.
-   Deve ser chamada EM TODOS OS FRAMES — mesmo sem alvos —
-   para distinguir "radar sem alvos" de "radar morto".
-============================================================ */
-void tracking_manager_task_notify_frame(bool teve_dados)
-{
-    atomic_store(&s_radar_teve_frame, teve_dados);
+/**
+ * @brief Helper para atualizar a visualização do radar no display.
+ */
+static void _atualiza_radar_display(void) {
+    tracked_vehicle_t veiculos[TRK_MAX_VEHICLES];
+    uint8_t count = 0;
+    if (tracking_manager_get_vehicles(veiculos, &count)) {
+        radar_obj_t objs[RADAR_MAX_OBJ];
+        for (int i = 0; i < count && i < RADAR_MAX_OBJ; i++) {
+            objs[i].x_mm = veiculos[i].x_mm;
+            objs[i].y_mm = veiculos[i].y_mm;
+            objs[i].speed_kmh = veiculos[i].speed_kmh;
+        }
+        display_manager_set_radar(objs, count);
+    }
 }
-
 
 /* ============================================================
    _atualiza_radar_display
-   Lê dados de posição do tracking_manager e envia ao display.
+   ────────────────────────────────────────────────────────────
+   @brief Filtra e envia alvos confirmados para o display.
+   @note  Impede que o Tc (aviso de rede) crie pontos fantasmas
+          no radar antes da detecção física local.
 ============================================================ */
-static void _atualiza_radar_display(void)
-{
-#if USE_RADAR == 0
-    float x = 0.0f, y = 0.0f;
-    if (fsm_sim_get_objeto(&x, &y)) {
-        radar_obj_t obj = {0};
-        obj.x_mm      = (int)x;
-        obj.y_mm      = (int)y;
-        obj.speed_kmh = state_machine_get_last_speed();
-        display_manager_set_radar(&obj, 1);
-    } else {
-        display_manager_set_radar(NULL, 0);
-    }
-
-#else
-    tracked_vehicle_t veiculos[TRK_MAX_VEHICLES];
-    uint8_t count = 0;
-
-    if (tracking_manager_get_vehicles(veiculos, &count) && count > 0) {
-        radar_obj_t objs[TRK_MAX_VEHICLES];
-        uint8_t n_objs = 0;
-        bool em_obstaculo = sm_is_obstaculo();
-
-        for (uint8_t i = 0; i < count && i < TRK_MAX_VEHICLES; i++) {
-            tracked_vehicle_t *v = &veiculos[i];
-            if (v->state == TRK_STATE_TENTATIVE) continue;
-
-            if (em_obstaculo) {
-                /* Obstáculo — posição fixa, speed=0 impede interpolação */
-                if (v->state == TRK_STATE_CONFIRMED ||
-                    v->state == TRK_STATE_APPROACHING) {
-                    objs[n_objs].x_mm      = (int)v->x_mm;
-                    objs[n_objs].y_mm      = (int)v->y_mm;
-                    objs[n_objs].speed_kmh = 0.0f;
-                    n_objs++;
-                }
-            } else {
-                /* Modo normal — veículos em movimento */
-                if (v->state == TRK_STATE_CONFIRMED ||
-                    v->state == TRK_STATE_APPROACHING) {
-                    objs[n_objs].x_mm      = (int)v->x_mm;
-                    objs[n_objs].y_mm      = (int)v->y_mm;
-                    objs[n_objs].speed_kmh = v->speed_kmh;
-                    n_objs++;
-                }
-            }
-        }
-        display_manager_set_radar(n_objs > 0 ? objs : NULL, n_objs);
-    } else {
-        display_manager_set_radar(NULL, 0);
-    }
-#endif
-}
 
 
-/* ============================================================
-   fsm_task — Core 1, Prioridade 6, Stack 6144B
-============================================================ */
-static void fsm_task(void *arg)
-{
-    ESP_LOGI(TAG, "fsm_task | Core %d | Prio 6 | aguarda 6s (radar)",
-             xPortGetCoreID());
 
-    /* Aguarda estabilização do HLK-LD2450 (6s em blocos de 200ms)
-       com heartbeat para evitar falsos warnings no system_monitor. */
-    for (int i = 0; i < 30; i++) {
-        system_monitor_heartbeat(MOD_FSM);
-        vTaskDelay(pdMS_TO_TICKS(200));
-    }
-
-    radar_flush_rx();
-    ESP_LOGI(TAG, "fsm_task v1.0 activa — pipeline event-driven");
+void fsm_task(void *pvParameters) {
+    ESP_LOGI(TAG, "Task FSM iniciada no Core %d", xPortGetCoreID());
 
     while (1) {
+        /* CORREÇÃO: comm_status_ok() verifica se o Wi-Fi está ligado.
+           Isto permite que o último poste funcione mesmo sem vizinho à direita. */
+        bool comm_ok = comm_status_ok(); 
+        bool is_master = comm_is_master();
+        
+        // Verifica se o radar está a enviar dados
+        bool radar_teve_frame = tracking_manager_get_radar_status();
 
-        /* ── 1. Injecção de carro de teste via debugger ──────── */
-        if (g_test_car) {
-            g_test_car = false;
-            sm_inject_test_car(g_test_car_speed);
-        }
+        // Ciclo principal da FSM (Trata timeouts e transições de estado)
+        state_machine_update(comm_ok, is_master, radar_teve_frame);
 
-        /* ── 2. Lê estado atómico do radar ───────────────────── */
-        bool radar_frame = atomic_exchange(&s_radar_teve_frame, false);
+        // Processamento de eventos vindos do Tracking
+        tracked_vehicle_t v_list[TRK_MAX_VEHICLES];
+        uint8_t v_count = 0;
+        
+        if (tracking_manager_get_vehicles(v_list, &v_count)) {
+            for (int i = 0; i < v_count; i++) {
+                tracked_vehicle_t *v = &v_list[i];
 
-        /* ── 3. Ciclo da FSM ──────────────────────────────────── */
-        state_machine_update(
-            comm_status_ok(),
-            comm_is_master(),
-            radar_frame
-        );
-
-        /* ── 3.1 Lê e processa eventos do tracking_manager ───── */
-        tracked_vehicle_t veiculos[TRK_MAX_VEHICLES];
-        uint8_t count = 0;
-        if (tracking_manager_get_vehicles(veiculos, &count)) {
-            for (uint8_t i = 0; i < count; i++) {
-                tracked_vehicle_t *v = &veiculos[i];
-
+                // 1. Deteção Inicial (Ligar Luz)
                 if (v->event_detected_pending)
-                    sm_process_event(SM_EVT_VEHICLE_DETECTED,
-                        v->id, v->speed_kmh, v->eta_ms, (int16_t)v->x_mm);
+                    sm_process_event(SM_EVT_VEHICLE_DETECTED, v->id, v->speed_kmh, v->eta_ms, v->x_mm);
 
+                // 2. MOMENTO LOCAL / HANDOVER
+                // Usamos 'event_approach_pending' que é o trigger real do seu radar
                 if (v->event_approach_pending)
-                    sm_process_event(SM_EVT_VEHICLE_APPROACHING,
-                        v->id, v->speed_kmh, v->eta_ms, (int16_t)v->x_mm);
+                    sm_process_event(SM_EVT_VEHICLE_LOCAL, v->id, v->speed_kmh, v->eta_ms, v->x_mm);
 
+                // 3. Saída do Radar
                 if (v->event_passed_pending)
-                    sm_process_event(SM_EVT_VEHICLE_PASSED,
-                        v->id, v->speed_kmh, 0, (int16_t)v->x_mm);
+                    sm_process_event(SM_EVT_VEHICLE_PASSED, v->id, v->speed_kmh, 0, v->x_mm);
 
+                // 4. Obstáculo Estático
                 if (v->event_obstaculo_pending)
-                    sm_process_event(SM_EVT_VEHICLE_OBSTACULO,
-                        v->id, v->speed_kmh, 0, (int16_t)v->x_mm);
+                    sm_process_event(SM_EVT_VEHICLE_OBSTACULO, v->id, v->speed_kmh, 0, v->x_mm);
 
-                /* Limpa todas as flags só depois de processar todos */
                 tracking_manager_clear_events(v->id);
             }
         }
 
-        /* ── 4. Sincroniza display ────────────────────────────── */
+        // Sincronização com o Display e Hardware
         display_manager_set_status(state_machine_get_state_name());
-        display_manager_set_traffic(state_machine_get_T(),
-                                    state_machine_get_Tc());
+        display_manager_set_traffic(state_machine_get_T(), state_machine_get_Tc());
         display_manager_set_speed((int)state_machine_get_last_speed());
-        display_manager_set_hardware(radar_get_status_str(),
-                                     radar_is_connected(),
-                                     (uint8_t)dali_get_brightness());
+        display_manager_set_hardware(radar_get_status_str(), radar_is_connected(), (uint8_t)dali_get_brightness());
         _atualiza_radar_display();
 
-        /* ── 5. Heartbeat ao monitor ──────────────────────────── */
         system_monitor_heartbeat(MOD_FSM);
-
         vTaskDelay(pdMS_TO_TICKS(100));
     }
 }
 
-
-/* ============================================================
-   state_machine_task_start — Core 1, Prio 6
-============================================================ */
-void state_machine_task_start(void)
-{
+/**
+ * @brief Inicializa e lança a Task da FSM
+ */
+void state_machine_task_start(void) {
     tracking_manager_init();
-
-    xTaskCreatePinnedToCore(fsm_task, "fsm_task",
-                            6144, NULL, 6, NULL, 1);
-
-    ESP_LOGI(TAG, "fsm_task v1.0 criada | Core 1 | Prio 6 | Stack 6144");
+    xTaskCreatePinnedToCore(fsm_task, "fsm_task", 4096, NULL, 6, NULL, 1);
+    ESP_LOGI(TAG, "Task FSM lançada com sucesso.");
 }
+

@@ -4,7 +4,6 @@ idf_component_register(
         "fsm_events.c"
         "fsm_network.c"
         "fsm_timer.c"
-        "fsm_sim.c"
         "fsm_task.c"
     INCLUDE_DIRS "."
     REQUIRES

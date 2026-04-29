@@ -1,30 +1,21 @@
 /* ============================================================
    MÓDULO     : fsm_core
-   FICHEIRO   : fsm_core.c — Núcleo da FSM
-   VERSÃO     : 1.0  |  2026-04-26
+   FICHEIRO   : fsm_core.c — Núcleo da FSM (Versão Produção)
+   VERSÃO     : 2.0  |  2026-04-29
    PROJECTO   : Poste Inteligente v8
    AUTORES    : Luis Custódio | Tiago Moreno
    PLATAFORMA : ESP32 (ESP-IDF v5.x)
 
    RESPONSABILIDADE:
    ─────────────────
-   - Declaração e inicialização de todas as variáveis de estado
-   - Utilitários internos partilhados (agora_ms, agendar_apagar)
-   - Monitorização da saúde do radar com debounce
-   - Getters públicos do estado da FSM
-   - Ponto de entrada state_machine_update() que delega
-     nos sub-módulos fsm_timer, fsm_network
-
-   DEPENDÊNCIAS:
-   ─────────────
-   fsm_core.h, fsm_timer.h, fsm_network.h
-   comm_manager.h, dali_manager.h, system_config.h
+   - Declaração e inicialização de todas as variáveis de estado.
+   - Monitorização da saúde do radar real com debounce.
+   - Ponto de entrada state_machine_update() (Sem Simulação).
 ============================================================ */
 
 #include "fsm_core.h"
 #include "fsm_timer.h"
 #include "fsm_network.h"
-#include "fsm_sim.h"
 #include "comm_manager.h"
 #include "dali_manager.h"
 #include "system_config.h"
@@ -33,11 +24,10 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 
-static const char *TAG = "FSM";
+static const char *TAG = "FSM_CORE";
 
 /* ============================================================
-   VARIÁVEIS DE ESTADO — definições
-   Declaradas extern em fsm_core.h para acesso pelos sub-módulos.
+   VARIÁVEIS DE ESTADO — Mantidas conforme original
 ============================================================ */
 system_state_t g_fsm_state          = STATE_IDLE;
 int            g_fsm_T              = 0;
@@ -59,7 +49,6 @@ uint64_t g_fsm_master_claim_ms   = 0;
 uint64_t g_fsm_sem_vizinho_ms    = 0;
 uint64_t g_fsm_obstaculo_last_ms = 0;
 
-
 /* ============================================================
    UTILITÁRIOS INTERNOS
 ============================================================ */
@@ -75,9 +64,6 @@ void fsm_agendar_apagar(void)
     g_fsm_last_detect_ms = fsm_agora_ms();
 }
 
-/* Monitoriza saúde do radar com debounce bidirecional.
-   Exige RADAR_FAIL_COUNT ciclos para declarar falha e
-   RADAR_OK_COUNT frames para declarar recuperação. */
 void fsm_verificar_radar(bool teve_frame, bool comm_ok)
 {
     if (teve_frame) {
@@ -85,7 +71,7 @@ void fsm_verificar_radar(bool teve_frame, bool comm_ok)
         g_fsm_radar_ok_cnt++;
         if (!g_fsm_radar_ok && g_fsm_radar_ok_cnt >= RADAR_OK_COUNT) {
             g_fsm_radar_ok = true;
-            ESP_LOGI(TAG, "Radar recuperado após %d frames", RADAR_OK_COUNT);
+            ESP_LOGI(TAG, "Radar Real recuperado.");
             if (g_fsm_state == STATE_SAFE_MODE)
                 g_fsm_state = STATE_IDLE;
         }
@@ -94,15 +80,14 @@ void fsm_verificar_radar(bool teve_frame, bool comm_ok)
         g_fsm_radar_fail_cnt++;
         if (g_fsm_radar_ok && g_fsm_radar_fail_cnt >= RADAR_FAIL_COUNT) {
             g_fsm_radar_ok = false;
-            ESP_LOGW(TAG, "Radar FAIL após %d ciclos", RADAR_FAIL_COUNT);
+            ESP_LOGE(TAG, "Falha no Radar Físico! Sem frames UART.");
         }
     }
     (void)comm_ok;
 }
 
-
 /* ============================================================
-   state_machine_init — inicialização de todas as variáveis
+   state_machine_init
 ============================================================ */
 void state_machine_init(void)
 {
@@ -125,25 +110,17 @@ void state_machine_init(void)
     g_fsm_tc_timeout_ms     = 0;
     g_fsm_last_detect_ms    = 0;
 
-#if USE_RADAR == 0
-    fsm_sim_init();
-#endif
+    // Parte simulada fsm_sim_init() REMOVIDA
 
-    ESP_LOGI(TAG, "FSM v1.0 inicializada — estado IDLE");
+    ESP_LOGI(TAG, "FSM Produção inicializada — Modo Hardware Real");
 }
 
-
 /* ============================================================
-   state_machine_update — ciclo de manutenção a 100ms
-   Delega nos sub-módulos por responsabilidade.
+   state_machine_update — Ciclo a 100ms
 ============================================================ */
-void state_machine_update(bool comm_ok, bool is_master,
-                          bool radar_teve_frame)
+void state_machine_update(bool comm_ok, bool is_master, bool radar_teve_frame)
 {
-#if USE_RADAR == 0
-    fsm_sim_update();
-    radar_teve_frame = true;
-#endif
+    // Lógica do simulador fsm_sim_update() REMOVIDA
 
     /* Passo 2: saúde do radar */
     fsm_verificar_radar(radar_teve_frame, comm_ok);
@@ -161,18 +138,12 @@ void state_machine_update(bool comm_ok, bool is_master,
     fsm_network_estados_degradados(comm_ok, is_master);
 }
 
-
 /* ============================================================
    GETTERS PÚBLICOS
 ============================================================ */
-system_state_t state_machine_get_state(void)
-{
-    return g_fsm_state;
-}
-
+system_state_t state_machine_get_state(void) { return g_fsm_state; }
 int state_machine_get_T(void)   { return g_fsm_T; }
 int state_machine_get_Tc(void)  { return g_fsm_Tc; }
-
 float state_machine_get_last_speed(void) { return g_fsm_last_speed; }
 bool  state_machine_radar_ok(void)       { return g_fsm_radar_ok; }
 bool  sm_is_obstaculo(void) { return g_fsm_state == STATE_OBSTACULO; }

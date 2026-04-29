@@ -137,5 +137,19 @@ void tracking_manager_reset(void);
 /* Nome legível de um estado */
 const char *tracking_state_name(trk_state_t state);
 
+/* No ficheiro components/tracking_manager/include/tracking_manager.h */
+
+/**
+ * @brief Notifica o gestor de tracking sobre a receção de um frame de radar.
+ * @param ok True se o frame for válido.
+ */
+void tracking_manager_task_notify_frame(bool ok);
+
+/**
+ * @brief Obtém o estado de saúde/conectividade do radar.
+ * @return True se o radar estiver a comunicar ativamente.
+ */
+bool tracking_manager_get_radar_status(void);
+
 
 #endif /* TRACKING_MANAGER_H */

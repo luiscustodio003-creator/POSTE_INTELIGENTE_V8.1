@@ -223,3 +223,14 @@ bool comm_left_known(void)
     neighbor_t *v = udp_manager_get_neighbor_by_pos(POST_POSITION - 1);
     return (v != NULL && v->active);
 }
+
+/* ============================================================
+   comm_right_known — true se vizinho direito foi descoberto
+============================================================ */
+bool comm_right_known(void)
+{
+    // O último poste não tem vizinho à direita por definição.
+    // No entanto, aqui verificamos se o udp_manager já "ouviu" falar dele.
+    neighbor_t *v = udp_manager_get_neighbor_by_pos(POST_POSITION + 1);
+    return (v != NULL && v->active);
+}

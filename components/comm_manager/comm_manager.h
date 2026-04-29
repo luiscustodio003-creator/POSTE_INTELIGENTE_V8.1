@@ -79,5 +79,18 @@ void comm_send_master_claim(void);
 
 bool comm_left_known(void);
 
+/* No ficheiro components/comm_manager/include/comm_manager.h */
+
+/**
+ * @brief Verifica se existe um vizinho configurado (IP conhecido) à esquerda.
+ */
+bool comm_left_known(void);
+
+/**
+ * @brief Verifica se existe um vizinho configurado (IP conhecido) à direita.
+ * (ADICIONE ESTA LINHA)
+ */
+bool comm_right_known(void);
+
 #endif /* COMM_MANAGER_H */
 

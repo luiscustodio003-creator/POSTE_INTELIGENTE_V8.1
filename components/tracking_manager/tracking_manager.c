@@ -18,6 +18,20 @@
 #include <string.h>
 #include <math.h>
 
+#include <stdatomic.h>
+
+static atomic_bool s_radar_frame_ok = false;
+
+/* Função que o radar_manager_task chama e o Linker não encontrava */
+void tracking_manager_task_notify_frame(bool ok) {
+    atomic_store(&s_radar_frame_ok, ok);
+}
+
+/* Função para a FSM ler a saúde do radar */
+bool tracking_manager_get_radar_status(void) {
+    return atomic_load(&s_radar_frame_ok);
+}
+
 static const char *TAG = "TRK";
 
 /* ── Slot interno — estende tracked_vehicle_t com campos privados ── */
