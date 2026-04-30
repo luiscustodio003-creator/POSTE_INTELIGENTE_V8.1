@@ -1,7 +1,7 @@
 /* ============================================================
    MÓDULO     : fsm_timer
    FICHEIRO   : fsm_timer.c — Gestão de Timers e Timeouts
-   VERSÃO     : 1.1  |  2026-04-29
+   VERSÃO     : 1.2  |  2026-04-30
    PROJECTO   : Poste Inteligente v8
    AUTORES    : Luis Custódio | Tiago Moreno
    PLATAFORMA : ESP32 (ESP-IDF v5.x)
@@ -12,17 +12,31 @@
    - Gestão de pré-acendimento (ETA).
    - Recuperação automática de estados de erro (Obstáculo).
    - Heartbeat de rede para o papel de Master.
+
+   CORRECÇÕES v1.1 → v1.2:
+   ─────────────────────────
+   - REMOVIDO: dali_fade_up() em _passo6_processar_eta().
+     A mudança de estado para LIGHT_ON é detectada por
+     fsm_aplicar_luz() em fsm_task.c no ciclo seguinte.
+   - REMOVIDO: dali_fade_down() em _passo7_gestao_apagamento().
+     Idem — fsm_aplicar_luz() aplica o fade down ao detectar
+     a transição para IDLE / MASTER / AUTONOMO.
+   - REMOVIDO: #include "dali_manager.h" — já não necessário.
+   - REMOVIDO: fsm_timer_process_timeouts() — função duplicada
+     que repetia a lógica do _passo9_timeout_seguranca_tc().
+     A única função pública é fsm_timer_update().
+   - REMOVIDO: segundo #include "system_config.h" duplicado.
+   - MANTIDO: toda a lógica de timeouts e transições de estado.
 ============================================================ */
 
 #include "fsm_timer.h"
 #include "fsm_core.h"
 #include "comm_manager.h"
-#include "dali_manager.h"
 #include "system_config.h"
 #include "esp_log.h"
-#include "system_config.h"
 
 static const char *TAG = "FSM_TMR";
+
 
 /* ── Passo 5: Proteção contra T preso (Vizinho offline) ───── */
 static void _passo5_verificar_t_estagnado(uint64_t agora)
@@ -42,13 +56,13 @@ static void _passo6_processar_eta(uint64_t agora)
         g_fsm_acender_em_ms = 0;
 
         if (g_fsm_Tc > 0) {
-            dali_fade_up(g_fsm_last_speed);
-            
-            /* Transição de estado apenas se estiver em estados de espera */
-            if (g_fsm_state == STATE_IDLE || g_fsm_state == STATE_MASTER || g_fsm_state == STATE_AUTONOMO) {
+            /* Muda estado — fsm_aplicar_luz() aplica dali no ciclo seguinte */
+            if (g_fsm_state == STATE_IDLE   ||
+                g_fsm_state == STATE_MASTER ||
+                g_fsm_state == STATE_AUTONOMO) {
                 g_fsm_state = STATE_LIGHT_ON;
             }
-            ESP_LOGI(TAG, "ETA atingido: Luz ligada para veículo em aproximação.");
+            ESP_LOGI(TAG, "ETA atingido: estado → LIGHT_ON para veículo em aproximação.");
         }
     }
 }
@@ -57,7 +71,7 @@ static void _passo6_processar_eta(uint64_t agora)
 static void _passo7_gestao_apagamento(uint64_t agora, bool is_master)
 {
     if (!g_fsm_apagar_pend) return;
-    
+
     /* Só apaga se não houver tráfego local (T) nem remoto (Tc) */
     if (g_fsm_T != 0 || g_fsm_Tc != 0) return;
 
@@ -66,7 +80,7 @@ static void _passo7_gestao_apagamento(uint64_t agora, bool is_master)
         g_fsm_last_speed    = 0.0f;
         g_fsm_acender_em_ms = 0;
 
-        /* Define estado de destino */
+        /* Define estado de destino — fsm_aplicar_luz() aplica dali no ciclo seguinte */
         if (is_master) {
             g_fsm_state = STATE_MASTER;
         } else if (g_fsm_era_autonomo) {
@@ -76,8 +90,7 @@ static void _passo7_gestao_apagamento(uint64_t agora, bool is_master)
             g_fsm_state = STATE_IDLE;
         }
 
-        dali_fade_down();
-        ESP_LOGI(TAG, "Timeout de tráfego: Luz desligada -> %s", state_machine_get_state_name());
+        ESP_LOGI(TAG, "Timeout de tráfego: estado → %s", state_machine_get_state_name());
     }
 }
 
@@ -91,6 +104,8 @@ static void _passo7_gestao_apagamento(uint64_t agora, bool is_master)
 */
 static void _passo8_limpeza_obstaculo(uint64_t agora, bool is_master)
 {
+    (void)is_master;
+
     if (g_fsm_state != STATE_OBSTACULO || g_fsm_obstaculo_last_ms == 0) return;
 
     if ((agora - g_fsm_obstaculo_last_ms) < OBSTACULO_REMOVE_MS) return;
@@ -140,39 +155,10 @@ static void _passo12_master_heartbeat(uint64_t agora, bool is_master)
 
 
 /* ============================================================
-   fsm_timer_process_timeouts
-   ────────────────────────────────────────────────────────────
-   @brief Verifica expiração de tempos de tráfego e iluminação.
-   @param agora_ms Timestamp actual em milissegundos.
-============================================================ */
-void fsm_timer_process_timeouts(uint64_t agora_ms) 
-{
-    // 1. SEGURANÇA DO TRÁFEGO REMOTO (Tc)
-    // Se um poste vizinho avisou que vinha um carro, mas ele nunca 
-    // apareceu no nosso radar, limpamos o contador após o timeout.
-    if (g_fsm_Tc > 0) {
-        if (agora_ms > g_fsm_tc_timeout_ms) {
-            ESP_LOGW("FSM_TMR", "Timeout Tc: Veículo esperado não atingiu este poste.");
-            g_fsm_Tc = 0;
-            
-            // Se não houver mais ninguém, preparamos o desligamento
-            if (g_fsm_T == 0) fsm_agendar_apagar();
-        }
-    }
-
-    // 2. SEGURANÇA DA ILUMINAÇÃO (LIGHT_ON)
-    // Se a luz está ligada mas os contadores estão a zero (ninguém no radar
-    // e ninguém a caminho), forçamos o fade down após o tempo definido.
-    if (g_fsm_state == STATE_LIGHT_ON && g_fsm_T == 0 && g_fsm_Tc == 0) {
-        if ((agora_ms - g_fsm_last_detect_ms) > LIGHT_ON_TIMEOUT_MS) {
-            ESP_LOGI("FSM_TMR", "Timeout Luz: Área deserta, a iniciar fade down.");
-            fsm_agendar_apagar();
-        }
-    }
-}
-
-/* ============================================================
-   fsm_timer_update
+   fsm_timer_update — ponto de entrada único
+   ──────────────────────────────────────────
+   Executa todos os passos de timer do ciclo 100ms.
+   Chamada por state_machine_update() em fsm_core.c.
 ============================================================ */
 void fsm_timer_update(bool comm_ok, bool is_master)
 {

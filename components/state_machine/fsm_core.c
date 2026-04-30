@@ -17,7 +17,6 @@
 #include "fsm_timer.h"
 #include "fsm_network.h"
 #include "comm_manager.h"
-#include "dali_manager.h"
 #include "system_config.h"
 #include "esp_log.h"
 #include "esp_timer.h"
@@ -62,6 +61,7 @@ void fsm_agendar_apagar(void)
 {
     g_fsm_apagar_pend    = true;
     g_fsm_last_detect_ms = fsm_agora_ms();
+    g_fsm_acender_em_ms  = 0;
 }
 
 /* ============================================================

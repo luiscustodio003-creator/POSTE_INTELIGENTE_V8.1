@@ -1,7 +1,7 @@
 /* ============================================================
    MÁQUINA DE ESTADOS — PROCESSAMENTO DE EVENTOS
    @file      fsm_events.c
-   @version   3.0  |  2026-04-29
+   @version   3.1  |  2026-04-30
    PROJECTO   : Poste Inteligente v8
    AUTORES    : Luis Custódio | Tiago Moreno
    PLATAFORMA : ESP32 (ESP-IDF v5.x)
@@ -13,26 +13,25 @@
 
    REGRAS DO PROTOCOLO T/Tc (implementadas aqui):
    ────────────────────────────────────────────────
-   DETECTED  → guarda ETA, acende luz antecipada. SEM T++. SEM TC_INC.
-   LOCAL     → T++, Tc--, luz ON, PASSED→esq, TC_INC+SPD→dir.
+   DETECTED  → guarda ETA, muda estado. SEM T++. SEM TC_INC.
+   LOCAL     → T++, Tc--, muda estado, PASSED→esq, TC_INC+SPD→dir.
    PASSED    → T--, SPD→dir, apaga se T==0 e Tc==0.
-   OBSTACULO → STATE_OBSTACULO, luz 100%, PASSED→dir (cancela Tc).
+   OBSTACULO → STATE_OBSTACULO, PASSED→dir (cancela Tc).
 
-   CORRECÇÕES v2.0 → v3.0:
+   CORRECÇÕES v3.0 → v3.1:
    ─────────────────────────
-   - CORRIGIDO: DETECTED deixou de fazer T++ e de enviar TC_INC.
-     Consequência: T=1 máximo por veículo (era T=2 — bug).
-     O TC_INC é enviado UMA ÚNICA VEZ em EVT_LOCAL.
-   - CORRIGIDO: PASSED faz fsm_agendar_apagar() apenas quando
-     T==0 AND Tc==0 — evita apagamentos prematuros.
-   - MANTIDO: recuperação de AUTONOMO→IDLE em DETECTED quando
-     rede volta a estar disponível durante detecção física.
+   - REMOVIDO: todas as chamadas dali_* (dali_fade_up, dali_set_brightness).
+     Este módulo NÃO chama hardware directamente.
+     A aplicação de brilho é da exclusiva responsabilidade de
+     fsm_aplicar_luz() em fsm_task.c, chamada após cada ciclo de eventos.
+   - REMOVIDO: #include "dali_manager.h" — já não necessário.
+   - MANTIDO: toda a lógica de estado g_fsm_* — sem alterações.
+   - MANTIDO: protocolo T/Tc — sem alterações.
 ============================================================ */
 
 #include "fsm_events.h"
 #include "fsm_core.h"
 #include "comm_manager.h"
-#include "dali_manager.h"
 #include "system_config.h"
 #include "esp_log.h"
 
@@ -45,6 +44,9 @@ static const char *TAG = "FSM_EVT";
    Chamados pelo udp_manager no contexto da udp_task (Core 0).
    Acesso a g_fsm_T / g_fsm_Tc: escrita atómica em Xtensa LX6
    (32 bits alinhados) — sem mutex necessário para int simples.
+   NOTA: NÃO chamam dali_* — correm em Core 0, o dali corre
+   em Core 1. A transição de estado é detectada por
+   fsm_aplicar_luz() no próximo ciclo de 100ms da fsm_task.
 ============================================================ */
 
 /* ── on_tc_inc_received — veículo anunciado pelo poste esquerdo ── */
@@ -64,12 +66,11 @@ void on_tc_inc_received(float speed, int16_t x_mm)
 
     ESP_LOGI(TAG, "[UDP] TC_INC | vel=%.0f | T=%d Tc=%d", speed, g_fsm_T, g_fsm_Tc);
 
-    /* Acende antecipadamente se estava em repouso */
+    /* Muda estado — fsm_aplicar_luz() aplica dali no ciclo seguinte */
     if (g_fsm_state == STATE_IDLE   ||
         g_fsm_state == STATE_MASTER ||
         g_fsm_state == STATE_AUTONOMO) {
         g_fsm_state = STATE_LIGHT_ON;
-        dali_fade_up(speed);
     }
 }
 
@@ -138,6 +139,11 @@ void sm_on_right_neighbor_online(void)
    Chamado pela fsm_task para cada evento pendente.
    Cada veículo gera no máximo: DETECTED → LOCAL → PASSED.
    Nunca LOCAL sem DETECTED antes (tracking_manager garante ordem).
+
+   NOTA: nenhum case chama dali_* directamente.
+   Todos os cases apenas actualizam g_fsm_state e variáveis
+   de contagem. A aplicação de brilho é feita por
+   fsm_aplicar_luz() em fsm_task.c após este ciclo de eventos.
 ============================================================ */
 void sm_process_event(sm_event_type_t type, uint16_t vehicle_id,
                       float vel, uint32_t eta_ms, int16_t x_mm)
@@ -145,9 +151,10 @@ void sm_process_event(sm_event_type_t type, uint16_t vehicle_id,
     switch (type) {
 
         /* ── DETECTED — primeiro avistamento pelo radar ────────
-           Responsabilidade: preparar ETA e acender luz antecipada.
+           Responsabilidade: preparar ETA e mudar estado.
            NÃO faz T++ — o veículo ainda não está confirmado.
-           NÃO envia TC_INC — só EVT_LOCAL propaga na cadeia.    */
+           NÃO envia TC_INC — só EVT_LOCAL propaga na cadeia.
+           NÃO chama dali — fsm_aplicar_luz() trata no ciclo seguinte. */
         case SM_EVT_VEHICLE_DETECTED:
             ESP_LOGI(TAG, "[EVT] DETECTED id=%u vel=%.0f", vehicle_id, vel);
 
@@ -168,21 +175,21 @@ void sm_process_event(sm_event_type_t type, uint16_t vehicle_id,
             else
                 g_fsm_acender_em_ms = fsm_agora_ms();
 
-            /* Acende se estava em repouso */
+            /* Muda estado — fsm_aplicar_luz() aplica dali no ciclo seguinte */
             if (g_fsm_state == STATE_IDLE   ||
                 g_fsm_state == STATE_MASTER ||
                 g_fsm_state == STATE_AUTONOMO) {
                 g_fsm_state = STATE_LIGHT_ON;
-                dali_fade_up(vel);
             }
-            /* SEM T++ aqui. SEM TC_INC aqui. */
+            /* SEM T++ aqui. SEM TC_INC aqui. SEM dali aqui. */
             break;
 
 
         /* ── LOCAL — veículo confirmado fisicamente no radar ───
            Responsabilidade: handover T/Tc, propagar na cadeia.
            É aqui que T++ acontece — UMA VEZ por veículo.
-           TC_INC é enviado UMA VEZ — para o vizinho direito.   */
+           TC_INC é enviado UMA VEZ — para o vizinho direito.
+           NÃO chama dali — fsm_aplicar_luz() trata no ciclo seguinte. */
         case SM_EVT_VEHICLE_LOCAL:
             ESP_LOGI(TAG, "[EVT] LOCAL id=%u vel=%.0f T=%d Tc=%d",
                      vehicle_id, vel, g_fsm_T, g_fsm_Tc);
@@ -194,13 +201,12 @@ void sm_process_event(sm_event_type_t type, uint16_t vehicle_id,
 
             /* Handover: veículo deixa de ser "esperado" (Tc) e passa a "local" (T) */
             if (g_fsm_Tc > 0) g_fsm_Tc--;
-            if (g_fsm_T  < 3) g_fsm_T++;
+            if (g_fsm_T < MAX_RADAR_TARGETS) g_fsm_T++;
 
-            /* Garante luz acesa */
+            /* Muda estado — fsm_aplicar_luz() aplica dali no ciclo seguinte */
             if (g_fsm_state != STATE_LIGHT_ON &&
                 g_fsm_state != STATE_OBSTACULO) {
                 g_fsm_state = STATE_LIGHT_ON;
-                dali_fade_up(vel);
             }
 
             /* Confirma ao poste esquerdo que o veículo chegou → T-- no viz.esq. */
@@ -236,8 +242,8 @@ void sm_process_event(sm_event_type_t type, uint16_t vehicle_id,
 
 
         /* ── OBSTACULO — veículo parado na zona do radar ───────
-           Responsabilidade: luz 100%, posição fixa, cancelar Tc
-           no vizinho direito (veículo não vai avançar).          */
+           Responsabilidade: mudar estado, cancelar Tc no vizinho.
+           NÃO chama dali — fsm_aplicar_luz() trata no ciclo seguinte. */
         case SM_EVT_VEHICLE_OBSTACULO:
             ESP_LOGW(TAG, "[EVT] OBSTACULO id=%u vel=%.0f", vehicle_id, vel);
 
@@ -247,7 +253,6 @@ void sm_process_event(sm_event_type_t type, uint16_t vehicle_id,
                 /* Cancela Tc no vizinho direito — este veículo não vai chegar */
                 comm_notify_prev_passed(vel);
                 g_fsm_state = STATE_OBSTACULO;
-                dali_set_brightness(LIGHT_MAX);
             }
             break;
 

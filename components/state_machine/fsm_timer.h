@@ -18,7 +18,7 @@
 
    DEPENDÊNCIAS:
    ─────────────
-   fsm_core.h, comm_manager.h, dali_manager.h, system_config.h
+   fsm_core.h, comm_manager.h, system_config.h
 ============================================================ */
 
 #ifndef FSM_TIMER_H

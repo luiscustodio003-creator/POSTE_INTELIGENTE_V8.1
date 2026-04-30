@@ -1,7 +1,7 @@
 /* ============================================================
    MÁQUINA DE ESTADOS — TASK PRINCIPAL
    @file      fsm_task.c
-   @version   5.0  |  2026-04-29
+   @version   5.1  |  2026-04-30
    PROJECTO   : Poste Inteligente v8
    AUTORES    : Luis Custódio | Tiago Moreno
    PLATAFORMA : ESP32 (ESP-IDF v5.x)
@@ -15,6 +15,7 @@
      1. Lê estado atómico do radar (escrito pela radar_task)
      2. Chama state_machine_update() — timeouts e transições
      3. Consome eventos pendentes do tracking_manager
+     3.5 Aplica brilho DALI com base no novo estado
      4. Actualiza display com alvos confirmados pelo radar
      5. Envia heartbeat ao system_monitor
 
@@ -26,6 +27,14 @@
      (Core 0, Prio 5). A comunicação entre tasks é feita via
      atomic_bool (tracking_manager_task_notify_frame).
 
+   HARDWARE DALI — PONTO ÚNICO DE CONTROLO:
+   ──────────────────────────────────────────
+     fsm_aplicar_luz() é o ÚNICO sítio em todo o sistema que
+     chama dali_fade_up(), dali_fade_down(), dali_set_brightness()
+     e dali_safe_mode(). Todos os outros módulos (fsm_events,
+     fsm_timer, fsm_network) apenas mudam g_fsm_state — nunca
+     chamam dali directamente.
+
    SINCRONIZAÇÃO ENTRE TASKS:
    ────────────────────────────
      radar_task (Core 0, 100ms) → tracking_manager_update()
@@ -33,6 +42,7 @@
      fsm_task   (Core 1, 100ms) → lê atomic_bool → state_machine_update()
                                 → tracking_manager_get_vehicles()
                                 → sm_process_event() por evento
+                                → fsm_aplicar_luz()
 
    DISPLAY — DADOS REAIS APENAS:
    ──────────────────────────────
@@ -47,16 +57,14 @@
      do HLK-LD2450. O sensor demora até 5s a inicializar o UART.
      Após o delay, limpa o buffer UART antes de processar frames.
 
-   MUDANÇAS v4.0 → v5.0:
+   MUDANÇAS v5.0 → v5.1:
    ──────────────────────
-     - REMOVIDO: toda a lógica de simulação (#if USE_RADAR == 0)
-     - REMOVIDO: variáveis g_test_car / g_test_car_speed
-     - REMOVIDO: chamada a sim_get_objeto() em _atualiza_radar_display()
-     - REMOVIDO: #include "fsm_sim.h"
-     - SIMPLIFICADO: _atualiza_radar_display() sem ramificação condicional
-     - MANTIDO: atomic_bool s_radar_teve_frame e notify_frame()
-     - MANTIDO: delay de arranque de 6s com heartbeat
-     - MANTIDO: filtro TRK_STATE_CONFIRMED/APPROACHING no display
+     - ADICIONADO: fsm_aplicar_luz() — ponto único de controlo DALI.
+     - ADICIONADO: s_ultimo_estado — guarda de transição de estado.
+     - REMOVIDO: #include "radar_manager.h" duplicado.
+     - CORRIGIDO: ordem dos blocos — fsm_aplicar_luz() definida
+       antes de fsm_task() para evitar dependência da declaração
+       antecipada.
 ============================================================ */
 
 #include "fsm_core.h"
@@ -69,7 +77,6 @@
 #include "dali_manager.h"
 #include "system_monitor.h"
 #include "system_config.h"
-#include "radar_manager.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_log.h"
@@ -91,6 +98,7 @@ static const char *TAG = "FSM_TASK";
 ============================================================ */
 static _Atomic bool s_radar_teve_frame = false;
 
+
 /* ============================================================
    tracking_manager_task_notify_frame
    ────────────────────────────────────
@@ -98,9 +106,13 @@ static _Atomic bool s_radar_teve_frame = false;
 
    Deve ser chamada EM TODOS OS FRAMES — mesmo quando count=0 —
    para que a FSM distinga "radar activo sem alvos" de
-   "radar completamente silencioso/morto" (SAFE_MODE).*/
+   "radar completamente silencioso/morto" (SAFE_MODE).
+============================================================ */
+void tracking_manager_task_notify_frame(bool teve_frame)
+{
+    atomic_store(&s_radar_teve_frame, teve_frame);
+}
 
- 
 
 /* ============================================================
    _atualiza_radar_display
@@ -173,10 +185,10 @@ static void _atualiza_radar_display(void)
    Cada veículo pode ter até 4 flags de evento activas simultaneamente.
    A ordem de processamento respeita a prioridade lógica:
      1. DETECTED   — primeiro avistamento (sem luz ainda)
-     2. LOCAL      — veículo confirmado local (T++, luz ON, propaga)
-     3. APPROACHING — a aproximar-se (agenda pré-acendimento ETA)
+     2. LOCAL      — veículo confirmado local (T++, muda estado, propaga)
+     3. PASSING    — a aproximar-se (agenda pré-acendimento ETA)
      4. PASSED     — saiu do radar (T--, SPD ao vizinho direito)
-     5. OBSTACULO  — veículo parado (STATE_OBSTACULO, luz 100%)
+     5. OBSTACULO  — veículo parado (STATE_OBSTACULO)
 
    Após consumir todos os eventos, chama tracking_manager_clear_events()
    para limpar as flags. A limpeza é feita APÓS todos os eventos para
@@ -208,7 +220,7 @@ static void _processa_eventos_tracking(void)
                              v->id, v->speed_kmh, v->eta_ms, (int16_t)v->x_mm);
         }
 
-        /* 2. Veículo confirmado local — T++, luz ON, TC_INC + SPD ao vizinho */
+        /* 2. Veículo confirmado local — T++, muda estado, TC_INC + SPD ao vizinho */
         if (v->event_approach_pending) {
             sm_process_event(SM_EVT_VEHICLE_LOCAL,
                              v->id, v->speed_kmh, v->eta_ms, (int16_t)v->x_mm);
@@ -220,7 +232,7 @@ static void _processa_eventos_tracking(void)
                              v->id, v->speed_kmh, 0, (int16_t)v->x_mm);
         }
 
-        /* 4. Veículo parado — entra em STATE_OBSTACULO, luz 100% */
+        /* 4. Veículo parado — entra em STATE_OBSTACULO */
         if (v->event_obstaculo_pending) {
             sm_process_event(SM_EVT_VEHICLE_OBSTACULO,
                              v->id, v->speed_kmh, 0, (int16_t)v->x_mm);
@@ -233,6 +245,64 @@ static void _processa_eventos_tracking(void)
 
 
 /* ============================================================
+   fsm_aplicar_luz
+   ──────────────────────────────────────────────────────────
+   @brief  Aplica o nível de brilho correcto ao dali_manager
+           com base no estado actual da FSM.
+
+   Chamada UMA VEZ por ciclo de 100ms, após _processa_eventos_tracking().
+   É o ÚNICO sítio em todo o sistema que chama dali_fade_up(),
+   dali_fade_down(), dali_set_brightness() e dali_safe_mode().
+
+   Só actua em mudanças de estado — s_ultimo_estado evita que
+   dali_fade_up() seja reiniciado a cada 100ms enquanto o
+   estado se mantém LIGHT_ON.
+
+   PRIVADA — não exposta no .h. Uso exclusivo da fsm_task.
+============================================================ */
+static system_state_t s_ultimo_estado = STATE_IDLE;
+
+static void fsm_aplicar_luz(void)
+{
+    system_state_t estado_actual = g_fsm_state;
+
+    /* Só actua em mudanças de estado */
+    if (estado_actual == s_ultimo_estado) return;
+
+    switch (estado_actual) {
+
+        case STATE_LIGHT_ON:
+            /* Veículo em movimento — fade suave proporcional à velocidade */
+            dali_fade_up(g_fsm_last_speed);
+            break;
+
+        case STATE_OBSTACULO:
+            /* Obstáculo parado — luz máxima instantânea, sem fade */
+            dali_set_brightness(LIGHT_MAX);
+            break;
+
+        case STATE_SAFE_MODE:
+            /* Radar em falha — luz fixa a LIGHT_SAFE_MODE (50%) */
+            dali_safe_mode();
+            break;
+
+        case STATE_IDLE:
+        case STATE_MASTER:
+        case STATE_AUTONOMO:
+            /* Sem tráfego — fade down suave para LIGHT_MIN */
+            dali_fade_down();
+            break;
+
+        default:
+            break;
+    }
+
+    s_ultimo_estado = estado_actual;
+    ESP_LOGD(TAG, "Luz: %s", state_machine_get_state_name());
+}
+
+
+/* ============================================================
    fsm_task — Core 1, Prioridade 6, Stack 6144B
    ──────────────────────────────────────────────
    Loop principal a 100ms.
@@ -241,6 +311,7 @@ static void _processa_eventos_tracking(void)
      1. Lê atomic_bool do radar (escrito pela radar_task)
      2. Chama state_machine_update() — timeouts e transições de estado
      3. Processa eventos do tracking_manager → FSM
+     3.5 Aplica brilho DALI com base no novo estado
      4. Actualiza display com alvos confirmados
      5. Envia heartbeat ao system_monitor
      6. Aguarda 100ms
@@ -261,7 +332,7 @@ static void fsm_task(void *arg)
 
     /* Limpa backlog UART acumulado durante o arranque */
     radar_flush_rx();
-    ESP_LOGI(TAG, "fsm_task v5.0 activa — pipeline radar real");
+    ESP_LOGI(TAG, "fsm_task v5.1 activa — pipeline radar real");
 
     while (1) {
 
@@ -278,6 +349,10 @@ static void fsm_task(void *arg)
 
         /* ── 3. Eventos do tracking → FSM ─────────────────────── */
         _processa_eventos_tracking();
+
+        /* ── 3.5 Aplica brilho com base no novo estado ────────── */
+        /* Ponto único de controlo DALI — só actua em transições. */
+        fsm_aplicar_luz();
 
         /* ── 4. Actualiza display com dados reais do radar ───────*/
         _atualiza_radar_display();
@@ -321,5 +396,5 @@ void state_machine_task_start(void)
         1   /* Core 1 — APP_CPU */
     );
 
-    ESP_LOGI(TAG, "fsm_task v5.0 | Core 1 | Prio 6 | Stack 6144B");
+    ESP_LOGI(TAG, "fsm_task v5.1 | Core 1 | Prio 6 | Stack 6144B");
 }
