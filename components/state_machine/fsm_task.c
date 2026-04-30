@@ -99,19 +99,6 @@ static const char *TAG = "FSM_TASK";
 static _Atomic bool s_radar_teve_frame = false;
 
 
-/* ============================================================
-   tracking_manager_task_notify_frame
-   ────────────────────────────────────
-   @brief Chamada pela radar_task após cada frame do sensor.
-
-   Deve ser chamada EM TODOS OS FRAMES — mesmo quando count=0 —
-   para que a FSM distinga "radar activo sem alvos" de
-   "radar completamente silencioso/morto" (SAFE_MODE).
-============================================================ */
-void tracking_manager_task_notify_frame(bool teve_frame)
-{
-    atomic_store(&s_radar_teve_frame, teve_frame);
-}
 
 
 /* ============================================================
