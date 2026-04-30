@@ -1,9 +1,14 @@
-#include <inttypes.h>
 /* ============================================================
-   DALI MANAGER — DECLARACAO v2.0
+   DALI MANAGER — DECLARACAO v3.0
+   @file      dali_manager.h
+   @version   3.0  |  2026-04-29
    Projecto  : Poste Inteligente v8
    Estudantes: Luis Custodio | Tiago Moreno
    Plataforma: ESP32 (ESP-IDF v5.x)
+
+   Alterações v2.0 → v3.0:
+   - #include <inttypes.h> movido para dentro do guard
+   - ADICIONADO: dali_get_brightness_real()
 ============================================================ */
 #ifndef DALI_MANAGER_H
 #define DALI_MANAGER_H
@@ -24,7 +29,18 @@ void    dali_fade_up(float vel_kmh);
 void    dali_fade_down(void);
 void    dali_fade_stop(void);
 
-/* Leitura de estado (thread-safe) */
+/**
+ * @brief Valor lógico de brilho (destino do fade).
+ *        Pode ser optimista durante o fade.
+ *        Thread-safe via spinlock.
+ */
 uint8_t dali_get_brightness(void);
+
+/**
+ * @brief Valor real do hardware LEDC durante o fade.
+ *        Reflecte o brilho instantâneo enquanto o fade corre.
+ *        Usar no system_monitor para a barra no display.
+ */
+uint8_t dali_get_brightness_real(void);
 
 #endif /* DALI_MANAGER_H */

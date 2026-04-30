@@ -1,0 +1,627 @@
+================================================================================
+   POSTE INTELIGENTE v8 — RELATÓRIO FINAL DE DESENVOLVIMENTO
+   Data       : 2026-04-29
+   Projecto   : Poste Inteligente v8
+   Autores    : Luis Custódio | Tiago Moreno
+   Plataforma : ESP32 (ESP-IDF v5.x / PlatformIO)
+================================================================================
+
+
+================================================================================
+1. INTRODUÇÃO
+================================================================================
+
+Este relatório documenta todas as análises, problemas encontrados e melhorias
+implementadas no Poste Inteligente v8 durante a fase de revisão e optimização
+do código. O sistema consiste numa cadeia de postes de iluminação inteligente
+com radar HLK-LD2450, comunicação UDP via WiFi, display ST7789 e controlo de
+brilho DALI por PWM.
+
+O objectivo desta fase foi organizar o código por camadas com responsabilidades
+bem definidas, corrigir problemas no protocolo T/Tc, adaptar os parâmetros para
+testes em laboratório e garantir que todos os modos de funcionamento operam de
+forma correcta e coerente.
+
+
+================================================================================
+2. ARQUITECTURA POR CAMADAS
+================================================================================
+
+O código foi reorganizado em 5 camadas com responsabilidades estritamente
+separadas. Cada camada só conhece a camada imediatamente abaixo — nunca salta
+camadas nem cria dependências circulares.
+
+CAMADA 0 — Configuração
+  Ficheiros: system_config.h, hw_config.h, post_config
+  Função: fonte única de verdade para todas as constantes do sistema.
+          Nenhuma lógica, só defines e macros.
+
+CAMADA 1 — Drivers de Hardware
+  Ficheiros: radar_manager, dali_manager, wifi_manager, st7789 (LVGL)
+  Função: lêem e escrevem hardware. Não conhecem veículos, estados FSM
+          nem protocolo UDP.
+
+CAMADA 2 — Processamento de Dados
+  Ficheiros: tracking_manager, udp_manager, comm_manager
+  Função: transformam dados brutos em informação estruturada.
+          O tracking_manager converte frames UART em veículos rastreados.
+          O udp_manager converte bytes UDP em mensagens tipadas.
+          O comm_manager abstrai o transporte sem expor IPs à FSM.
+
+CAMADA 3 — Lógica de Negócio (FSM)
+  Ficheiros: fsm_core, fsm_events, fsm_network, fsm_timer, fsm_task
+  Função: única camada que conhece o protocolo T/Tc, os estados MASTER,
+          SAFE_MODE, AUTONOMO e OBSTACULO e as regras de negócio.
+          Não sabe nada sobre UART nem sobre pixels.
+
+CAMADA 4 — Apresentação e Monitorização
+  Ficheiros: display_manager, system_monitor
+  Função: consomem estado, nunca o modificam. O display_manager recebe
+          dados via fila LVGL e desenha. O system_monitor inicializa
+          tudo, alimenta o WDT e monitoriza heartbeats.
+
+DISTRIBUIÇÃO DUAL-CORE ESP32:
+  Core 0 (PRO_CPU): radar_task (Prio 5), udp_task (Prio 5), WiFi stack
+  Core 1 (APP_CPU): monitor_task (Prio 7), fsm_task (Prio 6),
+                    display_task (Prio 4)
+
+
+================================================================================
+3. SIMULADOR REMOVIDO
+================================================================================
+
+PROBLEMA ENCONTRADO:
+  O ficheiro fsm_sim.c estava listado no CMakeLists.txt e era compilado e
+  linkado mesmo em produção com USE_RADAR=1. Ocupava flash e RAM sem função.
+  O state_machine.h expunha funções de simulação (sim_get_objeto,
+  sim_notificar_chegada) no header público.
+  O state_machine_task.c tinha blocos #if USE_RADAR == 0 com lógica de
+  simulação entretecida com a lógica real.
+
+SOLUÇÃO IMPLEMENTADA:
+  - fsm_sim.c e fsm_sim.h removidos completamente do projecto.
+  - CMakeLists.txt da state_machine actualizado — só os 5 módulos reais:
+    fsm_core.c, fsm_events.c, fsm_network.c, fsm_timer.c, fsm_task.c
+  - Todos os blocos #if USE_RADAR eliminados.
+  - state_machine_task.c substituído por fsm_task.c sem simulação.
+  - state_machine.c (versão monolítica antiga) pode ser apagado —
+    não é compilado mas continua no repositório a causar confusão.
+
+FICHEIROS A APAGAR DO PROJECTO (já não compilados):
+  components/state_machine/fsm_sim.c
+  components/state_machine/fsm_sim.h
+  components/state_machine/state_machine.c
+  components/state_machine/state_machine_task.c
+
+
+================================================================================
+4. PROTOCOLO T/Tc — PROBLEMAS E CORRECÇÕES
+================================================================================
+
+O protocolo T/Tc é o núcleo do sistema. T conta veículos detectados
+localmente pelo radar. Tc conta veículos anunciados via UDP pelo poste
+à esquerda (a caminho).
+
+REGRAS FUNDAMENTAIS DO PROTOCOLO:
+  T=0 e Tc=0 → condição para apagar a luz (após TRAFIC_TIMEOUT_MS)
+  TC_INC enviado UMA VEZ por veículo — em EVT_LOCAL (detecção física)
+  on_tc_inc_received() só faz Tc++ — nunca reenvia TC_INC
+  EVT_APPROACHING não envia TC_INC — só agenda pré-acendimento por ETA
+  EVT_PASSED envia SPD (ETA) — nunca TC_INC
+  Luz apaga APENAS quando T==0 AND Tc==0 AND timeout expirou
+
+PROBLEMA 1 — EVT_DETECTED fazia T++ (BUG CRÍTICO):
+  No fsm_events.c, o case SM_EVT_VEHICLE_DETECTED incrementava T e
+  enviava TC_INC. Isto causava T=2 para um único veículo (DETECTED fazia
+  T++ e depois LOCAL fazia T++ outra vez). O TC_INC era enviado duas
+  vezes ao vizinho. O apagamento nunca chegava a T=0 correctamente.
+
+  ANTES (buggy):
+    case SM_EVT_VEHICLE_DETECTED:
+        if (g_fsm_T < 3) g_fsm_T++;    // ERRADO
+        comm_send_tc_inc(vel, x_mm);    // ERRADO
+
+  DEPOIS (correcto):
+    case SM_EVT_VEHICLE_DETECTED:
+        // Só guarda ETA e acende luz se necessário
+        // SEM T++ aqui. SEM TC_INC aqui.
+
+PROBLEMA 2 — Mapeamento de eventos incorrecto em state_machine_task.c:
+  O ficheiro antigo mapeava event_approach_pending para
+  SM_EVT_VEHICLE_APPROACHING em vez de SM_EVT_VEHICLE_LOCAL.
+  Resultado: T++ nunca acontecia, TC_INC nunca era enviado.
+  Resolvido com a substituição por fsm_task.c com mapeamento correcto:
+    event_approach_pending → SM_EVT_VEHICLE_LOCAL (correcto)
+
+PROBLEMA 3 — EVT_PASSED não fazia T-- em alguns cenários:
+  O fsm_agendar_apagar() era chamado sempre, mesmo com T>0.
+  Corrigido — só agenda apagamento quando T==0 AND Tc==0.
+
+PROBLEMA 4 — on_prev_passed_received() com assinatura inconsistente:
+  No udp_manager.h declarada como void(void).
+  No fsm_events.c implementada como void(float speed).
+  Comportamento indefinido em runtime — possível causa de eventos lentos.
+  Corrigido — assinatura unificada: void on_prev_passed_received(float speed)
+
+FLUXO CORRECTO APÓS CORRECÇÕES (exemplo com 3 postes):
+
+  Veículo entra na zona do Poste A (MASTER):
+    EVT_DETECTED → luz ON, agenda ETA. T permanece 0.
+    EVT_LOCAL    → T=1, Tc=0, TC_INC+SPD → Poste B
+    EVT_PASSED   → T=0, SPD → Poste B, agenda apagamento
+
+  Poste B recebe TC_INC → Tc=1, luz ON antecipada
+    EVT_DETECTED → só ETA, sem tocar T nem Tc
+    EVT_LOCAL    → Tc=0, T=1, PASSED → Poste A, TC_INC+SPD → Poste C
+    EVT_PASSED   → T=0, agenda apagamento
+
+  Poste C (fim de linha) recebe TC_INC → Tc=1
+    EVT_LOCAL → Tc=0, T=1, PASSED → Poste B
+    SEM TC_INC (sem vizinho direito)
+    EVT_PASSED → T=0, T==0 e Tc==0 → apagamento → IDLE
+
+
+================================================================================
+5. MODOS DE FUNCIONAMENTO — DESCRIÇÃO E EXEMPLOS
+================================================================================
+
+O sistema tem 6 estados. Cada estado tem condições claras de entrada,
+comportamento específico e condições de saída.
+
+────────────────────────────────────────────────────────────────────────────────
+5.1 MASTER → LIGHT_ON → MASTER (operação normal com múltiplos postes)
+────────────────────────────────────────────────────────────────────────────────
+
+QUANDO ACONTECE:
+  Operação normal. WiFi OK. Radar OK. Todos os postes operacionais.
+  O Poste A (posição 0) é sempre MASTER — é o primeiro a ver o veículo.
+
+EXEMPLO COM 3 POSTES (A=MASTER, B=IDLE, C=fim de linha):
+
+  Estado inicial: A=MASTER(T=0,Tc=0), B=IDLE(T=0,Tc=0), C=IDLE(T=0,Tc=0)
+
+  [t=0s]   Radar de A detecta veículo a 2 km/h
+           A: EVT_DETECTED → LIGHT_ON, fade up 500ms
+           A envia TC_INC + SPD a B
+
+  [t=0s]   B recebe TC_INC → Tc=1, luz ON antecipada (pré-acendimento)
+
+  [t=1s]   A: EVT_LOCAL → T=1
+           A envia PASSED a... (não tem viz.esq) → sem envio
+           TC_INC já foi enviado em DETECTED — não reenvia
+
+  [t=3s]   Radar de B detecta o veículo
+           B: EVT_LOCAL → Tc=0, T=1, PASSED → A (A faz T--=0)
+           B envia TC_INC + SPD a C
+           A: T=0, Tc=0 → agenda apagamento (TRAFIC_TIMEOUT=5s)
+
+  [t=5s]   A aguarda 5s → fade down 4000ms → MASTER
+
+  [t=6s]   Radar de C detecta o veículo
+           C: EVT_LOCAL → Tc=0, T=1, PASSED → B (B faz T--=0)
+           C NÃO envia TC_INC (sem vizinho direito)
+           B: T=0, Tc=0 → agenda apagamento
+
+  [t=8s]   Veículo sai da zona de C
+           C: EVT_PASSED → T=0, T==0 e Tc==0 → agenda apagamento
+           C aguarda 5s → fade down 4000ms → IDLE
+
+RESULTADO: cada poste acende e apaga sequencialmente. T nunca passa de 1
+por veículo. TC_INC enviado uma única vez por poste.
+
+────────────────────────────────────────────────────────────────────────────────
+5.2 SAFE_MODE — radar falha, WiFi pode estar OK
+────────────────────────────────────────────────────────────────────────────────
+
+QUANDO ACONTECE:
+  O radar HLK-LD2450 deixa de enviar frames UART válidos.
+  Após RADAR_FAIL_COUNT ciclos sem frame (50 × 100ms = 5 segundos),
+  g_fsm_radar_ok fica false e o sistema entra em SAFE_MODE.
+  O WiFi pode estar completamente operacional — não interessa.
+  A regra é absoluta: sem radar = SAFE_MODE.
+
+COMPORTAMENTO EM SAFE_MODE:
+  - Luz fixa a 50% (LIGHT_SAFE_MODE) — nunca apaga sozinho
+  - Não detecta veículos (radar inoperacional)
+  - Não envia TC_INC nem PASSED aos vizinhos
+  - Responde ao UDP com STATUS:SAFE em vez de STATUS:OK
+  - O vizinho à esquerda vê SAFE → não envia TC_INC a este poste
+  - O vizinho à direita vê SAFE no viz.esq → assume MASTER temporariamente
+
+EXEMPLO (B perde radar, A e C têm radar OK):
+
+  Estado inicial: A=MASTER, B=IDLE, C=IDLE (todos WiFi OK, Radar OK)
+
+  [t=0s]   Radar de B falha → sem frames UART
+  [t=5s]   B: RADAR_FAIL_COUNT atingido → SAFE_MODE, luz 50%
+           B responde DISCOVER com STATUS:SAFE
+
+  [t=5s]   A recebe STATUS:SAFE de B
+           A: viz.dir em SAFE → NÃO envia TC_INC a B
+           A: comm_is_master() continua true (pos=0)
+
+  [t=5s]   C recebe STATUS:SAFE de B (viz.esq)
+           C: comm_is_master() devolve true (viz.esq em SAFE)
+           C assume papel MASTER temporariamente
+
+  [Durante SAFE_MODE de B]:
+           Veículos detectados por A → TC_INC → B ignora (SAFE_MODE)
+           C não recebe aviso dos veículos de A
+           C detecta localmente os veículos que chegam pela sua zona
+
+RECUPERAÇÃO (radar de B volta):
+  Após RADAR_OK_COUNT frames consecutivos (3 × 100ms = 300ms):
+  B: SAFE_MODE → IDLE
+  B responde DISCOVER com STATUS:OK
+  A e C recebem STATUS:OK → comportamento normal restabelecido
+  Toda a cadeia recupera automaticamente em menos de 1 segundo.
+
+NOTA IMPORTANTE:
+  O problema de A não conseguir saltar B para avisar C directamente
+  (quando B está em SAFE_MODE) é uma limitação conhecida desta versão.
+  Está identificada como próxima melhoria no comm_manager —
+  saltar vizinhos em SAFE e procurar o próximo operacional na cadeia.
+
+────────────────────────────────────────────────────────────────────────────────
+5.3 AUTONOMO — WiFi falha, radar OK
+────────────────────────────────────────────────────────────────────────────────
+
+QUANDO ACONTECE:
+  A rede WiFi fica indisponível (router desligado, sinal perdido, etc.)
+  mas o radar continua a funcionar normalmente.
+  Após AUTONOMO_DELAY_MS sem comm_ok (5s em lab, 10s em produção),
+  o poste entra em modo AUTONOMO.
+
+COMPORTAMENTO EM AUTONOMO:
+  - Radar detecta veículos normalmente
+  - Fade up e fade down funcionam com base no radar local
+  - T e Tc funcionam localmente
+  - NÃO envia TC_INC nem PASSED — sem rede
+  - NÃO recebe UDP de outros postes
+  - TRAFIC_TIMEOUT → fade down → volta a STATE_AUTONOMO (não IDLE)
+    (memória de que estava em AUTONOMO, não presume que voltou ao normal)
+
+EXEMPLO (Poste B perde WiFi):
+
+  [t=0s]   Router desliga — B perde WiFi
+  [t=5s]   B: comm_ok=false durante AUTONOMO_DELAY_MS → AUTONOMO
+
+  [t=6s]   Mão passa pelo radar de B a 2 km/h
+           B: EVT_DETECTED → fade up 500ms (MODO_LABORATORIO)
+           B: EVT_LOCAL → T=1 (sem envio UDP — sem rede)
+           Luz fica acesa
+
+  [t=9s]   Mão sai da zona
+           B: EVT_PASSED → T=0 → agenda apagamento
+           B aguarda 5s → fade down 4000ms → STATE_AUTONOMO
+
+  [t=20s]  WiFi recupera → comm_ok=true → vizinho detectado
+           B: AUTONOMO → IDLE ou MASTER (conforme posição)
+           Fluxo UDP normal restabelecido
+
+DIFERENÇA ENTRE AUTONOMO E SAFE_MODE:
+  AUTONOMO  = radar OK, WiFi falhou  → detecta e ilumina localmente
+  SAFE_MODE = radar falhou, WiFi OK  → luz 50% fixa, não detecta nada
+
+────────────────────────────────────────────────────────────────────────────────
+5.4 OBSTACULO — veículo parado na zona do radar
+────────────────────────────────────────────────────────────────────────────────
+
+QUANDO ACONTECE:
+  O tracking_manager detecta um veículo com velocidade abaixo de
+  OBSTACULO_SPEED_MAX_KMH durante OBSTACULO_MIN_FRAMES consecutivos.
+
+  Modo laboratório:  vel ≤ 1.0 km/h durante 30 frames = 3 segundos
+  Modo produção:     vel ≤ 3.0 km/h durante 80 frames = 8 segundos
+
+COMPORTAMENTO EM OBSTACULO:
+  - Luz forçada a 100% (LIGHT_MAX) — máxima visibilidade
+  - Posição do obstáculo fixa no display (speed=0 → sem movimento preditivo)
+  - Envia PASSED ao vizinho direito para cancelar Tc (o veículo não avança)
+  - NÃO envia TC_INC — o obstáculo não viaja para o próximo poste
+  - Outros veículos que passam continuam a ser processados normalmente
+    (slots independentes no tracking_manager)
+  - fsm_obstaculo_keepalive() actualizado a cada 100ms enquanto o radar
+    confirma o obstáculo — o timeout só começa quando o obstáculo desaparece
+
+EXEMPLO:
+  [t=0s]   Veículo detectado a 45 km/h → EVT_LOCAL → T=1, luz ON
+  [t=2s]   Veículo pára — vel cai para 0.5 km/h
+  [t=5s]   30 frames com vel ≤ 1.0 → EVT_OBSTACULO
+           Luz → 100%, posição fixa no display
+           PASSED → vizinho direito (cancela Tc)
+
+  [Durante obstáculo]:
+           Outros veículos que passam → processados normalmente
+           Obstáculo mantém-se → keepalive a cada 100ms
+           Display mostra posição fixa do obstáculo
+
+  [t=15s]  Obstáculo remove-se (veículo arrancar ou sair)
+           Sem detecção durante OBSTACULO_REMOVE_MS (5s em lab)
+           T-- (T=1→0), T==0 e Tc==0 → fsm_agendar_apagar()
+           Fade down 4000ms → IDLE/MASTER
+
+PROBLEMA ENCONTRADO E CORRIGIDO:
+  O passo 8 do fsm_timer.c transitava directamente para IDLE/MASTER
+  sem fazer T--. T ficava preso em 1 para sempre — a luz nunca apagava.
+  Corrigido: T-- antes de verificar se apaga.
+
+  Problema adicional: g_fsm_obstaculo_last_ms só era actualizado no
+  primeiro evento. Após 8s o timeout disparava com o obstáculo ainda
+  presente. Corrigido com fsm_obstaculo_keepalive() chamado a cada 100ms
+  enquanto o slot do obstáculo está activo no tracking_manager.
+
+
+================================================================================
+6. SINCRONIZAÇÃO ENTRE TASKS (DUAL-CORE)
+================================================================================
+
+A comunicação entre radar_task (Core 0) e fsm_task (Core 1) usa uma
+variável atómica _Atomic bool que garante visibilidade entre os dois cores
+do ESP32 (Xtensa LX6) sem mutex:
+
+  radar_task (Core 0, 100ms):
+    → radar_read_data() — parse UART HLK-LD2450
+    → tracking_manager_update() — rastreamento multi-veículo
+    → tracking_manager_task_notify_frame(ok) — escreve _Atomic bool
+
+  fsm_task (Core 1, 100ms):
+    → atomic_exchange(&s_radar_teve_frame, false) — lê e repõe
+    → state_machine_update() — timeouts e transições
+    → _processa_eventos_tracking() — FSM consome eventos
+    → _atualiza_radar_display() — display recebe alvos reais
+
+PROBLEMA ENCONTRADO:
+  tracking_manager_task_notify_frame() estava declarada com "extern"
+  directamente no radar_manager_task.c (acoplamento silencioso).
+  Se a assinatura mudasse no .c, o compilador não avisava.
+  Corrigido: incluir tracking_manager.h que tem a declaração correcta.
+
+
+================================================================================
+7. ADAPTAÇÕES PARA MODO LABORATÓRIO
+================================================================================
+
+Foi adicionada a flag MODO_LABORATORIO ao system_config.h. Com uma única
+linha é possível comutar entre parâmetros de bancada e produção.
+
+  #define MODO_LABORATORIO   1   // 1=bancada | 0=produção
+
+PARÂMETROS QUE MUDAM AUTOMATICAMENTE:
+
+  Parâmetro               Laboratório (=1)    Produção (=0)
+  ─────────────────────── ──────────────────  ──────────────
+  VEL_FADE_RAPIDO_KMH     3.0 km/h (mão)     80 km/h
+  VEL_FADE_MEDIO_KMH      2.0 km/h            50 km/h
+  VEL_FADE_LENTO_KMH      1.0 km/h            30 km/h
+  OBSTACULO_MIN_FRAMES    30 (3 segundos)     80 (8 segundos)
+  OBSTACULO_SPEED_MAX     1.0 km/h            3.0 km/h
+  RADAR_MIN_DIST_M        0.2m (20cm)         0.5m
+  MIN_DETECT_KMH          0.3 km/h            3.0 km/h
+  AFASTAR_THRESHOLD       8.0 km/h            2.0 km/h
+  TRAFIC_TIMEOUT_MS       5000ms (5s)         8000ms (8s)
+  AUTONOMO_DELAY_MS       5000ms              10000ms
+  OBSTACULO_REMOVE_MS     5000ms              8000ms
+
+FADE DALI EM LABORATÓRIO (mão a passar pelo radar):
+  Mão rápida  (>3 km/h) → fade UP  300ms  — muito rápido, vê-se claramente
+  Mão normal  (>2 km/h) → fade UP  500ms  — médio
+  Mão devagar (>1 km/h) → fade UP  800ms  — suave e gradual
+  Sem detecção → aguarda 5s → fade DOWN 4000ms — descida muito suave
+
+
+================================================================================
+8. MÓDULO DALI — PROBLEMAS E CORRECÇÕES
+================================================================================
+
+PROBLEMA 1 — Literais hardcoded em dali_fade_up():
+  Os limiares de velocidade (80/50/30 km/h) estavam escritos directamente
+  no código. Com MODO_LABORATORIO não tinham qualquer efeito — a mão nunca
+  atinge 30 km/h e o sistema usava sempre o else (500ms).
+
+  CORRIGIDO: substituídos por VEL_FADE_RAPIDO/MEDIO/LENTO_KMH e
+  FADE_UP_RAPIDO/MEDIO/LENTO_MS definidos no system_config.h.
+
+PROBLEMA 2 — FADE_DOWN_MS definido localmente no .c:
+  O dali_manager.c tinha #define FADE_DOWN_MS 4000 na linha 31.
+  Com o system_config.h a definir o mesmo valor, causava conflito
+  de redefinição ou ocultava o valor configurável.
+  CORRIGIDO: define local removido — valor vem exclusivamente do config.
+
+PROBLEMA 3 — dali_get_brightness_real() inexistente:
+  Sem esta função o display não consegue mostrar o fade em tempo real.
+  dali_get_brightness() devolve sempre o valor de destino (100%) mesmo
+  quando o fade ainda está a meio. A barra no display saltava directamente
+  para 100% sem animação visual.
+  CORRIGIDO: função nova implementada — lê o duty actual do hardware LEDC.
+
+PROBLEMA 4 — dali_manager.h com #include fora do guard:
+  #include <inttypes.h> estava na linha 1, antes do #ifndef.
+  Em inclusões múltiplas o include era processado sempre.
+  CORRIGIDO: movido para dentro do #ifndef DALI_MANAGER_H.
+
+CURVA LOGARÍTMICA IEC 62386 (mantida — já estava correcta):
+  arc = 1 + (253/3) × log10(pct × 10)
+  Compensa a percepção logarítmica do olho humano. Um fade linear de 0
+  a 100% pareceria brusco no início e lento no fim. Com esta curva o
+  fade parece perfeitamente linear ao observador.
+
+
+================================================================================
+9. CONFIGURAÇÃO DE TESTE EM BANCADA — LED E RESISTÊNCIA
+================================================================================
+
+O pino PWM do DALI está definido no hw_config.h:
+  LED_PWM_PIN     = GPIO 26
+  LED_PWM_FREQ_HZ = 5000 Hz
+  Tensão GPIO     = 3.3V (ESP32)
+
+RAZÃO PARA USAR LED EM VEZ DE DRIVER DALI REAL:
+  O protocolo DALI real (IEC 62386) usa comunicação série bidirecional a
+  1200 baud com níveis de tensão de 16V. Em laboratório, o objetivo é apenas
+  verificar o comportamento do fade — subida suave, descida suave, diferentes
+  velocidades conforme a velocidade de detecção. Um LED simples ligado ao pino
+  PWM do ESP32 permite observar exactamente este comportamento sem necessidade
+  de hardware de controlo DALI (interface, ballast digital, luminária DALI).
+  Em produção o sinal PWM do GPIO 26 controla o driver DALI real.
+  A lógica de software é identica — só o hardware de saída difere.
+
+CÁLCULO DA RESISTÊNCIA:
+
+  Para LED vermelho/amarelo/verde standard (Vf ≈ 2.0V) — RECOMENDADO:
+    R = (Vtensão - Vf) / I = (3.3V - 2.0V) / 0.010A = 130Ω
+    Valor standard mais próximo: 150Ω (seguro, LED visivelmente brilhante)
+
+  Para LED azul ou branco (Vf ≈ 3.0V):
+    R = (3.3V - 3.0V) / 0.010A = 30Ω
+    Valor standard: 33Ω ou 47Ω
+    NOTA: margem muito reduzida — o fade nos valores baixos (10-30%)
+    é praticamente invisível. Não recomendado para testes de fade.
+
+LED RECOMENDADO:
+  LED vermelho 5mm standard (Vf=2.0V, If=20mA max)
+  ou LED amarelo 5mm standard (Vf=2.1V)
+  Resistência: 150Ω
+
+  Razão: o olho humano é mais sensível ao vermelho/amarelo/verde.
+  A curva logarítmica IEC 62386 é muito mais perceptível nestas cores.
+  Com LED azul a Vf≈3.0V a margem é insuficiente para se ver o fade
+  nos níveis baixos de brilho (LIGHT_MIN=10%).
+
+LIGAÇÃO:
+
+  ESP32 GPIO 26 (LED_PWM_PIN)
+         |
+        [R 150Ω]
+         |
+        [LED +]
+         |
+        [LED -]
+         |
+        GND
+
+VERIFICAÇÃO ANTES DE LIGAR:
+  - Confirmar que MODO_LABORATORIO = 1 no system_config.h
+  - Confirmar que LED_PWM_PIN = 26 no hw_config.h
+  - Resistência de 150Ω entre GPIO 26 e ânodo do LED
+  - Cátodo do LED ligado ao GND do ESP32
+  - Nunca ligar directamente sem resistência — queima o GPIO
+
+O QUE DEVE OBSERVAR-SE EM BANCADA:
+  1. Sistema arranca → LED acende a 10% (LIGHT_MIN) — muito fraco
+  2. Mão passa rápida pelo radar (>3 km/h) → LED sobe para 100% em 300ms
+  3. Mão passa normal (~2 km/h) → LED sobe para 100% em 500ms
+  4. Mão passa devagar (~1 km/h) → LED sobe para 100% em 800ms
+  5. Sem detecção durante 5s → LED desce de 100% para 10% em 4000ms
+  6. Mão parada junto ao radar (≤1 km/h por 3s) → LED vai a 100% fixo
+     (modo OBSTACULO — não desce por timeout enquanto mão estiver parada)
+  7. Mão retira → 5s depois → LED desce → IDLE
+
+
+================================================================================
+10. RESUMO DAS CORRECÇÕES POR FICHEIRO
+================================================================================
+
+  fsm_events.c
+    - EVT_DETECTED: removido T++ e TC_INC (eram ilegais neste estado)
+    - EVT_PASSED:   fsm_agendar_apagar() só quando T==0 e Tc==0
+    - on_prev_passed_received(): assinatura corrigida (float speed)
+
+  fsm_task.c
+    - Substituiu state_machine_task.c (sem simulação)
+    - Mapeamento correcto: event_approach_pending → SM_EVT_VEHICLE_LOCAL
+    - fsm_obstaculo_keepalive() chamado a cada 100ms em _atualiza_radar_display()
+
+  fsm_core.c / fsm_core.h
+    - fsm_obstaculo_keepalive() implementada e declarada
+
+  fsm_timer.c
+    - _passo8_limpeza_obstaculo(): T-- antes de apagar
+      Antes: IDLE/MASTER directo sem T-- (T ficava preso)
+      Depois: T--, se T==0 e Tc==0 → fsm_agendar_apagar()
+
+  fsm_network.c (verificado — sem alterações necessárias)
+    - fsm_network_estados_degradados(): SAFE_MODE e AUTONOMO correctos
+    - Recuperação automática de SAFE_MODE após RADAR_OK_COUNT frames
+
+  udp_manager.c
+    - Resposta ao DISCOVER: STATUS:OK → STATUS:<estado_real>
+      Permite vizinhos saberem quando este poste está em SAFE/AUTO/OBST
+
+  udp_manager.h
+    - on_prev_passed_received(void) → on_prev_passed_received(float speed)
+
+  comm_manager.c
+    - _vizinho_operacional(): nova função — SAFE e FAIL não são operacionais
+    - _ip_vizinho_direito(): salta vizinhos em SAFE_MODE
+    - comm_is_master(): SAFE e FAIL contam como ausente (→ assume MASTER)
+    - comm_notify_prev_passed(): usa udp_manager_send_passed() dedicado
+
+  comm_manager.h
+    - comm_left_known() duplicada removida
+    - #include <inttypes.h> movido para dentro do guard
+
+  dali_manager.c
+    - dali_fade_up(): literais 80/50/30 → VEL_FADE_RAPIDO/MEDIO/LENTO_KMH
+    - FADE_DOWN_MS local removido (conflito com system_config.h)
+    - dali_get_brightness_real(): nova função (duty real do LEDC)
+    - dali_init(): log mostra modo activo e limiares de velocidade
+
+  dali_manager.h
+    - dali_get_brightness_real() declarada
+    - #include <inttypes.h> removido (desnecessário)
+
+  system_config.h
+    - MODO_LABORATORIO: nova flag — comuta todos os parâmetros
+    - VEL_FADE_RAPIDO/MEDIO/LENTO_KMH: limiares de velocidade para fade
+    - FADE_UP_RAPIDO/MEDIO/LENTO/DEFAULT_MS: tempos de fade configuráveis
+    - FADE_DOWN_MS: tempo de descida configurável
+    - OBSTACULO_MIN_FRAMES: corrigido (era 500=50s, agora 80=8s produção,
+      30=3s laboratório)
+    - RADAR_OK_COUNT / RADAR_FAIL_COUNT: movidos para cá (estavam no .c)
+
+  state_machine.h
+    - on_prev_passed_received(float speed): assinatura corrigida
+
+  CMakeLists.txt (state_machine)
+    - fsm_sim.c removido dos SRCS
+    - esp_random removido dos REQUIRES (era só do simulador)
+
+
+================================================================================
+11. FICHEIROS A APAGAR DO REPOSITÓRIO
+================================================================================
+
+  components/state_machine/fsm_sim.c       — simulador eliminado
+  components/state_machine/fsm_sim.h       — header do simulador
+  components/state_machine/state_machine.c — versão monolítica antiga
+  components/state_machine/state_machine_task.c — substituído por fsm_task.c
+
+
+================================================================================
+12. PRÓXIMAS MELHORIAS IDENTIFICADAS
+================================================================================
+
+  1. comm_manager — salto de poste em SAFE_MODE:
+     Quando B está em SAFE_MODE, A não consegue avisar C directamente
+     porque só conhece B como vizinho direito. O comm_manager deve
+     procurar o próximo vizinho operacional na cadeia quando o directo
+     está em SAFE ou FAIL.
+
+  2. system_monitor — usar dali_get_brightness_real():
+     Substituir dali_get_brightness() por dali_get_brightness_real()
+     para a barra do display mostrar o fade em tempo real.
+
+  3. display_manager — LV_ANIM_ON na barra DALI:
+     Activar animação LVGL na barra de brilho para suavizar a
+     actualização visual a cada 200ms.
+
+  4. fsm_network — AUTONOMO durante LIGHT_ON:
+     Se o WiFi cair enquanto o poste está em LIGHT_ON, g_fsm_era_autonomo
+     nunca fica true. Quando o veículo sai e a luz apaga, o estado vai
+     para IDLE em vez de AUTONOMO. Melhoria futura opcional.
+
+
+================================================================================
+FIM DO RELATÓRIO
+================================================================================

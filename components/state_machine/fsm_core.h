@@ -70,6 +70,16 @@ void fsm_agendar_apagar(void);
 /** Monitoriza saúde do radar com debounce bidirecional */
 void fsm_verificar_radar(bool teve_frame, bool comm_ok);
 
+/**
+ * @brief Mantém o obstáculo "vivo" enquanto o radar o continua a detectar.
+ *        Chamada pela fsm_task a cada 100ms enquanto existir um slot com
+ *        obstaculo_frames >= OBSTACULO_MIN_FRAMES no tracking_manager.
+ *        Actualiza g_fsm_obstaculo_last_ms para que OBSTACULO_REMOVE_MS
+ *        só comece a contar quando o obstáculo desaparece do radar.
+ *        Inofensiva se chamada fora de STATE_OBSTACULO.
+ */
+void fsm_obstaculo_keepalive(void);
+
 /* ============================================================
    CICLO DE VIDA
 ============================================================ */

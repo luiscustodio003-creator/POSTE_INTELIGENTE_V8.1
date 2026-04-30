@@ -91,7 +91,6 @@ static const char *TAG = "FSM_TASK";
 ============================================================ */
 static _Atomic bool s_radar_teve_frame = false;
 
-
 /* ============================================================
    tracking_manager_task_notify_frame
    ────────────────────────────────────
@@ -99,16 +98,9 @@ static _Atomic bool s_radar_teve_frame = false;
 
    Deve ser chamada EM TODOS OS FRAMES — mesmo quando count=0 —
    para que a FSM distinga "radar activo sem alvos" de
-   "radar completamente silencioso/morto" (SAFE_MODE).
+   "radar completamente silencioso/morto" (SAFE_MODE).*/
 
-   @param teve_dados  true  → frame UART válido recebido
-                      false → timeout UART ou frame corrompido
-============================================================ */
-void tracking_manager_task_notify_frame(bool teve_dados)
-{
-    atomic_store(&s_radar_teve_frame, teve_dados);
-}
-
+ 
 
 /* ============================================================
    _atualiza_radar_display
@@ -150,6 +142,11 @@ static void _atualiza_radar_display(void)
 
     for (uint8_t i = 0; i < count && n_alvos < RADAR_MAX_OBJ; i++) {
         tracked_vehicle_t *v = &veiculos[i];
+
+        /* Keepalive: mantém obstáculo vivo enquanto radar o detecta */
+        if (em_obstaculo && v->obstaculo_frames >= OBSTACULO_MIN_FRAMES) {
+            fsm_obstaculo_keepalive();
+        }
 
         /* Só estados com detecção física confirmada */
         if (v->state != TRK_STATE_CONFIRMED &&

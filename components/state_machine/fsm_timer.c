@@ -82,16 +82,34 @@ static void _passo7_gestao_apagamento(uint64_t agora, bool is_master)
 }
 
 /* ── Passo 8: Auto-remoção de Estado de Obstáculo ─────────── */
+/*
+   CORRECÇÃO v1.2:
+   O obstáculo ocupa T=1. Ao ser removido por inactividade,
+   T-- é necessário antes de apagar — senão T fica preso em 1
+   e o passo 7 nunca apaga a luz.
+   Se ainda há outros veículos (T>1), volta a LIGHT_ON.
+*/
 static void _passo8_limpeza_obstaculo(uint64_t agora, bool is_master)
 {
     if (g_fsm_state != STATE_OBSTACULO || g_fsm_obstaculo_last_ms == 0) return;
 
-    if ((agora - g_fsm_obstaculo_last_ms) >= OBSTACULO_REMOVE_MS) {
-        g_fsm_state = is_master ? STATE_MASTER : STATE_IDLE;
-        g_fsm_obstaculo_last_ms = 0;
-        
-        dali_fade_down();
-        ESP_LOGW(TAG, "Obstáculo removido por inatividade.");
+    if ((agora - g_fsm_obstaculo_last_ms) < OBSTACULO_REMOVE_MS) return;
+
+    /* Obstáculo desapareceu — decrementa T do slot do obstáculo */
+    if (g_fsm_T > 0) g_fsm_T--;
+    g_fsm_obstaculo_last_ms = 0;
+
+    ESP_LOGW(TAG, "Obstáculo removido por inactividade → T=%d Tc=%d",
+             g_fsm_T, g_fsm_Tc);
+
+    if (g_fsm_T == 0 && g_fsm_Tc == 0) {
+        /* Nenhum veículo — apagamento normal via passo 7 */
+        fsm_agendar_apagar();
+        ESP_LOGI(TAG, "Apagamento agendado após remoção de obstáculo.");
+    } else {
+        /* Ainda há outros veículos — volta a LIGHT_ON */
+        g_fsm_state = STATE_LIGHT_ON;
+        ESP_LOGI(TAG, "Outros veículos presentes → LIGHT_ON.");
     }
 }
 

@@ -32,6 +32,21 @@
 
 
 /* ============================================================
+   MODO DE OPERAÇÃO
+   ──────────────────────────────────────────────────────────
+   MODO_LABORATORIO = 1 → bancada (mão/pessoa, ~1m, <5 km/h)
+   MODO_LABORATORIO = 0 → produção (veículos reais, >30 km/h)
+
+   Afecta automaticamente:
+     - Velocidades de fade DALI (VEL_FADE_*)
+     - Parâmetros de detecção do radar
+     - Timeout de obstáculo (OBSTACULO_MIN_FRAMES)
+     - Timeouts de apagamento
+============================================================ */
+#define MODO_LABORATORIO      1   /* 1 = bancada | 0 = produção */
+
+
+/* ============================================================
    IDENTIDADE DO POSTE
    ──────────────────────────────────────────────────────────
    Editar antes de flashar cada ESP32:
@@ -119,26 +134,34 @@
 /* ============================================================
    RADAR — PARÂMETROS DE DETECÇÃO
    ──────────────────────────────────────────────────────────
-   Ajustar conforme o modo de operação:
-
-   MODO TESTE (bancada, mão/pessoa a ~1m):
+   MODO_LABORATORIO=1 (bancada, mão/pessoa a ~1m):
      RADAR_MIN_DIST_M      0.2   aceita objectos a partir de 20cm
-     MIN_DETECT_KMH        0.5   aceita movimento muito lento
+     MIN_DETECT_KMH        0.3   aceita movimento muito lento
      AFASTAR_THRESHOLD_KMH 8.0   aceita qualquer direcção
-     OBSTACULO_MIN_FRAMES  500   desactiva detecção de obstáculo
+     OBSTACULO_MIN_FRAMES   30   obstáculo após 3s (30×100ms)
+     OBSTACULO_SPEED_MAX    1.0  mão praticamente parada
 
-   MODO PRODUÇÃO (poste real, veículos):
+   MODO_LABORATORIO=0 (produção, veículos reais):
      RADAR_MIN_DIST_M      0.5   ignora reflexões próximas
      MIN_DETECT_KMH        3.0   ignora objectos estáticos
      AFASTAR_THRESHOLD_KMH 2.0   só alvos a aproximar-se
-     OBSTACULO_MIN_FRAMES  80    obstáculo após ~8 segundos
+     OBSTACULO_MIN_FRAMES   80   obstáculo após 8s (80×100ms)
+     OBSTACULO_SPEED_MAX    3.0  veículo praticamente parado
    ──────────────────────────────────────────────────────────── */
-#define RADAR_MIN_DIST_M        0.2f  /* Distância mínima de detecção (metros)   */
-#define MIN_DETECT_KMH          0.5f  /* Velocidade mínima de detecção (km/h)    */
-#define AFASTAR_THRESHOLD_KMH   8.0f  /* Limiar de afastamento (km/h)            */
-#define OBSTACULO_MIN_FRAMES    500   /* Frames parado para activar OBSTÁCULO    */
-#define OBSTACULO_SPEED_MAX_KMH 3.0f  /* Velocidade máxima de obstáculo (km/h)   */
-#define OBSTACULO_DIST_TOL_MM   300   /* Tolerância de posição para obstáculo(mm)*/
+#if MODO_LABORATORIO
+  #define RADAR_MIN_DIST_M        0.2f
+  #define MIN_DETECT_KMH          0.3f
+  #define AFASTAR_THRESHOLD_KMH   8.0f
+  #define OBSTACULO_MIN_FRAMES    30
+  #define OBSTACULO_SPEED_MAX_KMH 1.0f
+#else
+  #define RADAR_MIN_DIST_M        0.5f
+  #define MIN_DETECT_KMH          3.0f
+  #define AFASTAR_THRESHOLD_KMH   2.0f
+  #define OBSTACULO_MIN_FRAMES    80
+  #define OBSTACULO_SPEED_MAX_KMH 3.0f
+#endif
+#define OBSTACULO_DIST_TOL_MM   300   /* Tolerância de posição para obstáculo (mm) */
 
 
 /* ============================================================
@@ -151,6 +174,32 @@
 #define LIGHT_MIN             10
 #define LIGHT_MAX             100
 #define LIGHT_SAFE_MODE       50
+
+
+/* ============================================================
+   FADE DALI — LIMIARES DE VELOCIDADE
+   ──────────────────────────────────────────────────────────
+   Modo laboratório (mão/pessoa):
+     > 3 km/h → 300ms  |  > 2 km/h → 500ms  |  > 1 km/h → 800ms
+
+   Modo produção (veículos):
+     > 80 km/h → 300ms  |  > 50 km/h → 500ms  |  > 30 km/h → 800ms
+============================================================ */
+#if MODO_LABORATORIO
+  #define VEL_FADE_RAPIDO_KMH   3.0f
+  #define VEL_FADE_MEDIO_KMH    2.0f
+  #define VEL_FADE_LENTO_KMH    1.0f
+#else
+  #define VEL_FADE_RAPIDO_KMH  80.0f
+  #define VEL_FADE_MEDIO_KMH   50.0f
+  #define VEL_FADE_LENTO_KMH   30.0f
+#endif
+
+#define FADE_UP_RAPIDO_MS     300
+#define FADE_UP_MEDIO_MS      500
+#define FADE_UP_LENTO_MS      800
+#define FADE_UP_DEFAULT_MS    500
+#define FADE_DOWN_MS          4000
 
 
 /* ============================================================
@@ -176,6 +225,13 @@
 #define T_STUCK_TIMEOUT_MS      (TRAFIC_TIMEOUT_MS * 3)
 #define OBSTACULO_REMOVE_MS     8000
 #define AUTONOMO_DELAY_MS       10000ULL
+
+/* Saúde do radar */
+#define RADAR_OK_COUNT          3     /* Frames consecutivos para recuperação */
+#define RADAR_FAIL_COUNT        50    /* Ciclos sem frame para declarar FAIL  */
+
+/* Watchdog */
+#define SYSTEM_WDT_TIMEOUT_S    30
 
 
 
@@ -214,6 +270,10 @@
 
 #if MAX_NEIGHBORS < 2 || MAX_NEIGHBORS > 8
   #error "MAX_NEIGHBORS deve estar entre 2 e 8"
+#endif
+
+#if MODO_LABORATORIO != 0 && MODO_LABORATORIO != 1
+  #error "MODO_LABORATORIO deve ser 0 (producao) ou 1 (laboratorio)"
 #endif
 
 

@@ -1,17 +1,23 @@
 /* ============================================================
-   DALI MANAGER — IMPLEMENTACAO v2.1
+   DALI MANAGER — IMPLEMENTACAO v3.0
    @file      dali_manager.c
-   @version   2.1  |  2026-04-08
+   @version   3.0  |  2026-04-29
    Projecto  : Poste Inteligente v8
    Estudantes: Luis Custodio | Tiago Moreno
    Plataforma: ESP32 (ESP-IDF v5.x)
 
-   Alterações v2.0 → v2.1:
+   Alterações v2.1 → v3.0:
    ─────────────────────────
-   - Corrigido: PRIu32 substituído por %lu + (unsigned long)
-     em dali_fade_up() e dali_fade_down().
-   - Removidas linhas comentadas duplicadas em dali_fade_down().
-   - Removido #include <inttypes.h> (não necessário sem PRIu32).
+   - dali_fade_up(): literais 80/50/30 km/h substituídos por
+     VEL_FADE_RAPIDO/MEDIO/LENTO_KMH do system_config.h.
+     Em MODO_LABORATORIO=1 usa 3/2/1 km/h (mão/pessoa).
+     Em MODO_LABORATORIO=0 usa 80/50/30 km/h (veículos).
+   - FADE_DOWN_MS: removido define local — vem do system_config.h.
+   - ADICIONADO: dali_get_brightness_real() — lê duty actual do
+     hardware LEDC durante o fade para o display mostrar em
+     tempo real a progressão da barra de brilho.
+   - dali_manager.h: #include <inttypes.h> movido para dentro
+     do guard. Adicionada declaração dali_get_brightness_real().
 ============================================================ */
 #include "dali_manager.h"
 #include "hw_config.h"
@@ -28,7 +34,7 @@ static const char *TAG = "DALI_MGR";
 #define LEDC_CHANNEL    LEDC_CHANNEL_0
 #define LEDC_TIMER      LEDC_TIMER_0
 #define LEDC_DUTY_RES   LEDC_TIMER_8_BIT
-#define FADE_DOWN_MS    4000
+/* FADE_DOWN_MS vem do system_config.h — não definir aqui */
 
 static uint8_t      s_brightness     = 0;
 static bool         s_fade_installed = false;
@@ -108,8 +114,14 @@ void dali_init(void)
 
     dali_set_brightness(LIGHT_MIN);
 
-    ESP_LOGI(TAG, "DALI v2.1 | GPIO%d | %dHz | %d%% | IEC 62386",
-             LED_PWM_PIN, LED_PWM_FREQ_HZ, LIGHT_MIN);
+    ESP_LOGI(TAG, "DALI v3.0 | GPIO%d | %dHz | %d%% | IEC 62386 | %s",
+             LED_PWM_PIN, LED_PWM_FREQ_HZ, LIGHT_MIN,
+             MODO_LABORATORIO ? "LABORATORIO" : "PRODUCAO");
+    ESP_LOGI(TAG, "Fade UP: >%.0f=300ms >%.0f=500ms >%.0f=800ms %s",
+             (double)VEL_FADE_RAPIDO_KMH,
+             (double)VEL_FADE_MEDIO_KMH,
+             (double)VEL_FADE_LENTO_KMH,
+             MODO_LABORATORIO ? "km/h (mao)" : "km/h (veiculo)");
 }
 
 /* ============================================================
@@ -143,22 +155,27 @@ void dali_safe_mode(void) { dali_set_brightness(LIGHT_SAFE_MODE); }
 
 /* ============================================================
    dali_fade_up — subida vel-dependente IEC 62386
-   Tempo de fade adaptado à velocidade do veículo:
-     >= 80 km/h → 300ms (reacção rápida, autoestrada)
-     >= 50 km/h → 500ms (estrada nacional)
-     >= 30 km/h → 800ms (zona urbana)
-     <  30 km/h → 500ms (default)
-   CORRIGIDO v2.1: PRIu32 → %lu + (unsigned long)
+   Tempo de fade adaptado à velocidade do objecto detectado.
+   Limiares definidos no system_config.h via MODO_LABORATORIO:
+
+   MODO_LABORATORIO=1 (bancada, mão/pessoa):
+     >= VEL_FADE_RAPIDO_KMH (3.0) → FADE_UP_RAPIDO_MS (300ms)
+     >= VEL_FADE_MEDIO_KMH  (2.0) → FADE_UP_MEDIO_MS  (500ms)
+     >= VEL_FADE_LENTO_KMH  (1.0) → FADE_UP_LENTO_MS  (800ms)
+     <  1.0 km/h            → FADE_UP_DEFAULT_MS (500ms)
+
+   MODO_LABORATORIO=0 (produção, veículos):
+     >= VEL_FADE_RAPIDO_KMH (80) → FADE_UP_RAPIDO_MS (300ms)
+     >= VEL_FADE_MEDIO_KMH  (50) → FADE_UP_MEDIO_MS  (500ms)
+     >= VEL_FADE_LENTO_KMH  (30) → FADE_UP_LENTO_MS  (800ms)
+     <  30 km/h             → FADE_UP_DEFAULT_MS (500ms)
 ============================================================ */
 void dali_fade_up(float vel_kmh)
 {
-    /* Se já está no máximo não faz nada — evita chamadas redundantes ao LEDC */
-    //portENTER_CRITICAL(&s_mux);
     uint8_t brilho_actual = s_brightness;
-    //portEXIT_CRITICAL(&s_mux);
 
     ESP_LOGI(TAG, "Fade UP chamado | brilho_actual=%d | LIGHT_MAX=%d | vel=%.1f",
-             brilho_actual, LIGHT_MAX, vel_kmh);  
+             brilho_actual, LIGHT_MAX, vel_kmh);
 
     if (brilho_actual >= LIGHT_MAX) {
         ESP_LOGD(TAG, "Fade UP ignorado — já em %d%%", LIGHT_MAX);
@@ -166,12 +183,12 @@ void dali_fade_up(float vel_kmh)
     }
 
     uint32_t t_ms;
-    if      (vel_kmh >= 80.0f) t_ms = 300;
-    else if (vel_kmh >= 50.0f) t_ms = 500;
-    else if (vel_kmh >= 30.0f) t_ms = 800;
-    else                       t_ms = 500;
+    if      (vel_kmh >= VEL_FADE_RAPIDO_KMH) t_ms = FADE_UP_RAPIDO_MS;
+    else if (vel_kmh >= VEL_FADE_MEDIO_KMH)  t_ms = FADE_UP_MEDIO_MS;
+    else if (vel_kmh >= VEL_FADE_LENTO_KMH)  t_ms = FADE_UP_LENTO_MS;
+    else                                       t_ms = FADE_UP_DEFAULT_MS;
 
-    ESP_LOGI(TAG, "Fade UP %.0f km/h -> %lums", vel_kmh, (unsigned long)t_ms);
+    ESP_LOGI(TAG, "Fade UP %.1f km/h → %lums", vel_kmh, (unsigned long)t_ms);
     _fade_to_pct(LIGHT_MAX, t_ms);
 }
 
@@ -210,6 +227,7 @@ void dali_fade_stop(void)
 /* ============================================================
    dali_get_brightness — thread-safe
    Retorna brilho actual protegido por spinlock.
+   Valor optimista durante fade (já tem destino, ainda a subir).
 ============================================================ */
 uint8_t dali_get_brightness(void)
 {
@@ -218,4 +236,31 @@ uint8_t dali_get_brightness(void)
     val = s_brightness;
     portEXIT_CRITICAL(&s_mux);
     return val;
+}
+
+/* ============================================================
+   dali_get_brightness_real — valor real do hardware LEDC
+   ──────────────────────────────────────────────────────────
+   Lê o duty cycle actual do periférico LEDC e converte para
+   percentagem. Reflecte o valor instantâneo durante o fade —
+   não o valor de destino optimista de s_brightness.
+
+   Usar no system_monitor para actualizar a barra DALI no
+   display em tempo real durante fade up e fade down:
+     t=0ms    barra: 10%   (início do fade)
+     t=200ms  barra: 32%   (a subir)
+     t=400ms  barra: 58%
+     t=800ms  barra: 100%  (fim do fade)
+============================================================ */
+uint8_t dali_get_brightness_real(void)
+{
+    if (!s_fade_installed) return s_brightness;
+
+    uint32_t duty = ledc_get_duty(DALI_LEDC_MODE, LEDC_CHANNEL);
+    uint8_t  pct  = (uint8_t)((duty * 100U + 127U) / 255U);
+
+    if (pct < LIGHT_MIN) pct = LIGHT_MIN;
+    if (pct > LIGHT_MAX) pct = LIGHT_MAX;
+
+    return pct;
 }

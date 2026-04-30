@@ -64,6 +64,22 @@ void fsm_agendar_apagar(void)
     g_fsm_last_detect_ms = fsm_agora_ms();
 }
 
+/* ============================================================
+   fsm_obstaculo_keepalive
+   ──────────────────────────────────────────────────────────
+   Chamada pela fsm_task a cada 100ms enquanto o tracking_manager
+   ainda tem um slot com obstaculo_frames >= OBSTACULO_MIN_FRAMES.
+   Mantém g_fsm_obstaculo_last_ms actualizado para que o passo 8
+   do fsm_timer só actue quando o radar DEIXAR de detectar o
+   obstáculo — não enquanto ele está fisicamente presente.
+============================================================ */
+void fsm_obstaculo_keepalive(void)
+{
+    if (g_fsm_state == STATE_OBSTACULO) {
+        g_fsm_obstaculo_last_ms = fsm_agora_ms();
+    }
+}
+
 void fsm_verificar_radar(bool teve_frame, bool comm_ok)
 {
     if (teve_frame) {

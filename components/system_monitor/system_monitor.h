@@ -86,7 +86,7 @@ typedef enum {
    10 segundos: cobre o pior caso de inicialização (WiFi + DHCP).
    Após inicialização, monitor_task alimenta WDT a cada 200ms.
 ============================================================ */
-#define SYSTEM_WDT_TIMEOUT_S    10
+//#define SYSTEM_WDT_TIMEOUT_S    10
 
 
 /* ============================================================
