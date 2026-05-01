@@ -28,8 +28,7 @@
 /* ============================================================
    CONSTANTES INTERNAS
 ============================================================ */
-#define RADAR_FAIL_COUNT    50      /* ciclos sem frame para declarar FAIL */
-#define RADAR_OK_COUNT       3      /* frames consecutivos para recuperação */
+
 #define MASTER_CLAIM_HB_MS  30000ULL
 
 /* ============================================================

@@ -136,19 +136,35 @@ bool comm_status_ok(void)
     if ((agora - s_init_ms) < (uint64_t)AUTONOMO_DELAY_MS)
         return true;
 
-    /* Verifica se há pelo menos um vizinho operacional */
+    /* ── CORRECÇÃO: poste isolado (fim de linha ou único) ── */
+    /* Se não há vizinho teórico configurado à esquerda nem à direita,
+       este poste opera sozinho — comm_ok deve ser true se UDP activo. */
+    bool tem_vizinho_teorico_esq = (POST_POSITION > 0);
+    bool tem_vizinho_teorico_dir = false; /* descoberto dinamicamente */
+
+    /* Verifica se algum vizinho foi alguma vez descoberto */
     neighbor_t *viz_esq = udp_manager_get_neighbor_by_pos(POST_POSITION - 1);
     neighbor_t *viz_dir = udp_manager_get_neighbor_by_pos(POST_POSITION + 1);
+
+    bool algum_conhecido = (viz_esq && viz_esq->active) ||
+                           (viz_dir && viz_dir->active);
+
+    /* Se nunca descobriu vizinhos E a posição indica que pode estar isolado,
+       considera comm_ok — o UDP está activo mesmo sem vizinhos.
+       Isto evita que um poste único em teste entre em AUTONOMO desnecessariamente. */
+    if (!algum_conhecido && !tem_vizinho_teorico_esq) {
+        /* POST_POSITION == 0 sem vizinhos descobertos = poste único ou MASTER isolado */
+        return true;
+    }
 
     bool tem_operacional = _vizinho_operacional(viz_esq) ||
                            _vizinho_operacional(viz_dir);
 
-    if (!tem_operacional)
-        ESP_LOGD(TAG, "comm_status_ok: sem vizinhos operacionais");
+    if (!tem_operacional && algum_conhecido)
+        ESP_LOGD(TAG, "comm_status_ok: vizinhos conhecidos mas não operacionais");
 
-    return tem_operacional;
+    return tem_operacional || !algum_conhecido;
 }
-
 
 /* ============================================================
    comm_is_master

@@ -57,15 +57,15 @@
    ATENÇÃO: POST_POSITION deve ser único e sequencial.
             POSTE_ID     deve ser único em toda a rede.
 ============================================================ */
-#define POSTE_ID              4
-#define POSTE_NAME            "POSTE 04"
-#define POST_POSITION         3
+#define POSTE_ID              1
+#define POSTE_NAME            "POSTE 01"
+#define POST_POSITION         0
 
 
 /* ============================================================
    DISPLAY — RESOLUÇÃO VERTICAL
 ============================================================ */
-#define LCD_V_RES_CONFIG    240  /* 240 = ecrã 240×240 | 320 = ecrã 240×320 */
+#define LCD_V_RES_CONFIG    320  /* 240 = ecrã 240×240 | 320 = ecrã 240×320 */
 
 
 /* ============================================================

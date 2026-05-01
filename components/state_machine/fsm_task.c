@@ -319,6 +319,12 @@ static void fsm_task(void *arg)
 
     /* Limpa backlog UART acumulado durante o arranque */
     radar_flush_rx();
+    g_fsm_radar_fail_cnt = 0;
+    g_fsm_radar_ok_cnt   = 0;
+    g_fsm_radar_ok       = true;   /* presume OK até prova em contrário */
+    if (g_fsm_state == STATE_SAFE_MODE)
+        g_fsm_state = STATE_IDLE;
+    
     ESP_LOGI(TAG, "fsm_task v5.1 activa — pipeline radar real");
 
     while (1) {
