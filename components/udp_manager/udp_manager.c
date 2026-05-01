@@ -57,8 +57,7 @@ static const char *_status_str(neighbor_status_t s)
     switch (s) {
         case NEIGHBOR_OK:        return "OK";
         case NEIGHBOR_OFFLINE:   return "OFFLINE";
-        case NEIGHBOR_FAIL:      return "FAIL";
-        case NEIGHBOR_SAFE:      return "SAFE";
+        case NEIGHBOR_SAFE:      return "SAFE";   /* radar em falha — poste cego */
         case NEIGHBOR_AUTO:      return "AUTO";
         case NEIGHBOR_OBSTACULO: return "OBST";
         default:                 return "?";
@@ -70,8 +69,8 @@ static neighbor_status_t _str_para_status(const char *s)
 {
     if (!s)                    return NEIGHBOR_OFFLINE;
     if (!strcmp(s, "OK"))      return NEIGHBOR_OK;
-    if (!strcmp(s, "FAIL"))    return NEIGHBOR_FAIL;
     if (!strcmp(s, "SAFE"))    return NEIGHBOR_SAFE;
+    if (!strcmp(s, "FAIL"))    return NEIGHBOR_SAFE;   /* legado v5.1 → SAFE */
     if (!strcmp(s, "AUTO"))    return NEIGHBOR_AUTO;
     if (!strcmp(s, "OBST"))    return NEIGHBOR_OBSTACULO;
     return NEIGHBOR_OFFLINE;

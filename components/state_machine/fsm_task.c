@@ -285,7 +285,18 @@ static void fsm_aplicar_luz(void)
     }
 
     s_ultimo_estado = estado_actual;
-    ESP_LOGD(TAG, "Luz: %s", state_machine_get_state_name());
+
+    const char *descricao = "";
+    switch (estado_actual) {
+        case STATE_LIGHT_ON:  descricao = "→ LUZ ON (objecto detectado)";  break;
+        case STATE_OBSTACULO: descricao = "→ LUZ MÁXIMA (obstáculo parado)"; break;
+        case STATE_SAFE_MODE: descricao = "→ LUZ 50% (radar em falha)";    break;
+        case STATE_AUTONOMO:  descricao = "→ LUZ OFF (modo autónomo)";     break;
+        case STATE_MASTER:    descricao = "→ LUZ OFF (master, aguarda)";   break;
+        case STATE_IDLE:      descricao = "→ LUZ OFF (repouso)";           break;
+        default: break;
+    }
+    ESP_LOGI(TAG, "[DALI] %s", descricao);
 }
 
 
@@ -305,7 +316,7 @@ static void fsm_aplicar_luz(void)
 ============================================================ */
 static void fsm_task(void *arg)
 {
-    ESP_LOGI(TAG, "fsm_task | Core %d | Prio 6 | a aguardar estabilização do radar (6s)...",
+    ESP_LOGI(TAG, "fsm_task | Core %d | Prio 6 | a aguardar radar (6s)...",
              xPortGetCoreID());
 
     /* ── Arranque: aguarda estabilização do HLK-LD2450 ──────────
@@ -325,7 +336,7 @@ static void fsm_task(void *arg)
     if (g_fsm_state == STATE_SAFE_MODE)
         g_fsm_state = STATE_IDLE;
     
-    ESP_LOGI(TAG, "fsm_task v5.1 activa — pipeline radar real");
+    ESP_LOGI(TAG, "[SISTEMA] FSM activa — modo hardware real");
 
     while (1) {
 

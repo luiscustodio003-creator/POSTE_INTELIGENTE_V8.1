@@ -23,12 +23,11 @@
    ESTADO DE VIZINHOS
 ============================================================ */
 typedef enum {
-    NEIGHBOR_OK        = 0,
-    NEIGHBOR_OFFLINE   = 1,
-    NEIGHBOR_FAIL      = 2,
-    NEIGHBOR_SAFE      = 3,
-    NEIGHBOR_AUTO      = 4,
-    NEIGHBOR_OBSTACULO = 5,
+    NEIGHBOR_OK        = 0,  /* Online e operacional                  */
+    NEIGHBOR_OFFLINE   = 1,  /* Sem resposta (timeout)                */
+    NEIGHBOR_SAFE      = 2,  /* Radar em falha — poste cego           */
+    NEIGHBOR_AUTO      = 3,  /* Modo autónomo (sem vizinhos)          */
+    NEIGHBOR_OBSTACULO = 4,  /* Obstáculo estático detectado          */
 } neighbor_status_t;
 
 

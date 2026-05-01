@@ -1,7 +1,7 @@
 /* ============================================================
    MÓDULO     : fsm_network
    FICHEIRO   : fsm_network.c — Gestão de rede da FSM
-   VERSÃO     : 2.7  |  2026-05-01
+   VERSÃO     : 2.8  |  2026-05-01
    PROJECTO   : Poste Inteligente v8
    AUTORES    : Luis Custódio | Tiago Moreno
    PLATAFORMA : ESP32 (ESP-IDF v5.x)
@@ -21,16 +21,13 @@
    MASTER     → radar OK + WiFi OK + vizinhos OK + primeiro da cadeia
    IDLE       → radar OK + WiFi OK + vizinhos OK + não é primeiro
 
-   CORRECÇÕES v2.6 → v2.7:
+   CORRECÇÕES v2.6 → v2.8:
    ─────────────────────────
-   - CORRIGIDO: AUTONOMO agora activa quando radar OK + WiFi OK
-     mas sem vizinhos descobertos na rede — estado normal de um
-     poste único em teste ou primeiro arranque da cadeia.
-   - CORRIGIDO: AUTONOMO já NÃO activa por comm_ok=false (WiFi falhou).
-     WiFi em falha real → AUTONOMO apenas se radar OK.
-   - CORRIGIDO: Saída de AUTONOMO quando vizinhos aparecem na rede.
-   - MANTIDO: SAFE_MODE exclusivo para falha física do radar.
-   - MANTIDO: lógica de vizinho esquerdo offline → MASTER temporário.
+   - CORRIGIDO v2.7: AUTONOMO agora activa quando radar OK + WiFi OK
+     mas sem vizinhos descobertos na rede.
+   - CORRIGIDO v2.8: SAFE_MODE não activa quando há veículos activos
+     (T>0 ou Tc>0) — tráfego activo prova que o radar está funcional
+     mesmo que o contador de falhas tenha atingido o limite.
 ============================================================ */
 
 #include "fsm_network.h"
@@ -143,8 +140,16 @@ void fsm_network_estados_degradados(bool comm_ok, bool is_master)
        Condição exclusiva: g_fsm_radar_ok = false.
        Não interessa WiFi nem vizinhos.
        Luz fica a LIGHT_SAFE_MODE (50%) via fsm_aplicar_luz().
+
+       CORRECÇÃO v2.8: Se há veículos activos (T>0 ou Tc>0),
+       o radar está claramente a funcionar — não entra em SAFE_MODE.
+       O HLK-LD2450 pode perder alvos estáticos temporariamente
+       mas o tracking confirma que o sensor está operacional.
     ────────────────────────────────────────────────────────── */
     if (!g_fsm_radar_ok) {
+        /* Se há tráfego activo, o radar está a funcionar — ignora */
+        if (g_fsm_T > 0 || g_fsm_Tc > 0) return;
+
         if (g_fsm_state != STATE_SAFE_MODE) {
             g_fsm_state = STATE_SAFE_MODE;
             /* dali_safe_mode() NÃO é chamado aqui — responsabilidade

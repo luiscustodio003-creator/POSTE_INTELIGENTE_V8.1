@@ -98,43 +98,75 @@ static void _monitor_task(void *arg)
 
 void system_monitor_start(void)
 {
-    ESP_LOGI(TAG, "╔═══════════════════════════════════╗");
-    ESP_LOGI(TAG, "║  Poste Inteligente v8 | %-10s║", POSTE_NAME);
-    ESP_LOGI(TAG, "╚═══════════════════════════════════╝");
+    /* ── Banner principal ── */
+    printf("\n");
+    printf("╔═══════════════════════════════════════╗\n");
+    printf("║    Poste Inteligente v8  |  %-9s  ║\n", POSTE_NAME);
+    printf("╠═══════════════════════════════════════╣\n");
+    printf("║  Projecto: Luis Custodio | T. Moreno  ║\n");
+    printf("╚═══════════════════════════════════════╝\n");
+    printf("\n");
 
+    /* ── [1] Identidade ── */
     post_config_init();
-    ESP_LOGI(TAG, "[1] ID=%d %s pos=%d",
-             post_get_id(), post_get_name(), POST_POSITION);
+    printf("┌───────────────────────────────────────┐\n");
+    printf("│ [1] ID: %-2d  Nome: %-12s  Pos: %d │\n",
+           post_get_id(), post_get_name(), POST_POSITION);
+    printf("└───────────────────────────────────────┘\n");
 
+    /* ── [2] Hardware ── */
     dali_init();
     dali_set_brightness(LIGHT_MIN);
     radar_init(RADAR_MODE_UART);
     int baud = radar_auto_detect_baud();
-    ESP_LOGI(TAG, "[2] Radar UART baud=%d | DALI min=%d%%", baud, LIGHT_MIN);
+    printf("┌───────────────────────────────────────┐\n");
+    printf("│ [2] Radar  UART  baud=%-6d           │\n", baud);
+    printf("│     DALI   GPIO26  min=%d%%              │\n", LIGHT_MIN);
+    printf("└───────────────────────────────────────┘\n");
     radar_diagnostic();
 
+    /* ── [3] Display ── */
     display_manager_init();
-    ESP_LOGI(TAG, "[3] Display OK");
+    printf("┌───────────────────────────────────────┐\n");
+    printf("│ [3] Display  ST7789  OK               │\n");
+    printf("└───────────────────────────────────────┘\n");
 
+    /* ── [4] FSM ── */
     state_machine_init();
-    ESP_LOGI(TAG, "[4] FSM OK");
+    printf("┌───────────────────────────────────────┐\n");
+    printf("│ [4] FSM  inicializada                 │\n");
+    printf("└───────────────────────────────────────┘\n");
 
+    /* ── [5] WiFi ── */
     wifi_manager_init();
-    ESP_LOGI(TAG, "[5] WiFi STA iniciado");
+    printf("┌───────────────────────────────────────┐\n");
+    printf("│ [5] WiFi  STA  SSID: %-16s │\n", WIFI_SSID);
+    printf("└───────────────────────────────────────┘\n");
 
+    /* ── [6] Tasks ── */
     state_machine_task_start();
     radar_manager_task_start();
     display_manager_task_start();
     udp_manager_task_start();
-    ESP_LOGI(TAG, "[6] Tasks criadas");
+    printf("┌───────────────────────────────────────┐\n");
+    printf("│ [6] Tasks criadas                     │\n");
+    printf("│     FSM    Core1  Prio6  100ms        │\n");
+    printf("│     RADAR  Core0  Prio6  100ms        │\n");
+    printf("│     DISP   Core0  Prio4   20ms        │\n");
+    printf("│     UDP    Core0  Prio5   10ms        │\n");
+    printf("└───────────────────────────────────────┘\n");
 
+    /* ── [7] Watchdog ── */
     esp_task_wdt_config_t wdt_cfg = {
         .timeout_ms     = SYSTEM_WDT_TIMEOUT_S * 1000,
         .idle_core_mask = 0,
         .trigger_panic  = true,
     };
     esp_task_wdt_reconfigure(&wdt_cfg);
-    ESP_LOGI(TAG, "[7] WDT %ds | Sistema operacional", SYSTEM_WDT_TIMEOUT_S);
+    printf("┌───────────────────────────────────────┐\n");
+    printf("│ [7] WDT %-2ds  Sistema operacional      │\n", SYSTEM_WDT_TIMEOUT_S);
+    printf("╘═══════════════════════════════════════╛\n");
+    printf("\n");
 
     xTaskCreatePinnedToCore(_monitor_task, "monitor_task",
                             3072, NULL, 7, NULL, 1);

@@ -156,32 +156,29 @@ void sm_process_event(sm_event_type_t type, uint16_t vehicle_id,
            NÃO envia TC_INC — só EVT_LOCAL propaga na cadeia.
            NÃO chama dali — fsm_aplicar_luz() trata no ciclo seguinte. */
         case SM_EVT_VEHICLE_DETECTED:
-            ESP_LOGI(TAG, "[EVT] DETECTED id=%u vel=%.0f", vehicle_id, vel);
+            ESP_LOGI(TAG, "[DETECÇÃO] Objecto a %.1fm | %.1f km/h",
+                     (float)eta_ms / 1000.0f > 0.1f ? (float)eta_ms / 1000.0f : 0.5f,
+                     vel > 0.3f ? vel : 0.3f);
 
-            /* Recuperação de modo AUTONOMO se rede voltou */
             if (g_fsm_state == STATE_AUTONOMO &&
                 (g_fsm_right_online || comm_left_online())) {
                 g_fsm_state = STATE_IDLE;
-                ESP_LOGI(TAG, "Rede OK durante deteccao — saiu de AUTONOMO");
             }
 
             g_fsm_apagar_pend    = false;
             g_fsm_last_detect_ms = fsm_agora_ms();
             g_fsm_last_speed     = vel;
 
-            /* Agenda pré-acendimento baseado no ETA */
             if (eta_ms > MARGEM_ACENDER_MS)
                 g_fsm_acender_em_ms = fsm_agora_ms() + (uint64_t)(eta_ms - MARGEM_ACENDER_MS);
             else
                 g_fsm_acender_em_ms = fsm_agora_ms();
 
-            /* Muda estado — fsm_aplicar_luz() aplica dali no ciclo seguinte */
             if (g_fsm_state == STATE_IDLE   ||
                 g_fsm_state == STATE_MASTER ||
                 g_fsm_state == STATE_AUTONOMO) {
                 g_fsm_state = STATE_LIGHT_ON;
             }
-            /* SEM T++ aqui. SEM TC_INC aqui. SEM dali aqui. */
             break;
 
 
@@ -191,28 +188,24 @@ void sm_process_event(sm_event_type_t type, uint16_t vehicle_id,
            TC_INC é enviado UMA VEZ — para o vizinho direito.
            NÃO chama dali — fsm_aplicar_luz() trata no ciclo seguinte. */
         case SM_EVT_VEHICLE_LOCAL:
-            ESP_LOGI(TAG, "[EVT] LOCAL id=%u vel=%.0f T=%d Tc=%d",
-                     vehicle_id, vel, g_fsm_T, g_fsm_Tc);
+            ESP_LOGI(TAG, "[LUZ ON] Objecto confirmado | %.1f km/h | T=%d",
+                     vel, g_fsm_T + 1);
 
             g_fsm_acender_em_ms  = 0;
             g_fsm_apagar_pend    = false;
             g_fsm_last_speed     = vel;
             g_fsm_last_detect_ms = fsm_agora_ms();
 
-            /* Handover: veículo deixa de ser "esperado" (Tc) e passa a "local" (T) */
             if (g_fsm_Tc > 0) g_fsm_Tc--;
             if (g_fsm_T < MAX_RADAR_TARGETS) g_fsm_T++;
 
-            /* Muda estado — fsm_aplicar_luz() aplica dali no ciclo seguinte */
             if (g_fsm_state != STATE_LIGHT_ON &&
                 g_fsm_state != STATE_OBSTACULO) {
                 g_fsm_state = STATE_LIGHT_ON;
             }
 
-            /* Confirma ao poste esquerdo que o veículo chegou → T-- no viz.esq. */
             comm_notify_prev_passed(vel);
 
-            /* Propaga para vizinho direito — 1 TC_INC por veículo */
             if (g_fsm_right_online) {
                 comm_send_tc_inc(vel, x_mm);
                 comm_send_spd(vel, x_mm);
@@ -220,37 +213,28 @@ void sm_process_event(sm_event_type_t type, uint16_t vehicle_id,
             break;
 
 
-        /* ── PASSED — veículo saiu da zona do radar ────────────
-           Responsabilidade: decrementar T, avisar vizinhos, apagar.
-           Apagamento só acontece quando T==0 AND Tc==0.          */
         case SM_EVT_VEHICLE_PASSED:
-            ESP_LOGI(TAG, "[EVT] PASSED id=%u | T=%d Tc=%d",
-                     vehicle_id, g_fsm_T, g_fsm_Tc);
+            ESP_LOGI(TAG, "[SAÍDA] Objecto saiu | T=%d → LUZ OFF em %ds",
+                     g_fsm_T > 0 ? g_fsm_T - 1 : 0, TRAFIC_TIMEOUT_MS / 1000);
 
             g_fsm_acender_em_ms = 0;
 
             if (g_fsm_T > 0) g_fsm_T--;
 
-            /* Envia SPD ao vizinho direito para afinar ETA (sem TC_INC) */
             if (g_fsm_right_online)
                 comm_send_spd(vel, x_mm);
 
-            /* Agenda apagamento — fsm_timer só actua quando T==0 e Tc==0 */
             if (g_fsm_T == 0 && g_fsm_Tc == 0)
                 fsm_agendar_apagar();
             break;
 
 
-        /* ── OBSTACULO — veículo parado na zona do radar ───────
-           Responsabilidade: mudar estado, cancelar Tc no vizinho.
-           NÃO chama dali — fsm_aplicar_luz() trata no ciclo seguinte. */
         case SM_EVT_VEHICLE_OBSTACULO:
-            ESP_LOGW(TAG, "[EVT] OBSTACULO id=%u vel=%.0f", vehicle_id, vel);
+            ESP_LOGW(TAG, "[OBSTÁCULO] Objecto parado | LUZ MÁXIMA");
 
             g_fsm_obstaculo_last_ms = fsm_agora_ms();
 
             if (g_fsm_state != STATE_OBSTACULO) {
-                /* Cancela Tc no vizinho direito — este veículo não vai chegar */
                 comm_notify_prev_passed(vel);
                 g_fsm_state = STATE_OBSTACULO;
             }

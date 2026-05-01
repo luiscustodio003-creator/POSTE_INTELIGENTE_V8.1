@@ -70,7 +70,7 @@ static const char *TAG = "RADAR_TASK";
 ============================================================ */
 static void radar_task(void *arg)
 {
-    ESP_LOGI(TAG, "radar_task | Core %d | Prio 5 | 100ms | radar real",
+    ESP_LOGI(TAG, "radar_task | Core %d | Prio 6 | 100ms | radar real",
              xPortGetCoreID());
 
     while (1) {
@@ -110,12 +110,18 @@ static void radar_task(void *arg)
 /* ============================================================
    radar_manager_task_start
    ─────────────────────────
-   @brief Cria a radar_task no Core 0, Prio 5.
+   @brief Cria a radar_task no Core 0, Prio 6.
+
+   Prioridade 6 (igual à fsm_task) garante que a radar_task
+   não é preemptada pela stack WiFi durante retries de ligação.
+   Com Prio 5, o driver WiFi (Prio 23) causava starvation de
+   até 1s, acumulando falhas no g_fsm_radar_fail_cnt e
+   provocando entradas falsas em SAFE_MODE.
 
    Deve ser chamado APÓS state_machine_task_start() para garantir
    que o tracking_manager está inicializado antes do primeiro frame.
 
-   Pinagem no Core 0 evita preempção com a fsm_task (Core 1).
+   Pinagem no Core 0 evita contenção com a fsm_task (Core 1).
 ============================================================ */
 void radar_manager_task_start(void)
 {
@@ -124,10 +130,10 @@ void radar_manager_task_start(void)
         "radar_task",
         4096,
         NULL,
-        5,
+        6,              /* Prio 6 — protege contra starvation do WiFi */
         NULL,
-        0   /* Core 0 — PRO_CPU */
+        0               /* Core 0 — PRO_CPU */
     );
 
-    ESP_LOGI(TAG, "radar_task v5.0 | Core 0 | Prio 6 | Stack 4096B");
+    ESP_LOGI(TAG, "radar_task v5.1 | Core 0 | Prio 6 | Stack 4096B");
 }
