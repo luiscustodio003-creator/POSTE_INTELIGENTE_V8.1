@@ -187,8 +187,7 @@ bool comm_is_master(void)
 
     /* Assume MASTER se vizinho esq. está ausente ou não operacional */
     if (viz_esq->status == NEIGHBOR_OFFLINE ||
-        viz_esq->status == NEIGHBOR_SAFE    ||
-        viz_esq->status == NEIGHBOR_FAIL) {
+        viz_esq->status == NEIGHBOR_SAFE) {
         return true;
     }
 
