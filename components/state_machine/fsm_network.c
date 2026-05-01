@@ -1,7 +1,7 @@
 /* ============================================================
    MÓDULO     : fsm_network
    FICHEIRO   : fsm_network.c — Gestão de rede da FSM
-   VERSÃO     : 2.6  |  2026-04-30
+   VERSÃO     : 2.7  |  2026-05-01
    PROJECTO   : Poste Inteligente v8
    AUTORES    : Luis Custódio | Tiago Moreno
    PLATAFORMA : ESP32 (ESP-IDF v5.x)
@@ -13,15 +13,24 @@
    - Transições para estados degradados (SAFE_MODE, AUTONOMO)
    - Inteligência topológica dinâmica (abstração de N postes)
 
-   CORRECÇÕES v2.5 → v2.6:
+   LÓGICA DE ESTADOS DEGRADADOS (v2.7):
+   ──────────────────────────────────────
+   SAFE_MODE  → radar em FALHA física (independente de WiFi/vizinhos)
+   AUTONOMO   → radar OK + WiFi OK + sem vizinhos conhecidos na rede
+                Opera localmente: detecta e acende, não propaga TC_INC
+   MASTER     → radar OK + WiFi OK + vizinhos OK + primeiro da cadeia
+   IDLE       → radar OK + WiFi OK + vizinhos OK + não é primeiro
+
+   CORRECÇÕES v2.6 → v2.7:
    ─────────────────────────
-   - REMOVIDO: dali_set_brightness(LIGHT_SAFE_MODE) em
-     fsm_network_estados_degradados().
-     Este módulo NÃO chama hardware directamente.
-     A transição para STATE_SAFE_MODE é detectada por
-     fsm_aplicar_luz() em fsm_task.c que chama dali_safe_mode()
-     no ciclo seguinte de 100ms.
-   - REMOVIDO: #include "dali_manager.h" — já não necessário.
+   - CORRIGIDO: AUTONOMO agora activa quando radar OK + WiFi OK
+     mas sem vizinhos descobertos na rede — estado normal de um
+     poste único em teste ou primeiro arranque da cadeia.
+   - CORRIGIDO: AUTONOMO já NÃO activa por comm_ok=false (WiFi falhou).
+     WiFi em falha real → AUTONOMO apenas se radar OK.
+   - CORRIGIDO: Saída de AUTONOMO quando vizinhos aparecem na rede.
+   - MANTIDO: SAFE_MODE exclusivo para falha física do radar.
+   - MANTIDO: lógica de vizinho esquerdo offline → MASTER temporário.
 ============================================================ */
 
 #include "fsm_network.h"
@@ -116,13 +125,25 @@ void fsm_network_master(bool comm_ok, bool is_master)
 
 /* ============================================================
    fsm_network_estados_degradados — Passo 11
-   Gestão de SAFE_MODE e AUTONOMO com inteligência topológica.
+   ──────────────────────────────────────────────────────────
+   Prioridade das transições (ordem decrescente):
+
+     1. SAFE_MODE  — radar falhou → luz a 50%, ignora tudo o resto
+     2. AUTONOMO   — radar OK + WiFi OK + sem vizinhos conhecidos
+                     Opera localmente sem coordenação UDP
+     3. MASTER/IDLE — rede completa, coordenação normal
+
+   NOTA: AUTONOMO não é uma degradação — é o estado normal de
+   um poste isolado ou único em teste. Quando vizinhos aparecem,
+   o poste transita automaticamente para MASTER ou IDLE.
 ============================================================ */
 void fsm_network_estados_degradados(bool comm_ok, bool is_master)
 {
-    uint64_t agora = fsm_agora_ms();
-
-    /* ── 1. GESTÃO DO SAFE MODE (Falha Crítica de Hardware) ──── */
+    /* ── 1. SAFE MODE — falha física do radar ──────────────────
+       Condição exclusiva: g_fsm_radar_ok = false.
+       Não interessa WiFi nem vizinhos.
+       Luz fica a LIGHT_SAFE_MODE (50%) via fsm_aplicar_luz().
+    ────────────────────────────────────────────────────────── */
     if (!g_fsm_radar_ok) {
         if (g_fsm_state != STATE_SAFE_MODE) {
             g_fsm_state = STATE_SAFE_MODE;
@@ -130,59 +151,82 @@ void fsm_network_estados_degradados(bool comm_ok, bool is_master)
                de fsm_aplicar_luz() em fsm_task.c no ciclo seguinte. */
             ESP_LOGE(TAG, "SAFE MODE: Falha crítica no Radar.");
         }
+        return; /* Não avalia mais nada enquanto radar falhar */
+    }
+
+    /* Recuperação de SAFE MODE quando radar volta */
+    if (g_fsm_state == STATE_SAFE_MODE) {
+        /* Sai para AUTONOMO — vizinhos são avaliados no próximo bloco */
+        g_fsm_state = STATE_AUTONOMO;
+        g_fsm_sem_vizinho_ms = 0;
+        ESP_LOGI(TAG, "Recuperação SAFE MODE → AUTONOMO (radar OK)");
+    }
+
+    /* ── 2. AUTONOMO — radar OK + sem vizinhos conhecidos ──────
+       AUTONOMO é o estado normal quando:
+         - Poste único em teste (sem outros postes na rede)
+         - Primeiro arranque antes dos vizinhos responderem
+         - WiFi ligado mas sem outros postes UDP na rede
+
+       Saída de AUTONOMO: quando pelo menos um vizinho é descoberto.
+       Entrada em AUTONOMO: quando não há vizinhos conhecidos.
+
+       NOTA: WiFi em falha real (comm_ok=false) também mantém
+       AUTONOMO — o poste continua a detectar e acender localmente.
+    ────────────────────────────────────────────────────────── */
+    bool tem_vizinho_esq = comm_left_known();
+    bool tem_vizinho_dir = comm_right_known();
+    bool tem_vizinhos    = tem_vizinho_esq || tem_vizinho_dir;
+
+    if (!tem_vizinhos) {
+        /* Sem vizinhos conhecidos → AUTONOMO (radar OK garantido aqui) */
+        if (g_fsm_state != STATE_AUTONOMO  &&
+            g_fsm_state != STATE_LIGHT_ON  &&
+            g_fsm_state != STATE_OBSTACULO) {
+            g_fsm_state = STATE_AUTONOMO;
+            ESP_LOGI(TAG, "AUTONOMO: Radar OK, WiFi OK, sem vizinhos na rede.");
+        }
         return;
     }
 
-    /* Recuperação de SAFE MODE */
-    if (g_fsm_state == STATE_SAFE_MODE && g_fsm_radar_ok) {
+    /* ── 3. Vizinhos presentes — avalia saúde da rede ──────────
+       Chegamos aqui apenas quando há pelo menos um vizinho
+       conhecido. Avalia se estão operacionais.
+    ────────────────────────────────────────────────────────── */
+
+    /* Saída de AUTONOMO quando vizinhos aparecem */
+    if (g_fsm_state == STATE_AUTONOMO) {
         g_fsm_state = is_master ? STATE_MASTER : STATE_IDLE;
-        ESP_LOGI(TAG, "Recuperação: Radar OK. Saída para %s.", state_machine_get_state_name());
+        g_fsm_sem_vizinho_ms = 0;
+        ESP_LOGI(TAG, "Vizinhos descobertos: saída de AUTONOMO → %s",
+                 state_machine_get_state_name());
+        return;
     }
 
-    /* ── 2. GESTÃO DO MODO AUTÓNOMO (Lógica Dinâmica de Topologia) ─── */
+    /* Vizinho direito conhecido mas não operacional → timeout → AUTONOMO */
+    bool vizinho_dir_operacional = comm_right_online();
+    bool falta_vizinho_dir = tem_vizinho_dir && !vizinho_dir_operacional;
 
-    /*
-     * Inteligência de Fim de Linha:
-     * Verificamos se o comm_manager conhece um vizinho à direita.
-     * Se comm_right_known() for false, este poste é o fim da linha (N).
-     * A ausência de vizinho direito só é erro se houver um vizinho configurado.
-     */
-    bool tem_vizinho_teorico_dir   = comm_right_known();
-    bool falta_vizinho_obrigatorio = (tem_vizinho_teorico_dir && !comm_right_online());
-
-    /* CONDIÇÃO: Falha de WiFi OU perda de um vizinho que deveria existir */
-    if (!comm_ok || falta_vizinho_obrigatorio) {
-
-        if (!comm_ok) {
-            /* Falha total de WiFi: todos os postes passam a modo isolado */
-            if (g_fsm_state != STATE_AUTONOMO   &&
-                g_fsm_state != STATE_LIGHT_ON   &&
+    if (falta_vizinho_dir || !comm_ok) {
+        uint64_t agora = fsm_agora_ms();
+        if (g_fsm_sem_vizinho_ms == 0) {
+            g_fsm_sem_vizinho_ms = agora;
+            ESP_LOGW(TAG, "Vizinho dir. não responde — timeout em %llus",
+                     (unsigned long long)(AUTONOMO_DELAY_MS / 1000ULL));
+        }
+        if ((agora - g_fsm_sem_vizinho_ms) > AUTONOMO_DELAY_MS) {
+            if (g_fsm_state != STATE_AUTONOMO  &&
+                g_fsm_state != STATE_LIGHT_ON  &&
                 g_fsm_state != STATE_OBSTACULO) {
                 g_fsm_state = STATE_AUTONOMO;
-                ESP_LOGW(TAG, "Modo AUTÓNOMO: Falha na stack WiFi.");
+                ESP_LOGW(TAG, "AUTONOMO: Vizinho dir. sem resposta após %llus.",
+                         (unsigned long long)(AUTONOMO_DELAY_MS / 1000ULL));
             }
         }
-        else {
-            /* Falha de vizinho: apenas para postes intermédios configurados */
-            if (g_fsm_sem_vizinho_ms == 0) g_fsm_sem_vizinho_ms = agora;
-
-            if ((agora - g_fsm_sem_vizinho_ms) > AUTONOMO_DELAY_MS) {
-                if (g_fsm_state != STATE_AUTONOMO   &&
-                    g_fsm_state != STATE_LIGHT_ON   &&
-                    g_fsm_state != STATE_OBSTACULO) {
-                    g_fsm_state = STATE_AUTONOMO;
-                    ESP_LOGW(TAG, "Modo AUTÓNOMO: Vizinho direito configurado não responde.");
-                }
-            }
-        }
-    }
-    else {
-        /* Reset do timer se a rede estabilizou ou último poste (sem vizinho teórico) */
-        g_fsm_sem_vizinho_ms = 0;
-
-        if (g_fsm_state == STATE_AUTONOMO) {
-            g_fsm_state = is_master ? STATE_MASTER : STATE_IDLE;
-            ESP_LOGI(TAG, "Rede OK: Saída de modo AUTÓNOMO.");
+    } else {
+        /* Rede estável — reset do timer de vizinho em falta */
+        if (g_fsm_sem_vizinho_ms != 0) {
+            g_fsm_sem_vizinho_ms = 0;
         }
     }
 }

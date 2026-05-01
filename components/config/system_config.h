@@ -228,7 +228,7 @@
 
 /* Saúde do radar */
 #define RADAR_OK_COUNT          3     /* Frames consecutivos para recuperação */
-#define RADAR_FAIL_COUNT        50    /* Ciclos sem frame para declarar FAIL  */
+#define RADAR_FAIL_COUNT        80    /* Ciclos sem frame para declarar FAIL  */
 
 /* Watchdog */
 #define SYSTEM_WDT_TIMEOUT_S    30
