@@ -1,7 +1,7 @@
 /* ============================================================
    COMM MANAGER — IMPLEMENTAÇÃO
    @file      comm_manager.c
-   @version   3.0  |  2026-04-29
+   @version   3.1  |  2026-05-01
    PROJECTO   : Poste Inteligente v8
    AUTORES    : Luis Custódio | Tiago Moreno
    PLATAFORMA : ESP32 (ESP-IDF v5.x)
@@ -140,7 +140,6 @@ bool comm_status_ok(void)
     /* Se não há vizinho teórico configurado à esquerda nem à direita,
        este poste opera sozinho — comm_ok deve ser true se UDP activo. */
     bool tem_vizinho_teorico_esq = (POST_POSITION > 0);
-    bool tem_vizinho_teorico_dir = false; /* descoberto dinamicamente */
 
     /* Verifica se algum vizinho foi alguma vez descoberto */
     neighbor_t *viz_esq = udp_manager_get_neighbor_by_pos(POST_POSITION - 1);
@@ -186,9 +185,10 @@ bool comm_is_master(void)
 
     if (!viz_esq || !viz_esq->active) return true;
 
-    /* Assume MASTER se vizinho esq. está em SAFE_MODE ou offline */
+    /* Assume MASTER se vizinho esq. está ausente ou não operacional */
     if (viz_esq->status == NEIGHBOR_OFFLINE ||
-        viz_esq->status == NEIGHBOR_SAFE) {
+        viz_esq->status == NEIGHBOR_SAFE    ||
+        viz_esq->status == NEIGHBOR_FAIL) {
         return true;
     }
 
