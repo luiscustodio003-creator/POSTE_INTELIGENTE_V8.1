@@ -184,7 +184,7 @@ bool comm_is_master(void)
 
     neighbor_t *viz_esq = udp_manager_get_neighbor_by_pos(POST_POSITION - 1);
 
-    if (!viz_esq || !viz_esq->active) return false;
+    if (!viz_esq || !viz_esq->active) return true;
 
     /* Assume MASTER se vizinho esq. está ausente ou não operacional */
     if (viz_esq->status == NEIGHBOR_OFFLINE ||
