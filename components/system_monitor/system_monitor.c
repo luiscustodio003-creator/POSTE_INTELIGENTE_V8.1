@@ -34,8 +34,7 @@ static const char *TAG = "SYS_MON";
 static uint64_t s_hb_ms[MOD_COUNT] = {0};
 static bool     s_comm_ok          = false;
 
-static const uint32_t s_timeout_ms[MOD_COUNT] = { 500, 500, 200, 100 };
-static const char    *s_nome[MOD_COUNT]        = { "FSM","RADAR","DISPLAY","UDP" };
+static const char    *s_nome[MOD_COUNT] = { "FSM","RADAR","DISPLAY","UDP" };
 
 void system_monitor_heartbeat(monitor_module_t mod)
 {

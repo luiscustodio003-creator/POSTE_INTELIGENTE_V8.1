@@ -13,21 +13,20 @@
    - Transições para estados degradados (SAFE_MODE, AUTONOMO)
    - Inteligência topológica dinâmica (abstração de N postes)
 
-   LÓGICA DE ESTADOS DEGRADADOS (v2.7):
-   ──────────────────────────────────────
-   SAFE_MODE  → radar em FALHA física (independente de WiFi/vizinhos)
-   AUTONOMO   → radar OK + WiFi OK + sem vizinhos conhecidos na rede
-                Opera localmente: detecta e acende, não propaga TC_INC
-   MASTER     → radar OK + WiFi OK + vizinhos OK + primeiro da cadeia
-   IDLE       → radar OK + WiFi OK + vizinhos OK + não é primeiro
+   VERSÃO     : 2.9  |  2026-05-01
 
-   CORRECÇÕES v2.6 → v2.8:
+   LÓGICA DE ESTADOS (v2.9 — sequencial):
+   ──────────────────────────────────────
+   1. Sem radar (sensor desligado) → SAFE_MODE
+   2. Sem vizinhos conhecidos      → AUTONOMO
+   3. Com vizinhos                 → MASTER ou IDLE
+
+   CORRECÇÕES v2.8 → v2.9:
    ─────────────────────────
-   - CORRIGIDO v2.7: AUTONOMO agora activa quando radar OK + WiFi OK
-     mas sem vizinhos descobertos na rede.
-   - CORRIGIDO v2.8: SAFE_MODE não activa quando há veículos activos
-     (T>0 ou Tc>0) — tráfego activo prova que o radar está funcional
-     mesmo que o contador de falhas tenha atingido o limite.
+   - REMOVIDO: guarda (T>0 || Tc>0) no bloco SAFE_MODE.
+     Era contraditória com fsm_core.c v2.6 que usa radar_is_connected()
+     como fonte de verdade. Se o sensor está fisicamente desligado,
+     não pode haver tráfego activo — a guarda era inútil e confusa.
 ============================================================ */
 
 #include "fsm_network.h"
@@ -147,16 +146,11 @@ void fsm_network_estados_degradados(bool comm_ok, bool is_master)
        mas o tracking confirma que o sensor está operacional.
     ────────────────────────────────────────────────────────── */
     if (!g_fsm_radar_ok) {
-        /* Se há tráfego activo, o radar está a funcionar — ignora */
-        if (g_fsm_T > 0 || g_fsm_Tc > 0) return;
-
         if (g_fsm_state != STATE_SAFE_MODE) {
             g_fsm_state = STATE_SAFE_MODE;
-            /* dali_safe_mode() NÃO é chamado aqui — responsabilidade
-               de fsm_aplicar_luz() em fsm_task.c no ciclo seguinte. */
             ESP_LOGE(TAG, "SAFE MODE: Falha crítica no Radar.");
         }
-        return; /* Não avalia mais nada enquanto radar falhar */
+        return;
     }
 
     /* Recuperação de SAFE MODE quando radar volta */
