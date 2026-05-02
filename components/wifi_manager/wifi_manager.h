@@ -32,5 +32,11 @@ const char *wifi_manager_get_ip(void);
 /** Reinicia contador de tentativas (para forçar nova série). */
 void wifi_manager_reset_retry(void);
 
+/** Inicia em modo AP (MASTER) ou STA (IDLE) conforme posição */
+void wifi_manager_init_auto(void);
+
+/** Muda de STA para AP quando assume liderança */
+void wifi_manager_assume_ap(void);
+
 #endif /* WIFI_MANAGER_H */
 

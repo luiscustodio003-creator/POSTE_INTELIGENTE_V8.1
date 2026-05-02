@@ -35,6 +35,7 @@ static uint64_t s_hb_ms[MOD_COUNT] = {0};
 static bool     s_comm_ok          = false;
 
 static const char    *s_nome[MOD_COUNT] = { "FSM","RADAR","DISPLAY","UDP" };
+static const uint64_t s_timeout_ms[MOD_COUNT] = { 1000, 1000, 500, 1000 };
 
 void system_monitor_heartbeat(monitor_module_t mod)
 {
@@ -137,7 +138,7 @@ void system_monitor_start(void)
     printf("└───────────────────────────────────────┘\n");
 
     /* ── [5] WiFi ── */
-    wifi_manager_init();
+    wifi_manager_init_auto();
     printf("┌───────────────────────────────────────┐\n");
     printf("│ [5] WiFi  STA  SSID: %-16s │\n", WIFI_SSID);
     printf("└───────────────────────────────────────┘\n");

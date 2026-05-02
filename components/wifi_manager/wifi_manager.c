@@ -25,6 +25,7 @@ static const char *TAG = "WIFI_MGR";
 static bool s_conectado   = false;
 static char s_ip[16]      = "---";
 static int  s_retries     = 0;
+static bool s_modo_ap     = false;
 
 /* Spinlock para proteger s_ip (acedido de event handler e monitor) */
 static portMUX_TYPE s_ip_mux = portMUX_INITIALIZER_UNLOCKED;
@@ -141,3 +142,49 @@ void wifi_manager_reset_retry(void)
     esp_wifi_connect();
 }
 
+
+void wifi_manager_init_auto(void)
+{
+    if (POST_POSITION == 0) {
+        /* Sou o MASTER — crio o AP */
+        wifi_manager_assume_ap();
+    } else {
+        /* Sou IDLE — ligo ao AP do MASTER */
+        /* Usa o código actual mas com WIFI_AP_SSID/PASS */
+        wifi_manager_init();
+    }
+}
+
+
+
+/* Nova função — cria AP com DHCP interno */
+void wifi_manager_assume_ap(void)
+{
+    /* Para o modo STA actual */
+    esp_wifi_stop();
+    esp_wifi_deinit();
+
+    /* Cria interface AP */
+    esp_netif_create_default_wifi_ap();
+
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    esp_wifi_init(&cfg);
+
+    wifi_config_t ap_config = {
+        .ap = {
+            .ssid            = WIFI_SSID,
+            .ssid_len        = strlen(WIFI_SSID),
+            .password        = WIFI_PASS,
+            .channel         = WIFI_AP_CHANNEL,
+            .authmode        = WIFI_AUTH_WPA2_PSK,
+            .max_connection  = 10,
+        }
+    };
+
+    esp_wifi_set_mode(WIFI_MODE_AP);
+    esp_wifi_set_config(WIFI_IF_AP, &ap_config);
+    esp_wifi_start();
+
+    ESP_LOGI(TAG, "[AP] Rede criada: %s", WIFI_SSID);
+    s_modo_ap = true;
+}
