@@ -1,7 +1,7 @@
 /* ============================================================
    COMM MANAGER — IMPLEMENTAÇÃO
    @file      comm_manager.c
-   @version   3.1  |  2026-05-01
+   @version   3.1  |  2026-05-02
    PROJECTO   : Poste Inteligente v8
    AUTORES    : Luis Custódio | Tiago Moreno
    PLATAFORMA : ESP32 (ESP-IDF v5.x)
@@ -10,21 +10,12 @@
    Resolve IPs de vizinhos, calcula ETA e chama as funções
    de envio correctas sem expor detalhes de protocolo à FSM.
 
-   ALTERAÇÕES v2.1 → v3.0:
+   ALTERAÇÕES v3.0 → v3.1:
    ─────────────────────────
-   1. _ip_vizinho_direito() — salta vizinhos em SAFE_MODE ou FAIL.
-      Se o vizinho direito está em SAFE, não lhe envia TC_INC
-      (ele não tem radar, não pode processar o veículo).
-
-   2. comm_is_master() — SAFE e FAIL contam como "ausente".
-      Se o vizinho esquerdo está em SAFE_MODE, este poste
-      assume MASTER temporariamente (vizinho esq. está cego).
-
-   3. comm_status_ok() — SAFE no vizinho não conta como "online"
-      para efeitos de verificação de conectividade.
-
-   4. comm_notify_prev_passed() — usa udp_manager_send_passed()
-      dedicado em vez de TC_INC com velocidade negativa (legado).
+   - ADICIONADO: comm_send_master_claim_id(int master_id)
+     Envia MASTER_CLAIM com ID do MASTER real para relay em cadeia.
+     Chama udp_manager_send_master_claim_id() que usa o novo
+     formato de protocolo "MASTER_CLAIM:<from_id>:<master_id>".
 ============================================================ */
 #include "comm_manager.h"
 #include "udp_manager.h"
@@ -40,10 +31,6 @@ static bool s_iniciado = false;
 
 /* ============================================================
    _vizinho_operacional
-   ──────────────────────────────────────────────────────────
-   Retorna true se o vizinho está online E operacional.
-   SAFE_MODE e FAIL não contam como operacional — o poste
-   existe na rede mas não consegue processar veículos.
 ============================================================ */
 static bool _vizinho_operacional(neighbor_t *v)
 {
@@ -54,11 +41,6 @@ static bool _vizinho_operacional(neighbor_t *v)
 
 /* ============================================================
    _ip_vizinho_direito
-   ──────────────────────────────────────────────────────────
-   Retorna IP do vizinho direito APENAS se estiver operacional.
-   Vizinho em SAFE_MODE ou FAIL → retorna NULL.
-   Não enviamos TC_INC a um poste sem radar — ele não consegue
-   processar nem propagar o veículo.
 ============================================================ */
 static const char *_ip_vizinho_direito(void)
 {
@@ -69,11 +51,22 @@ static const char *_ip_vizinho_direito(void)
 
 
 /* ============================================================
-   _ip_vizinho_esquerdo
+   _ip_vizinho_direito_qualquer
    ──────────────────────────────────────────────────────────
-   Retorna IP do vizinho esquerdo se estiver activo e não offline.
-   Para PASSED: enviamos mesmo que esteja em SAFE (para T-- funcionar).
-   O poste em SAFE ainda processa callbacks UDP — só o radar é que falha.
+   Retorna IP do vizinho direito mesmo que não esteja operacional,
+   desde que esteja activo (conhecido). Usado para MASTER_CLAIM
+   relay — precisamos de enviar mesmo que o poste esteja em SAFE.
+============================================================ */
+static const char *_ip_vizinho_direito_qualquer(void)
+{
+    neighbor_t *v = udp_manager_get_neighbor_by_pos(POST_POSITION + 1);
+    if (!v || !v->active || v->status == NEIGHBOR_OFFLINE) return NULL;
+    return v->ip;
+}
+
+
+/* ============================================================
+   _ip_vizinho_esquerdo
 ============================================================ */
 static const char *_ip_vizinho_esquerdo(void)
 {
@@ -86,8 +79,6 @@ static const char *_ip_vizinho_esquerdo(void)
 
 /* ============================================================
    _calcular_eta_ms
-   ETA = distância restante / velocidade
-   Distância restante = POSTE_DIST_M - RADAR_DETECT_M (metros)
 ============================================================ */
 static uint32_t _calcular_eta_ms(float speed_kmh)
 {
@@ -106,7 +97,7 @@ bool comm_init(void)
     if (s_iniciado) return true;
     s_iniciado = udp_manager_init();
     if (s_iniciado)
-        ESP_LOGI(TAG, "Comm iniciado — UDP v3.0 activo");
+        ESP_LOGI(TAG, "Comm iniciado — UDP v3.1 activo");
     else
         ESP_LOGE(TAG, "Falha ao iniciar UDP");
     return s_iniciado;
@@ -115,9 +106,6 @@ bool comm_init(void)
 
 /* ============================================================
    comm_status_ok
-   ──────────────────────────────────────────────────────────
-   True se UDP operacional E pelo menos um vizinho operacional.
-   Vizinhos em SAFE ou FAIL não contam — não propagam veículos.
 ============================================================ */
 bool comm_status_ok(void)
 {
@@ -127,7 +115,6 @@ bool comm_status_ok(void)
     }
     if (!s_iniciado) return false;
 
-    /* Período de graça após arranque */
     static uint64_t s_init_ms = 0;
     if (s_init_ms == 0)
         s_init_ms = (uint64_t)(esp_timer_get_time() / 1000ULL);
@@ -136,25 +123,16 @@ bool comm_status_ok(void)
     if ((agora - s_init_ms) < (uint64_t)AUTONOMO_DELAY_MS)
         return true;
 
-    /* ── CORRECÇÃO: poste isolado (fim de linha ou único) ── */
-    /* Se não há vizinho teórico configurado à esquerda nem à direita,
-       este poste opera sozinho — comm_ok deve ser true se UDP activo. */
     bool tem_vizinho_teorico_esq = (POST_POSITION > 0);
 
-    /* Verifica se algum vizinho foi alguma vez descoberto */
     neighbor_t *viz_esq = udp_manager_get_neighbor_by_pos(POST_POSITION - 1);
     neighbor_t *viz_dir = udp_manager_get_neighbor_by_pos(POST_POSITION + 1);
 
     bool algum_conhecido = (viz_esq && viz_esq->active) ||
                            (viz_dir && viz_dir->active);
 
-    /* Se nunca descobriu vizinhos E a posição indica que pode estar isolado,
-       considera comm_ok — o UDP está activo mesmo sem vizinhos.
-       Isto evita que um poste único em teste entre em AUTONOMO desnecessariamente. */
-    if (!algum_conhecido && !tem_vizinho_teorico_esq) {
-        /* POST_POSITION == 0 sem vizinhos descobertos = poste único ou MASTER isolado */
+    if (!algum_conhecido && !tem_vizinho_teorico_esq)
         return true;
-    }
 
     bool tem_operacional = _vizinho_operacional(viz_esq) ||
                            _vizinho_operacional(viz_dir);
@@ -165,16 +143,9 @@ bool comm_status_ok(void)
     return tem_operacional || !algum_conhecido;
 }
 
+
 /* ============================================================
    comm_is_master
-   ──────────────────────────────────────────────────────────
-   True se este poste é ou deve ser MASTER.
-   Condições:
-     - Posição 0 → sempre MASTER
-     - Vizinho esquerdo OFFLINE → assume MASTER
-     - Vizinho esquerdo em SAFE_MODE → assume MASTER
-       (vizinho esq. está cego, não pode ser líder efectivo)
-     - Vizinho esquerdo em FAIL → assume MASTER
 ============================================================ */
 bool comm_is_master(void)
 {
@@ -185,7 +156,6 @@ bool comm_is_master(void)
 
     if (!viz_esq || !viz_esq->active) return true;
 
-    /* Assume MASTER se vizinho esq. está ausente ou não operacional */
     if (viz_esq->status == NEIGHBOR_OFFLINE ||
         viz_esq->status == NEIGHBOR_SAFE) {
         return true;
@@ -196,7 +166,7 @@ bool comm_is_master(void)
 
 
 /* ============================================================
-   comm_left_online — vizinho esquerdo online e operacional
+   comm_left_online
 ============================================================ */
 bool comm_left_online(void)
 {
@@ -207,7 +177,7 @@ bool comm_left_online(void)
 
 
 /* ============================================================
-   comm_right_online — vizinho direito online e operacional
+   comm_right_online
 ============================================================ */
 bool comm_right_online(void)
 {
@@ -217,7 +187,7 @@ bool comm_right_online(void)
 
 
 /* ============================================================
-   comm_left_known — vizinho esquerdo foi descoberto (activo)
+   comm_left_known
 ============================================================ */
 bool comm_left_known(void)
 {
@@ -228,7 +198,7 @@ bool comm_left_known(void)
 
 
 /* ============================================================
-   comm_right_known — vizinho direito foi descoberto (activo)
+   comm_right_known
 ============================================================ */
 bool comm_right_known(void)
 {
@@ -238,9 +208,7 @@ bool comm_right_known(void)
 
 
 /* ============================================================
-   comm_send_tc_inc — envia TC_INC ao vizinho direito
-   Só envia se o vizinho direito estiver operacional.
-   Vizinho em SAFE_MODE → NULL → sem envio.
+   comm_send_tc_inc
 ============================================================ */
 void comm_send_tc_inc(float speed, int16_t x_mm)
 {
@@ -255,7 +223,7 @@ void comm_send_tc_inc(float speed, int16_t x_mm)
 
 
 /* ============================================================
-   comm_send_spd — calcula ETA e envia SPD ao vizinho direito
+   comm_send_spd
 ============================================================ */
 void comm_send_spd(float speed, int16_t x_mm)
 {
@@ -272,11 +240,7 @@ void comm_send_spd(float speed, int16_t x_mm)
 
 
 /* ============================================================
-   comm_notify_prev_passed — notifica vizinho esquerdo (T--)
-   ──────────────────────────────────────────────────────────
-   Usa a mensagem PASSED dedicada (v5.0).
-   Enviamos mesmo que o vizinho esquerdo esteja em SAFE_MODE
-   — ele ainda processa callbacks UDP e precisa de fazer T--.
+   comm_notify_prev_passed
 ============================================================ */
 void comm_notify_prev_passed(float speed)
 {
@@ -288,12 +252,37 @@ void comm_notify_prev_passed(float speed)
 
 
 /* ============================================================
-   comm_send_master_claim — propaga liderança ao vizinho direito
+   comm_send_master_claim
+   ──────────────────────────────────────────────────────────
+   Anuncia que ESTE poste é MASTER ao vizinho direito.
+   Usa o formato original "MASTER_CLAIM:<POSTE_ID>".
+   Mantido para compatibilidade com código existente.
 ============================================================ */
 void comm_send_master_claim(void)
 {
-    const char *ip = _ip_vizinho_direito();
+    const char *ip = _ip_vizinho_direito_qualquer();
     if (!ip) return;
     udp_manager_send_master_claim(ip);
     ESP_LOGI(TAG, "MASTER_CLAIM → %s", ip);
+}
+
+
+/* ============================================================
+   comm_send_master_claim_id  (NOVO v3.1)
+   ──────────────────────────────────────────────────────────
+   Relay de MASTER_CLAIM preservando o ID do MASTER original.
+   Usa o novo formato "MASTER_CLAIM:<POSTE_ID>:<master_id>".
+
+   Envia ao vizinho direito mesmo que esteja em SAFE_MODE
+   (o relay tem de chegar a toda a cadeia independentemente
+   do estado do vizinho, desde que esteja activo e não OFFLINE).
+
+   @param master_id  ID do MASTER real (não muda ao longo dos relays)
+============================================================ */
+void comm_send_master_claim_id(int master_id)
+{
+    const char *ip = _ip_vizinho_direito_qualquer();
+    if (!ip) return;
+    udp_manager_send_master_claim_id(ip, master_id);
+    ESP_LOGI(TAG, "MASTER_CLAIM(id=%d) → %s", master_id, ip);
 }

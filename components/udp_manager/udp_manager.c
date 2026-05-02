@@ -1,21 +1,24 @@
 /* ============================================================
    UDP MANAGER — IMPLEMENTAÇÃO
    @file      udp_manager.c
-   @version   5.1  |  2026-04-29
+   @version   5.2  |  2026-05-02
    PROJECTO   : Poste Inteligente v8
    AUTORES    : Luis Custódio | Tiago Moreno
    PLATAFORMA : ESP32 (ESP-IDF v5.x)
 
-   ALTERAÇÃO v5.0 → v5.1:
+   ALTERAÇÕES v5.1 → v5.2:
    ──────────────────────────────────────────────────────────
-   - CORRIGIDO: resposta ao DISCOVER passa a enviar o estado
-     real do poste em vez de sempre "OK".
-     Antes: STATUS:<id>:OK  (sempre, independente do estado)
-     Depois: STATUS:<id>:<estado_real>  (OK | SAFE | AUTO | OBST)
-     Isto permite que os vizinhos saibam quando este poste está
-     em SAFE_MODE (sem radar) e reajam correctamente:
-       - Poste à esquerda: não envia TC_INC a vizinho em SAFE
-       - Poste à direita:  assume MASTER temporariamente
+   - ADICIONADO: udp_manager_send_master_claim_id(ip, master_id)
+     Envia "MASTER_CLAIM:<POSTE_ID>:<master_id>" preservando
+     o ID do MASTER real ao longo de toda a cadeia de relays.
+
+   - ADICIONADO: on_master_claim_received_ext(from_id, master_id)
+     Callback weak com dois parâmetros. Implementado em fsm_events.c.
+
+   - ALTERADO: parser de MASTER_CLAIM suporta ambos os formatos:
+     Antigo: "MASTER_CLAIM:<id>"            → from_id = master_id
+     Novo:   "MASTER_CLAIM:<from>:<master>" → relay completo
+     Compatibilidade total com postes v5.1 ainda não actualizados.
 ============================================================ */
 #include "udp_manager.h"
 #include "state_machine.h"
@@ -35,11 +38,11 @@
 static const char *TAG = "UDP_MGR";
 
 /* ── Estado interno ────────────────────────────────────────── */
-static int        s_socket      = -1;
-static bool       s_iniciado    = false;
-static neighbor_t s_vizinhos[MAX_NEIGHBORS];
-static uint32_t   s_ultimo_disc = 0;
-static udp_stats_t s_stats      = {0};
+static int         s_socket      = -1;
+static bool        s_iniciado    = false;
+static neighbor_t  s_vizinhos[MAX_NEIGHBORS];
+static uint32_t    s_ultimo_disc = 0;
+static udp_stats_t s_stats       = {0};
 
 
 /* ============================================================
@@ -51,49 +54,39 @@ static uint32_t _agora_ms(void)
     return (uint32_t)(esp_timer_get_time() / 1000ULL);
 }
 
-/* Converte neighbor_status_t em string para o protocolo UDP */
 static const char *_status_str(neighbor_status_t s)
 {
     switch (s) {
         case NEIGHBOR_OK:        return "OK";
         case NEIGHBOR_OFFLINE:   return "OFFLINE";
-        case NEIGHBOR_SAFE:      return "SAFE";   /* radar em falha — poste cego */
+        case NEIGHBOR_SAFE:      return "SAFE";
         case NEIGHBOR_AUTO:      return "AUTO";
         case NEIGHBOR_OBSTACULO: return "OBST";
         default:                 return "?";
     }
 }
 
-/* Converte string do protocolo em neighbor_status_t */
 static neighbor_status_t _str_para_status(const char *s)
 {
     if (!s)                    return NEIGHBOR_OFFLINE;
     if (!strcmp(s, "OK"))      return NEIGHBOR_OK;
     if (!strcmp(s, "SAFE"))    return NEIGHBOR_SAFE;
-    if (!strcmp(s, "FAIL"))    return NEIGHBOR_SAFE;   /* legado v5.1 → SAFE */
+    if (!strcmp(s, "FAIL"))    return NEIGHBOR_SAFE;
     if (!strcmp(s, "AUTO"))    return NEIGHBOR_AUTO;
     if (!strcmp(s, "OBST"))    return NEIGHBOR_OBSTACULO;
     return NEIGHBOR_OFFLINE;
 }
 
-/* ============================================================
-   _estado_local_str
-   ──────────────────────────────────────────────────────────
-   Retorna o estado actual deste poste como string de protocolo.
-   Usado na resposta ao DISCOVER para informar vizinhos do
-   estado real — especialmente importante em SAFE_MODE.
-============================================================ */
 static const char *_estado_local_str(void)
 {
     switch (state_machine_get_state()) {
-        case STATE_SAFE_MODE:  return "SAFE";
-        case STATE_AUTONOMO:   return "AUTO";
-        case STATE_OBSTACULO:  return "OBST";
-        default:               return "OK";
+        case STATE_SAFE_MODE: return "SAFE";
+        case STATE_AUTONOMO:  return "AUTO";
+        case STATE_OBSTACULO: return "OBST";
+        default:              return "OK";
     }
 }
 
-/* Envio UDP unicast */
 static bool _enviar_para(const char *ip, const char *msg)
 {
     if (s_socket < 0 || !ip || !msg) return false;
@@ -115,13 +108,10 @@ static bool _enviar_para(const char *ip, const char *msg)
     return true;
 }
 
-/* Procura vizinho por IP; cria se não existir */
-static neighbor_t *_encontrar_ou_criar_vizinho(const char *ip,
-                                                int id, int pos)
+static neighbor_t *_encontrar_ou_criar_vizinho(const char *ip, int id, int pos)
 {
     for (int i = 0; i < MAX_NEIGHBORS; i++) {
-        if (s_vizinhos[i].active &&
-            strcmp(s_vizinhos[i].ip, ip) == 0) {
+        if (s_vizinhos[i].active && strcmp(s_vizinhos[i].ip, ip) == 0) {
             if (id  >= 0) s_vizinhos[i].id      = id;
             if (pos >= 0) s_vizinhos[i].position = pos;
             return &s_vizinhos[i];
@@ -166,15 +156,7 @@ static void _processar_mensagem(char *msg, const char *ip)
             if (v->status == NEIGHBOR_OFFLINE) v->status = NEIGHBOR_OK;
         }
 
-        /* ── CORRECÇÃO v5.1 ──────────────────────────────────────
-           Responde com o estado REAL deste poste.
-           Se estiver em SAFE_MODE → "SAFE"
-           Se estiver em AUTONOMO  → "AUTO"
-           Se estiver em OBSTACULO → "OBST"
-           Caso normal             → "OK"
-           O vizinho que recebe actualiza s_vizinhos[].status
-           via _str_para_status() e o comm_manager usa esse
-           estado para decidir se propaga ou assume MASTER.    */
+        /* Responde com estado REAL deste poste */
         char resp[32];
         snprintf(resp, sizeof(resp), "STATUS:%d:%s",
                  POSTE_ID, _estado_local_str());
@@ -200,9 +182,7 @@ static void _processar_mensagem(char *msg, const char *ip)
         return;
     }
 
-    /* ── TC_INC:<id>:<vel>:<x_mm> ─────────────────────────────
-       vel > 0  → veículo a caminho   (Tc++)
-       vel < 0  → legado v4.x (ignorado — usa PASSED dedicado) */
+    /* ── TC_INC:<id>:<vel>:<x_mm> ────────────────────────────── */
     if (strncmp(msg, "TC_INC:", 7) == 0) {
         int id = 0, x_mm = 0; float vel = 0.0f;
         sscanf(msg + 7, "%d:%f:%d", &id, &vel, &x_mm);
@@ -235,7 +215,7 @@ static void _processar_mensagem(char *msg, const char *ip)
         return;
     }
 
-    /* ── SPD:<id>:<vel>:<eta_ms>:<dist_m>:<x_mm> ────────────── */
+    /* ── SPD:<id>:<vel>:<eta_ms>:<dist_m>:<x_mm> ──────────────── */
     if (strncmp(msg, "SPD:", 4) == 0) {
         int id = 0, x_mm = 0;
         float vel = 0.0f;
@@ -252,13 +232,32 @@ static void _processar_mensagem(char *msg, const char *ip)
         return;
     }
 
-    /* ── MASTER_CLAIM:<id> ───────────────────────────────────── */
-    if (strncmp(msg, "MASTER_CLAIM:", 13) == 0) {
-        int id = atoi(msg + 13);
-        if (id == POSTE_ID) return;
+    /* ── MASTER_CLAIM:<from_id>[:<master_id>] ────────────────────
+       Suporta dois formatos:
+         v5.1 (antigo): "MASTER_CLAIM:<id>"
+           → from_id = master_id = id  (compatibilidade)
+         v5.2 (novo):   "MASTER_CLAIM:<from_id>:<master_id>"
+           → relay completo com ID do MASTER real preservado
 
-        ESP_LOGI(TAG, "[RX] MASTER_CLAIM de ID=%d", id);
-        on_master_claim_received(id);
+       Chama on_master_claim_received_ext() que em fsm_events.c
+       delega para fsm_network_master_claim_relay().
+    ─────────────────────────────────────────────────────────── */
+    if (strncmp(msg, "MASTER_CLAIM:", 13) == 0) {
+        int from_id   = 0;
+        int master_id = 0;
+
+        /* Tenta ler dois campos; se só um → formato antigo */
+        int n = sscanf(msg + 13, "%d:%d", &from_id, &master_id);
+        if (n < 2) master_id = from_id;  /* compatibilidade v5.1 */
+
+        /* Ignora mensagens próprias (eco) */
+        if (from_id == POSTE_ID) return;
+
+        neighbor_t *v = _encontrar_ou_criar_vizinho(ip, from_id, -1);
+        if (v) v->last_seen = _agora_ms();
+
+        ESP_LOGI(TAG, "[RX] MASTER_CLAIM from=%d master=%d", from_id, master_id);
+        on_master_claim_received_ext(from_id, master_id);
         return;
     }
 
@@ -292,10 +291,11 @@ static void _verificar_timeouts(uint32_t agora)
 ============================================================ */
 void udp_task_run(void *arg)
 {
+    (void)arg;
     char               rx_buf[160];
     struct sockaddr_in origem;
 
-    ESP_LOGI(TAG, "udp_task v5.1 | Core %d | Porto %d",
+    ESP_LOGI(TAG, "udp_task v5.2 | Core %d | Porto %d",
              xPortGetCoreID(), UDP_PORT);
 
     while (s_socket < 0) {
@@ -332,7 +332,7 @@ void udp_task_run(void *arg)
 
 
 /* ============================================================
-   udp_manager_init — cria socket e faz bind
+   udp_manager_init
 ============================================================ */
 bool udp_manager_init(void)
 {
@@ -434,9 +434,26 @@ bool udp_manager_send_status(const char *ip, neighbor_status_t status)
 
 bool udp_manager_send_master_claim(const char *ip)
 {
-    char msg[24];
+    char msg[32];
     snprintf(msg, sizeof(msg), "MASTER_CLAIM:%d", POSTE_ID);
     return _enviar_para(ip, msg);
+}
+
+/* ============================================================
+   udp_manager_send_master_claim_id  (NOVO v5.2)
+   ──────────────────────────────────────────────────────────
+   Envia "MASTER_CLAIM:<POSTE_ID>:<master_id>".
+   O from_id (POSTE_ID) identifica quem fez o relay.
+   O master_id identifica o MASTER real — não muda ao longo da cadeia.
+============================================================ */
+bool udp_manager_send_master_claim_id(const char *ip, int master_id)
+{
+    char msg[40];
+    snprintf(msg, sizeof(msg), "MASTER_CLAIM:%d:%d", POSTE_ID, master_id);
+    bool ok = _enviar_para(ip, msg);
+    ESP_LOGD(TAG, "[TX] MASTER_CLAIM from=%d master=%d → %s",
+             POSTE_ID, master_id, ip);
+    return ok;
 }
 
 
@@ -496,7 +513,7 @@ int udp_manager_get_socket(void)
 
 
 /* ============================================================
-   CALLBACKS WEAK — substituídos pela state_machine
+   CALLBACKS WEAK — substituídos pela state_machine (fsm_events.c)
 ============================================================ */
 __attribute__((weak)) void on_tc_inc_received(float speed, int16_t x_mm)
 { (void)speed; (void)x_mm; }
@@ -508,5 +525,15 @@ __attribute__((weak)) void on_spd_received(float speed, uint32_t eta_ms,
                                             int16_t x_mm)
 { (void)speed; (void)eta_ms; (void)x_mm; }
 
+/* Callback legado — mantido para compatibilidade */
 __attribute__((weak)) void on_master_claim_received(int from_id)
 { (void)from_id; }
+
+/* Callback novo v5.2 — delega para on_master_claim_received se não implementado */
+__attribute__((weak)) void on_master_claim_received_ext(int from_id, int master_id)
+{
+    /* Por defeito, chama o callback legado com from_id.
+       fsm_events.c implementa esta função correctamente. */
+    on_master_claim_received(from_id);
+    (void)master_id;
+}

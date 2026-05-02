@@ -1,7 +1,7 @@
 /* ============================================================
-   MÁQUINA DE ESTADOS — PROCESSAMENTO DE EVENTOS
-   @file      fsm_events.c
-   @version   3.1  |  2026-04-30
+   MÓDULO     : fsm_events
+   FICHEIRO   : fsm_events.c — Processamento de eventos da FSM
+   VERSÃO     : 3.2  |  2026-05-02
    PROJECTO   : Poste Inteligente v8
    AUTORES    : Luis Custódio | Tiago Moreno
    PLATAFORMA : ESP32 (ESP-IDF v5.x)
@@ -11,26 +11,29 @@
    Ponto central de entrada de eventos do pipeline tracking→FSM
    e dos callbacks UDP recebidos pelo udp_manager.
 
-   REGRAS DO PROTOCOLO T/Tc (implementadas aqui):
-   ────────────────────────────────────────────────
+   REGRAS DO PROTOCOLO T/Tc:
+   ──────────────────────────
    DETECTED  → guarda ETA, muda estado. SEM T++. SEM TC_INC.
    LOCAL     → T++, Tc--, muda estado, PASSED→esq, TC_INC+SPD→dir.
    PASSED    → T--, SPD→dir, apaga se T==0 e Tc==0.
    OBSTACULO → STATE_OBSTACULO, PASSED→dir (cancela Tc).
 
-   CORRECÇÕES v3.0 → v3.1:
+   ALTERAÇÕES v3.1 → v3.2:
    ─────────────────────────
-   - REMOVIDO: todas as chamadas dali_* (dali_fade_up, dali_set_brightness).
-     Este módulo NÃO chama hardware directamente.
-     A aplicação de brilho é da exclusiva responsabilidade de
-     fsm_aplicar_luz() em fsm_task.c, chamada após cada ciclo de eventos.
-   - REMOVIDO: #include "dali_manager.h" — já não necessário.
-   - MANTIDO: toda a lógica de estado g_fsm_* — sem alterações.
-   - MANTIDO: protocolo T/Tc — sem alterações.
+   - ADICIONADO: on_master_claim_received_ext(from_id, master_id)
+     Implementa o callback declarado no udp_manager.h v5.2.
+     Delega para fsm_network_master_claim_relay() que faz o relay
+     completo em cadeia preservando o master_id original.
+
+   - ALTERADO: on_master_claim_received(from_id)
+     Agora delega para on_master_claim_received_ext() em vez de
+     apenas fazer log. Mantido para compatibilidade com postes
+     que ainda enviem o formato antigo (v5.1).
 ============================================================ */
 
 #include "fsm_events.h"
 #include "fsm_core.h"
+#include "fsm_network.h"
 #include "comm_manager.h"
 #include "system_config.h"
 #include "esp_log.h"
@@ -42,11 +45,9 @@ static const char *TAG = "FSM_EVT";
    CALLBACKS UDP
    ──────────────
    Chamados pelo udp_manager no contexto da udp_task (Core 0).
-   Acesso a g_fsm_T / g_fsm_Tc: escrita atómica em Xtensa LX6
-   (32 bits alinhados) — sem mutex necessário para int simples.
-   NOTA: NÃO chamam dali_* — correm em Core 0, o dali corre
-   em Core 1. A transição de estado é detectada por
-   fsm_aplicar_luz() no próximo ciclo de 100ms da fsm_task.
+   NÃO chamam dali_* — correm em Core 0, o dali corre em Core 1.
+   A transição de estado é detectada por fsm_aplicar_luz() no
+   próximo ciclo de 100ms da fsm_task.
 ============================================================ */
 
 /* ── on_tc_inc_received — veículo anunciado pelo poste esquerdo ── */
@@ -61,12 +62,12 @@ void on_tc_inc_received(float speed, int16_t x_mm)
     if (g_fsm_Tc == 0) {
         g_fsm_Tc = 1;
     } else {
-        ESP_LOGW(TAG, "[UDP] TC_INC ignorado — carro ja em transito (Tc=%d)", g_fsm_Tc);
+        ESP_LOGW(TAG, "[UDP] TC_INC ignorado — carro ja em transito (Tc=%d)",
+                 g_fsm_Tc);
     }
 
     ESP_LOGI(TAG, "[UDP] TC_INC | vel=%.0f | T=%d Tc=%d", speed, g_fsm_T, g_fsm_Tc);
 
-    /* Muda estado — fsm_aplicar_luz() aplica dali no ciclo seguinte */
     if (g_fsm_state == STATE_IDLE   ||
         g_fsm_state == STATE_MASTER ||
         g_fsm_state == STATE_AUTONOMO) {
@@ -88,9 +89,9 @@ void on_prev_passed_received(float speed)
 /* ── on_spd_received — actualiza ETA de pré-acendimento ── */
 void on_spd_received(float speed, uint32_t eta_ms, int16_t x_mm)
 {
+    (void)x_mm;
     g_fsm_last_speed = speed;
 
-    /* Só agenda se há um veículo anunciado */
     if (g_fsm_Tc <= 0) return;
 
     if (eta_ms > MARGEM_ACENDER_MS)
@@ -101,10 +102,26 @@ void on_spd_received(float speed, uint32_t eta_ms, int16_t x_mm)
     ESP_LOGD(TAG, "[UDP] SPD | vel=%.0f eta=%lums", speed, (unsigned long)eta_ms);
 }
 
-/* ── on_master_claim_received — regista MASTER na cadeia ── */
+/* ── on_master_claim_received_ext — callback novo v5.2 ─────────
+   Delega para fsm_network_master_claim_relay() que:
+     1. Regista o master_id real
+     2. Cede STATE_MASTER se éramos temporários
+     3. Propaga ao vizinho direito (relay em cadeia)
+
+   FIX BUG 1: substitui o simples ESP_LOGI anterior.
+─────────────────────────────────────────────────────────────── */
+void on_master_claim_received_ext(int from_id, int master_id)
+{
+    fsm_network_master_claim_relay(from_id, master_id);
+}
+
+/* ── on_master_claim_received — callback legado (compatibilidade) ──
+   Chamado por postes com firmware v5.1 que enviam formato antigo.
+   Delega para a versão ext com from_id == master_id.
+─────────────────────────────────────────────────────────────────── */
 void on_master_claim_received(int from_id)
 {
-    ESP_LOGI(TAG, "[UDP] MASTER_CLAIM de ID=%d", from_id);
+    on_master_claim_received_ext(from_id, from_id);
 }
 
 
@@ -137,27 +154,20 @@ void sm_on_right_neighbor_online(void)
    sm_process_event — ponto central de eventos do tracking
    ──────────────────────────────────────────────────────────
    Chamado pela fsm_task para cada evento pendente.
-   Cada veículo gera no máximo: DETECTED → LOCAL → PASSED.
-   Nunca LOCAL sem DETECTED antes (tracking_manager garante ordem).
-
-   NOTA: nenhum case chama dali_* directamente.
-   Todos os cases apenas actualizam g_fsm_state e variáveis
-   de contagem. A aplicação de brilho é feita por
-   fsm_aplicar_luz() em fsm_task.c após este ciclo de eventos.
+   Nenhum case chama dali_* directamente.
+   A aplicação de brilho é feita por fsm_aplicar_luz() em
+   fsm_task.c após este ciclo de eventos.
 ============================================================ */
 void sm_process_event(sm_event_type_t type, uint16_t vehicle_id,
                       float vel, uint32_t eta_ms, int16_t x_mm)
 {
+    (void)vehicle_id;
+
     switch (type) {
 
-        /* ── DETECTED — primeiro avistamento pelo radar ────────
-           Responsabilidade: preparar ETA e mudar estado.
-           NÃO faz T++ — o veículo ainda não está confirmado.
-           NÃO envia TC_INC — só EVT_LOCAL propaga na cadeia.
-           NÃO chama dali — fsm_aplicar_luz() trata no ciclo seguinte. */
+        /* ── DETECTED — primeiro avistamento pelo radar ──────── */
         case SM_EVT_VEHICLE_DETECTED:
-            ESP_LOGI(TAG, "[DETECÇÃO] Objecto a %.1fm | %.1f km/h",
-                     (float)eta_ms / 1000.0f > 0.1f ? (float)eta_ms / 1000.0f : 0.5f,
+            ESP_LOGI(TAG, "[DETECÇÃO] Objecto | %.1f km/h",
                      vel > 0.3f ? vel : 0.3f);
 
             if (g_fsm_state == STATE_AUTONOMO &&
@@ -170,7 +180,8 @@ void sm_process_event(sm_event_type_t type, uint16_t vehicle_id,
             g_fsm_last_speed     = vel;
 
             if (eta_ms > MARGEM_ACENDER_MS)
-                g_fsm_acender_em_ms = fsm_agora_ms() + (uint64_t)(eta_ms - MARGEM_ACENDER_MS);
+                g_fsm_acender_em_ms = fsm_agora_ms() +
+                                      (uint64_t)(eta_ms - MARGEM_ACENDER_MS);
             else
                 g_fsm_acender_em_ms = fsm_agora_ms();
 
@@ -182,11 +193,7 @@ void sm_process_event(sm_event_type_t type, uint16_t vehicle_id,
             break;
 
 
-        /* ── LOCAL — veículo confirmado fisicamente no radar ───
-           Responsabilidade: handover T/Tc, propagar na cadeia.
-           É aqui que T++ acontece — UMA VEZ por veículo.
-           TC_INC é enviado UMA VEZ — para o vizinho direito.
-           NÃO chama dali — fsm_aplicar_luz() trata no ciclo seguinte. */
+        /* ── LOCAL — veículo confirmado fisicamente no radar ─── */
         case SM_EVT_VEHICLE_LOCAL:
             ESP_LOGI(TAG, "[LUZ ON] Objecto confirmado | %.1f km/h | T=%d",
                      vel, g_fsm_T + 1);
@@ -213,9 +220,10 @@ void sm_process_event(sm_event_type_t type, uint16_t vehicle_id,
             break;
 
 
+        /* ── PASSED — veículo saiu do radar ─────────────────── */
         case SM_EVT_VEHICLE_PASSED:
-            ESP_LOGI(TAG, "[SAÍDA] Objecto saiu | T=%d → LUZ OFF em %ds",
-                     g_fsm_T > 0 ? g_fsm_T - 1 : 0, TRAFIC_TIMEOUT_MS / 1000);
+            ESP_LOGI(TAG, "[SAÍDA] Objecto saiu | T=%d",
+                     g_fsm_T > 0 ? g_fsm_T - 1 : 0);
 
             g_fsm_acender_em_ms = 0;
 
@@ -229,6 +237,7 @@ void sm_process_event(sm_event_type_t type, uint16_t vehicle_id,
             break;
 
 
+        /* ── OBSTACULO — veículo parado ──────────────────────── */
         case SM_EVT_VEHICLE_OBSTACULO:
             ESP_LOGW(TAG, "[OBSTÁCULO] Objecto parado | LUZ MÁXIMA");
 
@@ -244,4 +253,19 @@ void sm_process_event(sm_event_type_t type, uint16_t vehicle_id,
         default:
             break;
     }
+}
+
+
+/* ============================================================
+   COMPATIBILIDADE
+============================================================ */
+
+void sm_on_radar_detect(float vel)
+{
+    sm_process_event(SM_EVT_VEHICLE_LOCAL, 0, vel, 0, 0);
+}
+
+void sm_inject_test_car(float vel)
+{
+    sm_process_event(SM_EVT_VEHICLE_LOCAL, 0, vel, 0, 0);
 }

@@ -1,7 +1,7 @@
 /* ============================================================
    MÓDULO     : fsm_events
    FICHEIRO   : fsm_events.h — Declarações de eventos da FSM
-   VERSÃO     : 1.0  |  2026-04-26
+   VERSÃO     : 3.2  |  2026-05-02
    PROJECTO   : Poste Inteligente v8
    AUTORES    : Luis Custódio | Tiago Moreno
    PLATAFORMA : ESP32 (ESP-IDF v5.x)
@@ -11,24 +11,15 @@
    Processamento de todos os eventos do pipeline tracking → FSM
    e dos callbacks UDP recebidos do comm_manager.
 
-   EVENTOS:
-   ────────
-   SM_EVT_VEHICLE_DETECTED   → prepara ETA (sem T++)
-   SM_EVT_VEHICLE_APPROACHING → pré-acendimento local
-   SM_EVT_VEHICLE_PASSED     → T--, SPD ao vizinho direito
-   SM_EVT_VEHICLE_LOCAL      → Tc--, T++, luz ON, propaga
-   SM_EVT_VEHICLE_OBSTACULO  → STATE_OBSTACULO, luz máxima
-
-   CALLBACKS UDP:
-   ──────────────
-   on_tc_inc_received()      → Tc++
-   on_prev_passed_received() → T--
-   on_spd_received()         → agenda ETA
-   on_master_claim_received()→ log
+   ALTERAÇÕES v3.1 → v3.2:
+   ─────────────────────────
+   - ADICIONADO: on_master_claim_received_ext(from_id, master_id)
+     Callback com dois parâmetros para suporte ao relay em cadeia.
+     Delega para fsm_network_master_claim_relay().
 
    DEPENDÊNCIAS:
    ─────────────
-   fsm_core.h, comm_manager.h, dali_manager.h, state_machine.h
+   fsm_core.h, fsm_network.h, comm_manager.h, state_machine.h
 ============================================================ */
 
 #ifndef FSM_EVENTS_H
@@ -42,11 +33,6 @@
 
 /**
  * @brief Processa um evento do pipeline tracking → FSM.
- * @param type       Tipo de evento (SM_EVT_*)
- * @param vehicle_id ID do veículo (tracking_manager)
- * @param vel        Velocidade em km/h
- * @param eta_ms     ETA em ms (0 se não disponível)
- * @param x_mm       Posição lateral em mm
  */
 void sm_process_event(sm_event_type_t type,
                       uint16_t vehicle_id,
@@ -65,8 +51,17 @@ void on_prev_passed_received(float speed);
 /** Recebe SPD → actualiza ETA de pré-acendimento */
 void on_spd_received(float speed, uint32_t eta_ms, int16_t x_mm);
 
-/** Recebe MASTER_CLAIM → log */
+/**
+ * @brief Callback legado — recebe MASTER_CLAIM formato antigo.
+ *        Delega para on_master_claim_received_ext(from_id, from_id).
+ */
 void on_master_claim_received(int from_id);
+
+/**
+ * @brief Callback novo v3.2 — recebe MASTER_CLAIM com relay completo.
+ *        Delega para fsm_network_master_claim_relay(from_id, master_id).
+ */
+void on_master_claim_received_ext(int from_id, int master_id);
 
 /* ── Compatibilidade e injecção de teste ─────────────────── */
 
