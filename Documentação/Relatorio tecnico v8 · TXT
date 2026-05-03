@@ -1,0 +1,576 @@
+================================================================================
+   RELATÓRIO TÉCNICO — POSTE INTELIGENTE v8
+   Estados, Tempos de Resposta, Failover e Comportamentos de Rede
+================================================================================
+   Data        : 2026-05-02
+   Projecto    : Poste Inteligente v8
+   Firmware    : fsm_network v3.0 + udp_manager v5.2
+   Autores     : Luis Custódio | Tiago Moreno
+   Plataforma  : ESP32 dual-core (Xtensa LX6) + HLK-LD2450
+================================================================================
+
+
+════════════════════════════════════════════════════════════════════════════════
+  PARTE 1 — ESTADOS DA MÁQUINA DE ESTADOS
+════════════════════════════════════════════════════════════════════════════════
+
+  O sistema tem 6 estados distintos. Cada poste encontra-se em exactamente
+  um estado em cada instante. As transições são deterministas — não há
+  transições implícitas nem condições ambíguas.
+
+  ┌─────────────┬────────────────────────────────────────────────────────────┐
+  │ Estado      │ Significado                                                │
+  ├─────────────┼────────────────────────────────────────────────────────────┤
+  │ IDLE        │ Repouso. Sem veículos. Luz a LIGHT_MIN (10%).             │
+  │             │ Pronto para receber TC_INC ou detecção local.             │
+  ├─────────────┼────────────────────────────────────────────────────────────┤
+  │ LIGHT_ON    │ Veículo detectado ou anunciado. Luz a LIGHT_MAX (100%).   │
+  │             │ Permanece até T=0 e Tc=0 e TRAFIC_TIMEOUT expirar.       │
+  ├─────────────┼────────────────────────────────────────────────────────────┤
+  │ MASTER      │ Líder da cadeia. Primeiro poste activo à esquerda.        │
+  │             │ Envia MASTER_CLAIM em heartbeat de 30s.                   │
+  │             │ Pode ser permanente (pos==0) ou temporário (failover).    │
+  ├─────────────┼────────────────────────────────────────────────────────────┤
+  │ AUTONOMO    │ Radar OK mas sem vizinhos na rede.                        │
+  │             │ Opera localmente: detecção + luz, sem protocolo T/Tc.     │
+  │             │ Sai quando vizinhos aparecem.                             │
+  ├─────────────┼────────────────────────────────────────────────────────────┤
+  │ SAFE_MODE   │ Falha física do radar (UART sem frames por 8s).           │
+  │             │ Luz fixa a LIGHT_SAFE_MODE (50%) por segurança.           │
+  │             │ Ignora todos os eventos de tráfego.                       │
+  ├─────────────┼────────────────────────────────────────────────────────────┤
+  │ OBSTACULO   │ Objecto parado detectado (vel ≤ 3 km/h por ≥80 frames).  │
+  │             │ Luz a 100%. Posição fixa no display. Ignora outros        │
+  │             │ veículos. NÃO envia TC_INC. Remove após 8s sem detecção. │
+  └─────────────┴────────────────────────────────────────────────────────────┘
+
+
+1.1  PRIORIDADE DE ESTADOS
+───────────────────────────
+  Quando múltiplas condições existem simultaneamente:
+
+    SAFE_MODE  >  OBSTACULO  >  LIGHT_ON  >  MASTER  >  AUTONOMO  >  IDLE
+
+  SAFE_MODE tem prioridade máxima absoluta — entra independentemente de qualquer
+  outro estado e só sai quando o radar recupera.
+
+  OBSTACULO tem prioridade sobre LIGHT_ON — um veículo parado substitui
+  veículos em movimento na gestão de iluminação.
+
+
+1.2  CONDIÇÕES DE ENTRADA E SAÍDA DE CADA ESTADO
+──────────────────────────────────────────────────
+
+  IDLE → LIGHT_ON:
+    - EVT_VEHICLE_DETECTED (primeiro avistamento pelo radar local)
+    - EVT_VEHICLE_LOCAL    (confirmação física no radar)
+    - on_tc_inc_received() (veículo anunciado por UDP do poste à esquerda)
+    - Passo 6: ETA atingido com Tc > 0 (pré-acendimento)
+
+  LIGHT_ON → IDLE:
+    - T = 0 E Tc = 0 E TRAFIC_TIMEOUT_MS (5 000 ms) expirou
+    - Apagamento é sempre diferido: nunca apaga instantaneamente
+
+  IDLE/MASTER/AUTONOMO → LIGHT_ON:
+    - Qualquer evento de veículo (ver acima)
+
+  IDLE → MASTER:
+    - comm_is_master() retorna true (pos=0 ou viz.esq. offline)
+    - fsm_network_master() detecta a condição
+
+  MASTER → IDLE:
+    - comm_is_master() retorna false (vizinho esq. voltou online)
+    - Ou recebe MASTER_CLAIM de MASTER superior
+
+  IDLE/LIGHT_ON → SAFE_MODE:
+    - g_fsm_radar_ok = false (80 ciclos × 100ms = 8s sem frame UART)
+
+  SAFE_MODE → IDLE ou MASTER:
+    - g_fsm_radar_ok = true (3 frames consecutivos válidos)
+
+  IDLE → AUTONOMO:
+    - Sem vizinhos conhecidos por mais de AUTONOMO_DELAY_MS (10s)
+    - Só se não for MASTER e não estiver em LIGHT_ON ou OBSTACULO
+
+  AUTONOMO → IDLE/MASTER:
+    - Vizinho descoberto via DISCOVER UDP
+
+  LIGHT_ON → OBSTACULO:
+    - EVT_VEHICLE_OBSTACULO (≥80 frames com vel ≤ 3 km/h)
+
+  OBSTACULO → IDLE:
+    - Sem detecção de obstáculo por OBSTACULO_REMOVE_MS (8 000 ms)
+
+
+════════════════════════════════════════════════════════════════════════════════
+  PARTE 2 — TEMPOS DE RESPOSTA ENTRE POSTES
+════════════════════════════════════════════════════════════════════════════════
+
+2.1  CICLOS DE EXECUÇÃO (BASE DE TEMPO)
+────────────────────────────────────────
+  O sistema é orientado a ciclos fixos. Todas as latências são múltiplos
+  destes períodos:
+
+  ┌─────────────────────┬──────────┬────────┬──────────────────────────────┐
+  │ Task                │ Período  │ Core   │ Função                       │
+  ├─────────────────────┼──────────┼────────┼──────────────────────────────┤
+  │ fsm_task            │  100 ms  │ Core 1 │ FSM, T/Tc, estados, DALI     │
+  │ radar_task          │  100 ms  │ Core 0 │ Leitura UART HLK-LD2450       │
+  │ udp_task            │   10 ms  │ Core 0 │ Recepção/envio UDP            │
+  │ display_task        │   20 ms  │ Core 1 │ LVGL + ST7789                 │
+  │ monitor_task        │  200 ms  │ Core 1 │ Watchdog + heartbeats         │
+  └─────────────────────┴──────────┴────────┴──────────────────────────────┘
+
+  O radar HLK-LD2450 opera a ~10 Hz (frame a cada 100 ms).
+  O loop fsm_task está sincronizado com este período.
+
+
+2.2  LATÊNCIA DA DETECÇÃO LOCAL → LUZ ACESA
+─────────────────────────────────────────────
+  Sequência interna num único poste:
+
+    t=0       radar_task lê frame e chama tracking_manager_update()
+    t=0 ms    atomic_bool s_radar_teve_frame = true
+    t≤100 ms  fsm_task acorda, lê atomic_bool, processa eventos
+    t≤100 ms  EVT_VEHICLE_LOCAL → g_fsm_state = STATE_LIGHT_ON
+    t≤100 ms  fsm_aplicar_luz() detecta transição → dali_fade_up()
+    t≤100+F   DALI fade up completo (F = 300/500/800 ms por velocidade)
+
+  Latência total detecção → luz acesa:
+    Mínimo   :  100 ms + 300 ms =   400 ms  (vel > 3 km/h em laboratório)
+    Médio    :  100 ms + 500 ms =   600 ms
+    Máximo   :  100 ms + 800 ms =   900 ms  (vel ≤ 1 km/h)
+
+  Na prática, o pré-acendimento por ETA elimina esta latência para
+  postes a partir do segundo — a luz já está acesa quando o veículo chega.
+
+
+2.3  LATÊNCIA DA DETECÇÃO → ANÚNCIO TCP_INC AO POSTE SEGUINTE
+───────────────────────────────────────────────────────────────
+  Sequência completa (Poste A detecta, anuncia ao Poste B):
+
+    t=0 ms    EVT_VEHICLE_LOCAL em Poste A
+    t≤100 ms  comm_send_tc_inc() → udp_manager_send_tc_inc() → sendto()
+    t≤110 ms  udp_task de B recebe o pacote (ciclo 10ms)
+    t≤110 ms  on_tc_inc_received() em B → g_fsm_Tc = 1, g_fsm_state = LIGHT_ON
+    t≤110 ms  Próximo ciclo fsm_task de B → fsm_aplicar_luz() → dali_fade_up()
+    t≤110+F   Luz de B acesa
+
+  Latência total A detecta → B acende:
+    Melhor caso :  100 ms (FSM) + 10 ms (UDP) + 0 ms (ETA) ≈  110 ms
+    Pior caso   :  100 ms (FSM) + 10 ms (UDP) + 100 ms (FSM ciclo B) ≈ 210 ms
+
+  Nota: o SPD (ETA) é enviado em simultâneo com o TC_INC. O poste B pode
+  pré-agendar o acendimento com antecipação de MARGEM_ACENDER_MS (500 ms)
+  face ao ETA calculado. Na prática, a luz de B acende antes de o veículo chegar.
+
+
+2.4  LATÊNCIA DO VEÍCULO SAIR → LUZ APAGAR
+────────────────────────────────────────────
+  O apagamento é sempre diferido — nunca instantâneo:
+
+    t=0       EVT_VEHICLE_PASSED → T-- → se T==0 e Tc==0: agenda apagamento
+    t+5 000ms TRAFIC_TIMEOUT_MS expira → transição LIGHT_ON → IDLE
+    t+5 000ms fsm_aplicar_luz() → dali_fade_down()
+    t+9 000ms DALI fade down completo (FADE_DOWN_MS = 4 000 ms)
+
+  Tempo total detecção saída → luz apagada: ~9 segundos
+  (5s timeout + 4s fade down DALI)
+
+  Se chegarem mais veículos durante este período, o timer reinicia.
+
+
+2.5  LATÊNCIA DE DISCOVER (POSTE NOVO NA REDE)
+───────────────────────────────────────────────
+  Quando um poste arranca ou volta online:
+
+    t=0       udp_manager_discover() → broadcast DISCOVER:<id>:<pos>
+    t≤10 ms   Vizinho recebe via udp_task (ciclo 10ms)
+    t≤10 ms   Responde com STATUS:<id>:<estado>
+    t≤20 ms   Poste original recebe STATUS → cria entrada em s_vizinhos[]
+    t≤100 ms  fsm_network detecta novo vizinho no ciclo fsm_task
+
+  Tempo total para poste novo ser reconhecido: 20–100 ms
+  Broadcasts de DISCOVER repetem-se a cada DISCOVER_INTERVAL_MS (2 000 ms).
+  Se a primeira tentativa falhar, o poste é descoberto no máximo em 2 s.
+
+
+2.6  LATÊNCIA MASTER_CLAIM (HEARTBEAT NORMAL)
+──────────────────────────────────────────────
+  Em operação normal, o poste MASTER (pos=0) envia MASTER_CLAIM
+  periodicamente para refrescar a liderança em toda a cadeia:
+
+    Período  : MASTER_CLAIM_HB_MS = 30 000 ms (30 segundos)
+    Propagação: cada poste faz relay imediatamente ao receber
+    Latência por hop: ≤ 10 ms (udp_task)
+    Para cadeia de N postes: N × 10 ms ≤ total
+
+  Para uma cadeia de 10 postes: propagação completa em ≤ 100 ms.
+
+
+════════════════════════════════════════════════════════════════════════════════
+  PARTE 3 — FAILOVER: MASTER PROVISÓRIO
+════════════════════════════════════════════════════════════════════════════════
+
+3.1  CONDIÇÃO DE ARRANQUE DO FAILOVER
+───────────────────────────────────────
+  Cada poste monitoriza o seu vizinho esquerdo em cada ciclo de 100ms.
+  A sequência de failover inicia quando:
+
+    1. Poste B detecta vizinho esq. (A) offline:
+       comm_left_online() = false AND comm_left_known() = true
+    2. g_fsm_left_was_offline = true; g_fsm_left_offline_ms = agora
+    3. Inicia timer silencioso sem mudar de estado
+
+  Nesta fase: B continua em IDLE ou LIGHT_ON normalmente.
+  Nenhuma mensagem UDP é enviada ainda.
+
+
+3.2  PROMOÇÃO A MASTER TEMPORÁRIO
+───────────────────────────────────
+  Condição de activação (verificada a cada 100ms em fsm_network_master()):
+
+    g_fsm_left_was_offline = true
+    AND agora - g_fsm_left_offline_ms > AUTONOMO_DELAY_MS (10 000 ms)
+    AND g_fsm_radar_ok = true
+    AND g_fsm_state ≠ STATE_MASTER, STATE_SAFE_MODE, STATE_OBSTACULO
+
+  NOTA: aceita STATE_LIGHT_ON — um veículo em trânsito não bloqueia
+  a eleição. (Bug 3 corrigido na v3.0)
+
+  Acções imediatas (no mesmo ciclo):
+    1. g_fsm_state = STATE_MASTER
+    2. s_master_id_conhecido = POSTE_ID
+    3. comm_send_master_claim_id(POSTE_ID) → vizinho direito
+       (Bug 2 corrigido — sem aguardar heartbeat de 30s)
+    4. g_fsm_master_claim_ms = agora (reset heartbeat)
+
+  Tempo total desde falha até promoção:
+    Melhor caso : 10 000 ms (AUTONOMO_DELAY_MS) + 100 ms (ciclo FSM)
+    Pior caso   : 10 000 ms + 200 ms (ciclo perdido)
+    Total       : ~10.1 a 10.2 segundos
+
+
+3.3  PROPAGAÇÃO DO MASTER_CLAIM EM CADEIA (FIX BUG 1 + 2)
+────────────────────────────────────────────────────────────
+  Após promoção de B a MASTER temporário:
+
+    B envia: "MASTER_CLAIM:<B_id>:<B_id>" → C
+
+    C recebe via udp_task (≤10ms):
+      on_master_claim_received_ext(from=B, master=B)
+      fsm_network_master_claim_relay(B, B):
+        - Regista s_master_id_conhecido = B
+        - Se C era MASTER temporário → cede → IDLE
+        - Envia "MASTER_CLAIM:<C_id>:<B_id>" → D
+
+    D recebe (≤10ms mais tarde):
+      fsm_network_master_claim_relay(C, B):
+        - Regista s_master_id_conhecido = B  (master_id = B, não C)
+        - Envia "MASTER_CLAIM:<D_id>:<B_id>" → E
+    ...e assim sucessivamente.
+
+  Para uma cadeia de N postes à direita de B:
+    Tempo total de propagação = N × 10 ms
+
+  Para 5 postes à direita: propagação completa em ≤ 50 ms após promoção.
+
+  Formato da mensagem no protocolo UDP:
+    "MASTER_CLAIM:<from_id>:<master_id>"
+    O master_id não muda ao longo de toda a cadeia.
+    O from_id identifica quem fez o relay (muda a cada hop).
+
+
+3.4  CENÁRIOS DE FAILOVER DETALHADOS
+──────────────────────────────────────
+
+  CENÁRIO A — Queda do MASTER original (pos=0):
+  ────────────────────────────────────────────────
+    Linha: A(0) B(1) C(2) D(3) E(4)
+    A cai.
+
+    t=0       A para de responder a DISCOVER
+    t=8 000ms NEIGHBOR_TIMEOUT_MS: B marca A como OFFLINE
+    t=8 000ms comm_is_master() → true (viz.esq. = A = OFFLINE → B assume)
+    t=8 000ms fsm_network_master(): B não precisa de esperar AUTONOMO_DELAY
+              porque comm_is_master() já retorna true
+    t≤8 100ms B → STATE_MASTER, envia MASTER_CLAIM(B) → C
+    t≤8 110ms C recebe, relay → D
+    t≤8 120ms D recebe, relay → E
+    t≤8 130ms Toda a cadeia sabe que B é MASTER
+
+    Tempo total queda de A → toda a cadeia com novo MASTER: ~8.1 s
+
+
+  CENÁRIO B — Queda de poste intermédio (C cai):
+  ─────────────────────────────────────────────────
+    Linha: A(0) B(1) C(2) D(3) E(4)
+    C cai.
+
+    Segmento esquerdo (A, B): não afectado. B está em IDLE,
+    A continua como MASTER. Sem alteração.
+
+    Segmento direito (D, E):
+    t=0       C para de responder
+    t=8 000ms D marca C como OFFLINE (NEIGHBOR_TIMEOUT_MS)
+    t=8 000ms g_fsm_left_was_offline = true em D
+    t=18 000ms AUTONOMO_DELAY_MS (10s) expira em D
+    t=18 100ms D → STATE_MASTER temporário
+    t=18 100ms D envia MASTER_CLAIM(D) → E
+    t=18 110ms E recebe, regista D como MASTER do sub-segmento
+    t=18 110ms Relay → F (se existir)
+
+    Sub-segmento D-E-... opera autonomamente com D como líder.
+    O protocolo T/Tc funciona normalmente dentro do sub-segmento.
+
+    Tempo total C cai → sub-segmento D-E operacional: ~18.1 s
+
+
+  CENÁRIO C — Recuperação do poste intermédio (C volta):
+  ─────────────────────────────────────────────────────────
+    Continuação do Cenário B. C recupera.
+
+    t=0       C volta online, envia DISCOVER
+    t≤10ms    D recebe DISCOVER de C, responde com STATUS
+    t≤10ms    D regista C como viz.esq. online
+    t≤100ms   fsm_network_vizinhos() em D detecta esq. online
+    t≤100ms   D → cede MASTER → STATE_IDLE
+    t≤100ms   D envia MASTER_CLAIM(master_id=0) → E  [FIX BUG 5]
+    t≤110ms   E recebe, regista A (id=0) como MASTER real
+    t≤120ms   Relay → F, G, ...
+    t≤30 000ms A envia HB MASTER_CLAIM → propaga por toda a cadeia
+
+    Tempo total C recupera → cadeia reunificada: ≤ 100 ms (detecção) +
+    propagação do relay (N × 10ms). Muito mais rápido que a falha.
+
+
+  CENÁRIO D — Poste isolado (único na rede):
+  ────────────────────────────────────────────
+    Poste em teste sem vizinhos descobertos.
+
+    Se pos=0: imediatamente STATE_MASTER isolado. Opera normalmente.
+    Se pos>0: STATE_AUTONOMO após AUTONOMO_DELAY_MS (10s).
+    Em AUTONOMO: detecta veículos localmente, luz funciona.
+    Sem protocolo T/Tc (não há vizinhos para coordenar).
+
+    Quando vizinhos aparecem: saída imediata de AUTONOMO em ≤ 100ms.
+
+
+3.5  TABELA DE TEMPOS DE FAILOVER
+───────────────────────────────────
+  ┌─────────────────────────────────────────────┬─────────────────────────┐
+  │ Evento                                      │ Tempo de resposta       │
+  ├─────────────────────────────────────────────┼─────────────────────────┤
+  │ Poste fica OFFLINE → detectado              │   8 000 ms              │
+  │ MASTER cai → novo MASTER eleito             │   8 100 ms              │
+  │ Poste intermédio cai → sub-segmento MASTER  │  18 100 ms              │
+  │ Poste intermédio volta → cadeia unificada   │     100 ms              │
+  │ MASTER_CLAIM propaga 1 hop                  │      10 ms              │
+  │ MASTER_CLAIM propaga 10 hops                │     100 ms              │
+  │ Novo poste descoberto                       │  20–2 000 ms            │
+  │ Saída de AUTONOMO quando vizinho aparece    │     100 ms              │
+  └─────────────────────────────────────────────┴─────────────────────────┘
+
+
+════════════════════════════════════════════════════════════════════════════════
+  PARTE 4 — OBSTÁCULOS: DETECÇÃO, COMPORTAMENTO E REMOÇÃO
+════════════════════════════════════════════════════════════════════════════════
+
+4.1  CONDIÇÕES DE DETECÇÃO DE OBSTÁCULO
+─────────────────────────────────────────
+  O tracking_manager classifica um veículo como obstáculo quando:
+
+    - Velocidade ≤ 3 km/h  (OBSTACULO_SPEED_MAX_KMH = 3.0 em laboratório,
+                             OBSTACULO_SPEED_MAX_KMH = 3.0 em produção)
+    - Frames consecutivos com esta condição ≥ 80  (OBSTACULO_MIN_FRAMES)
+    - Mesmo vehicle_id confirmado
+
+  Tempo mínimo para classificar obstáculo:
+    80 frames × 100 ms/frame = 8 000 ms = 8 segundos
+
+
+4.2  COMPORTAMENTO EM MODO OBSTÁCULO
+──────────────────────────────────────
+  Quando EVT_VEHICLE_OBSTACULO é processado pela FSM:
+
+    Iluminação:
+      - Luz → LIGHT_MAX (100%) imediatamente
+      - Sem fade: máxima visibilidade instantânea
+      - Mantém-se a 100% enquanto obstáculo activo
+
+    Display:
+      - Posição do veículo congelada (não actualiza com novos frames)
+      - Indicador visual de obstáculo
+
+    Protocolo T/Tc:
+      - comm_notify_prev_passed() enviado ao viz.esq. (cancela Tc pendente)
+      - NÃO envia TC_INC (obstáculo não "viaja" — não avisa o poste seguinte)
+      - Outros veículos que passam são ignorados pelo tracking
+      - T e Tc não são actualizados durante OBSTACULO
+
+    Rede:
+      - STATUS deste poste responde "OBST" ao DISCOVER
+      - Vizinhos à esquerda sabem que este poste está em OBSTACULO
+      - Vizinhos à direita continuam a receber SPD normalmente
+
+
+4.3  REMOÇÃO AUTOMÁTICA DO OBSTÁCULO
+──────────────────────────────────────
+  Condição de remoção:
+
+    Sem detecção de obstáculo pelo radar por OBSTACULO_REMOVE_MS (8 000 ms)
+
+  O timer é resetado (keepalive) a cada 100ms enquanto o radar continua
+  a detectar o obstáculo. Só começa a contar quando o radar deixa de ver.
+
+  Sequência de remoção:
+    t=0       Radar deixa de detectar o obstáculo
+    t=8 000ms OBSTACULO_REMOVE_MS expira
+    t=8 000ms fsm_timer.c passo 8 detecta timeout
+    t=8 000ms display_manager_clear_obstacle() (posição descongelada)
+    t≤8 100ms g_fsm_state → IDLE (se T=0 e Tc=0)
+    t≤8 100ms fsm_aplicar_luz() detecta transição → fade down
+    t≤12 100ms Luz apagada (8s + 4s fade down = 12s total desde última detecção)
+
+
+4.4  CENÁRIO DE OBSTÁCULO COM VEÍCULOS EM CIRCULAÇÃO
+──────────────────────────────────────────────────────
+  Linha: A(0) B(1) [C=OBSTÁCULO] D(2) E(3)
+  Um veículo V passa pela cadeia enquanto C tem um obstáculo.
+
+  Em A: V detectado → T++, Tc=0, TC_INC → B
+  Em B: TC_INC recebido → Tc++ → LIGHT_ON, aguarda V
+        V chega → T++, Tc-- → PASSED → A, TC_INC → C
+  Em C: ESTADO = OBSTACULO — ignora TC_INC de B
+        NÃO envia TC_INC → D
+        D nunca recebe aviso de V
+  Em D: V chega sem aviso → detecção local → LIGHT_ON (funcionamento AUTONOMO)
+        Mas D não estava preparado com pré-acendimento ETA
+        Latência extra em D: 100ms + fade (conforme velocidade de V)
+
+  NOTA: Esta é a limitação esperada do modo OBSTÁCULO — o poste com
+  obstáculo interrompe intencionalmente o protocolo T/Tc para a direita.
+  A iluminação de D funciona, mas sem pré-acendimento antecipado.
+
+
+════════════════════════════════════════════════════════════════════════════════
+  PARTE 5 — MENSAGENS UDP: TIPOS, FORMATO E TEMPOS
+════════════════════════════════════════════════════════════════════════════════
+
+5.1  TABELA DE MENSAGENS
+──────────────────────────
+  ┌──────────────────────────────────────────┬──────────┬───────────────────┐
+  │ Mensagem                                 │ Direcção │ Trigger           │
+  ├──────────────────────────────────────────┼──────────┼───────────────────┤
+  │ DISCOVER:<id>:<pos>                      │ Broadcast│ Arranque, 2000ms  │
+  │ STATUS:<id>:<estado>                     │ Unicast  │ Resposta DISCOVER  │
+  │ TC_INC:<id>:<vel>:<x_mm>                 │ → Direita│ EVT_VEHICLE_LOCAL  │
+  │ SPD:<id>:<vel>:<eta>:<dist>:<x>          │ → Direita│ LOCAL + PASSED    │
+  │ PASSED:<id>:<vel>                        │ → Esq.   │ EVT_VEHICLE_LOCAL  │
+  │ MASTER_CLAIM:<from_id>:<master_id>       │ → Direita│ Promoção + 30s HB │
+  └──────────────────────────────────────────┴──────────┴───────────────────┘
+
+5.2  ESTADOS CODIFICADOS NO STATUS
+────────────────────────────────────
+  ┌────────┬──────────────────────────────────────────────────────────────┐
+  │ Código │ Significado                                                  │
+  ├────────┼──────────────────────────────────────────────────────────────┤
+  │ OK     │ Operacional (IDLE, LIGHT_ON ou MASTER)                       │
+  │ SAFE   │ SAFE_MODE — radar em falha, poste cego                       │
+  │ AUTO   │ AUTONOMO — sem vizinhos, opera localmente                    │
+  │ OBST   │ OBSTACULO — objecto parado detectado                         │
+  └────────┴──────────────────────────────────────────────────────────────┘
+
+  Quando o vizinho esquerdo reporta "SAFE" ou "OFFLINE":
+    → comm_is_master() retorna true → poste assume papel de MASTER
+
+
+5.3  FREQUÊNCIAS DE CADA MENSAGEM
+────────────────────────────────────
+  DISCOVER    : 1 vez a cada 2 000 ms (periodicidade fixa)
+  STATUS      : 1 vez por cada DISCOVER recebido (reactivo)
+  TC_INC      : 1 vez por veículo confirmado (EVT_LOCAL)
+  SPD         : 1 vez por EVT_LOCAL + 1 vez por EVT_PASSED
+  PASSED      : 1 vez por EVT_LOCAL (notifica viz.esq.)
+  MASTER_CLAIM: 1 vez na promoção + 1 vez a cada 30 000 ms
+
+
+════════════════════════════════════════════════════════════════════════════════
+  PARTE 6 — CONSTANTES DO SISTEMA E IMPACTO DE CADA UMA
+════════════════════════════════════════════════════════════════════════════════
+
+  ┌──────────────────────────┬──────────┬───────────────────────────────────┐
+  │ Constante                │ Valor    │ Impacto se alterada               │
+  ├──────────────────────────┼──────────┼───────────────────────────────────┤
+  │ TRAFIC_TIMEOUT_MS        │ 5 000 ms │ Tempo mínimo com luz acesa        │
+  │ TC_TIMEOUT_MS            │ 10 000ms │ Segurança: Tc não fica preso      │
+  │ T_STUCK_TIMEOUT_MS       │ 15 000ms │ Segurança: T não fica preso       │
+  │ OBSTACULO_REMOVE_MS      │ 8 000 ms │ Tempo para sair do modo obstáculo │
+  │ AUTONOMO_DELAY_MS        │ 10 000ms │ Tempo para promoção a MASTER tmp. │
+  │ NEIGHBOR_TIMEOUT_MS      │ 8 000 ms │ Tempo para marcar viz. OFFLINE    │
+  │ DISCOVER_INTERVAL_MS     │ 2 000 ms │ Frequência de redescoberta de viz.│
+  │ MASTER_CLAIM_HB_MS       │ 30 000ms │ Heartbeat de liderança MASTER     │
+  │ RADAR_FAIL_COUNT         │ 80 ciclos│ Ciclos sem frame → SAFE_MODE (8s) │
+  │ RADAR_OK_COUNT           │ 3 ciclos │ Frames consecutivos → sai SAFE    │
+  │ MARGEM_ACENDER_MS        │ 500 ms   │ Antecipação do pré-acendimento    │
+  │ FADE_DOWN_MS             │ 4 000 ms │ Duração do apagamento gradual     │
+  │ OBSTACULO_MIN_FRAMES     │ 80       │ Frames para confirmar obstáculo   │
+  └──────────────────────────┴──────────┴───────────────────────────────────┘
+
+
+════════════════════════════════════════════════════════════════════════════════
+  PARTE 7 — DISTRIBUIÇÃO DE PROCESSAMENTO DUAL-CORE
+════════════════════════════════════════════════════════════════════════════════
+
+  Core 0 (PRO_CPU) — comunicações:
+    - udp_task   : recepção/envio UDP, 10ms, Prio 5
+    - radar_task : leitura UART HLK-LD2450, 100ms, Prio 5
+    - Wi-Fi stack: gerida pelo ESP-IDF, Prio 22-23
+
+  Core 1 (APP_CPU) — lógica e interface:
+    - monitor_task : watchdog + heartbeats, 200ms, Prio 7
+    - fsm_task     : FSM + T/Tc + DALI, 100ms, Prio 6
+    - display_task : LVGL + ST7789, 20ms, Prio 4
+
+  Sincronização inter-core:
+    - radar_task → fsm_task : atomic_bool (sem mutex, lock-free)
+    - udp_task → fsm_task   : callbacks on_* (escrita de int32 — atómica em LX6)
+    - fsm_task → display    : tracking_manager com mutex FreeRTOS
+
+  Os callbacks UDP (on_tc_inc_received, on_master_claim_received_ext)
+  correm no Core 0. Escrevem em g_fsm_T/g_fsm_Tc (int32 alinhado).
+  No Xtensa LX6, leituras/escritas de int32 alinhado são atómicas.
+  Não é necessário mutex para estas variáveis específicas.
+
+
+════════════════════════════════════════════════════════════════════════════════
+  PARTE 8 — RESUMO EXECUTIVO
+════════════════════════════════════════════════════════════════════════════════
+
+  OPERAÇÃO NORMAL:
+    - Luz acende em ≤ 100 ms após detecção local
+    - Poste seguinte preparado via SPD (ETA) — luz acende antes do veículo
+    - Apagamento diferido: 5s timeout + 4s fade = 9s após saída do veículo
+    - Protocolo T/Tc garante que a luz não apaga com veículos em trânsito
+
+  FAILOVER:
+    - Vizinho offline detectado em 8s (NEIGHBOR_TIMEOUT_MS)
+    - Novo MASTER eleito em 8.1s (queda de MASTER) ou 18.1s (intermédio)
+    - Propagação do MASTER_CLAIM a toda a cadeia em N × 10ms
+    - Recuperação de poste → cadeia reunificada em ≤ 100ms
+
+  OBSTÁCULO:
+    - Detecção após 8s de imobilidade (80 frames × 100ms)
+    - Luz → 100% imediatamente na detecção
+    - Remoção automática 8s após desaparecimento do radar
+    - Protocolo T/Tc interrompido para a direita enquanto activo
+
+  DEGRADAÇÃO GRACIOSA:
+    - Radar offline: SAFE_MODE, luz a 50%, sem protocolo T/Tc
+    - Sem rede: AUTONOMO, detecção e luz locais funcionam
+    - Falha parcial da cadeia: sub-segmentos operam de forma independente
+      com MASTER temporário eleito automaticamente
+
+================================================================================
+FIM DO RELATÓRIO
+================================================================================

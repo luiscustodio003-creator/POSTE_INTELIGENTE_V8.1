@@ -57,15 +57,15 @@
    ATENÇÃO: POST_POSITION deve ser único e sequencial.
             POSTE_ID     deve ser único em toda a rede.
 ============================================================ */
-#define POSTE_ID              1
-#define POSTE_NAME            "POSTE 01"
-#define POST_POSITION         0
+#define POSTE_ID              2
+#define POSTE_NAME            "POSTE 02"
+#define POST_POSITION         1
 
 
 /* ============================================================
    DISPLAY — RESOLUÇÃO VERTICAL
 ============================================================ */
-#define LCD_V_RES_CONFIG    320  /* 240 = ecrã 240×240 | 320 = ecrã 240×320 */
+#define LCD_V_RES_CONFIG   240 /* 240 = ecrã 240×240 | 320 = ecrã 240×320 */
 
 
 /* ============================================================
@@ -80,6 +80,21 @@
 #define WIFI_AP_CHANNEL        1
 #define WIFI_RETRY_ATTEMPTS   5
 #define WIFI_RECONNECT_MS     30000
+
+/* Endereçamento IP da rede interna de postes
+   MASTER (pos=0) → 192.168.4.1  (AP — automático ESP-IDF)
+   Outros postes  → 192.168.4.(POST_POSITION + 1)
+   pos=1 → 192.168.4.2 | pos=2 → 192.168.4.3 | ...      */
+#define POSTE_IP_LAST_OCTET  (POST_POSITION + 1)
+
+/* Gama de rede interna dos postes (rede AP do MASTER)
+   Cada poste recebe WIFI_AP_IP_1.IP_2.IP_3.(POST_POSITION+1)
+   Para mudar de gama basta alterar aqui                        */
+#define WIFI_AP_IP_1        192
+#define WIFI_AP_IP_2        168
+#define WIFI_AP_IP_3          4
+#define WIFI_AP_GW_LAST       1   /* IP do MASTER = último octeto */
+
 
 
 

@@ -1,22 +1,41 @@
 /* ============================================================
    MÓDULO     : tracking_manager
    FICHEIRO   : tracking_manager.h — Declarações públicas
-   VERSÃO     : 1.1  |  2026-04-20
+   VERSÃO     : 1.2  |  2026-05-03
    PROJECTO   : Poste Inteligente v8
    AUTORES    : Luis Custódio | Tiago Moreno
    PLATAFORMA : ESP32 (ESP-IDF v5.x)
 
+   ALTERAÇÕES v1.1 → v1.2:
+   ─────────────────────────
+   - ADICIONADO: event_local_pending na struct tracked_vehicle_t.
+     Separa o conceito de "veículo confirmado fisicamente na zona
+     local" (LOCAL → T++) de "veículo a aproximar-se" (APPROACHING
+     → só ETA/pré-acendimento).
+
+     Antes: event_approach_pending era usado para os dois fins —
+       o fsm_task disparava SM_EVT_VEHICLE_LOCAL com ele, o que era
+       conceptualmente errado e causava confusão.
+
+     Depois:
+       event_local_pending    → SM_EVT_VEHICLE_LOCAL    (T++, TC_INC)
+       event_approach_pending → SM_EVT_VEHICLE_APPROACHING (só ETA)
+
+     Activação no tracking_manager.c:
+       event_detected_pending  : TENTATIVE → CONFIRMED
+       event_approach_pending  : CONFIRMED → APPROACHING (speed_signed ≤ threshold)
+       event_local_pending     : APPROACHING, distance_m ≤ RADAR_DETECT_M
+       event_passed_pending    : APPROACHING/CONFIRMED → COASTING → EXITED
+       event_obstaculo_pending : speed_kmh ≤ OBSTACULO_SPEED_MAX por N frames
+
    ALTERAÇÕES v1.0 → v1.1:
    ─────────────────────────
-   - Adicionados campos de detecção de obstáculo estático
-     à struct tracked_vehicle_t:
-       speed_kmh_max        — velocidade máxima registada
-       obstaculo_frames     — frames consecutivos parado
-       event_obstaculo_pending — flag de evento para a FSM
+   - Adicionados campos de detecção de obstáculo estático:
+       speed_kmh_max, obstaculo_frames, event_obstaculo_pending
 
    RESPONSABILIDADE:
    ─────────────────
-   Camada intermédia entre radar_manager e event_manager.
+   Camada intermédia entre radar_manager e state_machine.
    Recebe frames brutos (radar_data_t), associa alvos entre
    frames por proximidade (nearest-neighbour), atribui IDs
    estáveis, suaviza a velocidade e determina quando um veículo
@@ -24,14 +43,14 @@
 
    PIPELINE:
    ─────────
-   radar_manager  → lê UART, valida frames, devolve radar_data_t
+   radar_manager    → lê UART, valida frames, devolve radar_data_t
    tracking_manager → associa, filtra, gera tracked_vehicle_t[]
-   state_machine_task → consome eventos, acciona FSM
+   fsm_task         → consome eventos, acciona FSM
 
    THREADING:
    ──────────
-   tracking_manager_update() — exclusivo da radar_task.
-   tracking_manager_get_vehicles() — thread-safe (mutex interno).
+   tracking_manager_update()    — exclusivo da radar_task (Core 0)
+   tracking_manager_get_vehicles() — thread-safe (mutex interno)
 ============================================================ */
 
 #ifndef TRACKING_MANAGER_H
@@ -95,9 +114,34 @@ typedef struct {
 
     bool        active;         /* Actualizado no último frame        */
 
-    /* Flags de eventos pendentes — consumidas pela state_machine_task */
+    /* ── Flags de eventos pendentes ────────────────────────────
+       Consumidas pela fsm_task a cada ciclo de 100ms.
+       Limpas por tracking_manager_clear_events() após consumo.
+
+       event_detected_pending  → SM_EVT_VEHICLE_DETECTED
+         Activado: TENTATIVE → CONFIRMED (primeiro avistamento confirmado)
+         FSM: prepara ETA, muda estado para LIGHT_ON. SEM T++.
+
+       event_approach_pending  → SM_EVT_VEHICLE_APPROACHING
+         Activado: CONFIRMED → APPROACHING (velocidade em direcção ao poste)
+         FSM: só agenda pré-acendimento por ETA. SEM T++. SEM TC_INC.
+
+       event_local_pending     → SM_EVT_VEHICLE_LOCAL       [NOVO v1.2]
+         Activado: estado APPROACHING + distance_m ≤ RADAR_DETECT_M
+         FSM: T++, Tc--, TC_INC→dir, PASSED→esq se Tc>0.
+         É este o evento que representa "veículo na minha zona física".
+
+       event_passed_pending    → SM_EVT_VEHICLE_PASSED
+         Activado: COASTING → EXITED (radar perdeu o veículo)
+         FSM: T-- (ou aguarda PASSED de B), SPD→dir.
+
+       event_obstaculo_pending → SM_EVT_VEHICLE_OBSTACULO
+         Activado: N frames consecutivos com vel ≤ OBSTACULO_SPEED_MAX
+         FSM: STATE_OBSTACULO, luz 100%, posição fixa no display.
+    ──────────────────────────────────────────────────────────── */
     bool        event_detected_pending;   /* VEHICLE_DETECTED         */
     bool        event_approach_pending;   /* VEHICLE_APPROACHING       */
+    bool        event_local_pending;      /* VEHICLE_LOCAL    [v1.2]  */
     bool        event_passed_pending;     /* VEHICLE_PASSED            */
     bool        event_obstaculo_pending;  /* VEHICLE_OBSTACULO         */
 
@@ -115,40 +159,32 @@ typedef struct {
 
 /* ── API pública ───────────────────────────────────────────── */
 
-/* Inicializa o módulo — chamar uma vez antes de qualquer update */
+/** Inicializa o módulo — chamar uma vez antes de qualquer update */
 void tracking_manager_init(void);
 
-/* Processa um frame do radar — chamar exclusivamente da radar_task */
+/** Processa um frame do radar — chamar exclusivamente da radar_task */
 void tracking_manager_update(const radar_data_t *data);
 
-/* Copia estado actual dos veículos — thread-safe */
+/** Copia estado actual dos veículos — thread-safe */
 bool tracking_manager_get_vehicles(tracked_vehicle_t *out,
                                    uint8_t *out_count);
 
-/* Marca eventos de um veículo como consumidos */
+/** Marca eventos de um veículo como consumidos */
 void tracking_manager_clear_events(uint16_t vehicle_id);
 
-/* Estatísticas de diagnóstico */
+/** Estatísticas de diagnóstico */
 void tracking_manager_get_stats(trk_stats_t *out);
 
-/* Reset estado  tracking */
+/** Reset completo do estado de tracking */
 void tracking_manager_reset(void);
 
-/* Nome legível de um estado */
+/** Nome legível de um estado */
 const char *tracking_state_name(trk_state_t state);
 
-/* No ficheiro components/tracking_manager/include/tracking_manager.h */
-
-/**
- * @brief Notifica o gestor de tracking sobre a receção de um frame de radar.
- * @param ok True se o frame for válido.
- */
+/** Notifica sobre recepção de frame do radar (atomic) */
 void tracking_manager_task_notify_frame(bool ok);
 
-/**
- * @brief Obtém o estado de saúde/conectividade do radar.
- * @return True se o radar estiver a comunicar ativamente.
- */
+/** Retorna saúde do radar */
 bool tracking_manager_get_radar_status(void);
 
 

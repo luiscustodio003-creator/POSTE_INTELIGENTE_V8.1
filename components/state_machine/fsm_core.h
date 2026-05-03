@@ -1,7 +1,7 @@
 /* ============================================================
    MÓDULO     : fsm_core
    FICHEIRO   : fsm_core.h — Declarações do núcleo da FSM
-   VERSÃO     : 1.0  |  2026-04-26
+   VERSÃO     : 1.1  |  2026-05-03
    PROJECTO   : Poste Inteligente v8
    AUTORES    : Luis Custódio | Tiago Moreno
    PLATAFORMA : ESP32 (ESP-IDF v5.x)
@@ -11,6 +11,18 @@
    Núcleo da máquina de estados. Contém as variáveis de estado
    partilhadas entre todos os sub-módulos da FSM (fsm_events,
    fsm_network, fsm_timer) e as funções de ciclo de vida.
+
+   ALTERAÇÕES v1.0 → v1.1:
+   ─────────────────────────
+   - ADICIONADO: g_fsm_enviados_dir
+     Contador de TC_INC enviados ao vizinho direito que ainda
+     aguardam confirmação via PASSED. Independente de g_fsm_Tc
+     (que representa veículos a caminho vindos da esquerda).
+
+     Utilização:
+       EVT_LOCAL: g_fsm_enviados_dir++ quando envia TC_INC a B
+       EVT_PASSED: aguarda PASSED de B se g_fsm_enviados_dir > 0
+       on_prev_passed_received: g_fsm_enviados_dir-- quando B confirma
 
    DEPENDÊNCIAS:
    ─────────────
@@ -39,6 +51,7 @@
 extern system_state_t g_fsm_state;
 extern int            g_fsm_T;
 extern int            g_fsm_Tc;
+extern int            g_fsm_enviados_dir;   /* TC_INC enviados a B aguardando PASSED */
 extern float          g_fsm_last_speed;
 extern bool           g_fsm_apagar_pend;
 extern bool           g_fsm_radar_ok;
@@ -71,8 +84,6 @@ void fsm_verificar_radar(bool teve_frame, bool comm_ok);
 
 /**
  * @brief Mantém o obstáculo "vivo" enquanto o radar o continua a detectar.
- *        Chamada pela fsm_task a cada 100ms enquanto existir um slot com
- *        obstaculo_frames >= OBSTACULO_MIN_FRAMES no tracking_manager.
  *        Actualiza g_fsm_obstaculo_last_ms para que OBSTACULO_REMOVE_MS
  *        só comece a contar quando o obstáculo desaparece do radar.
  *        Inofensiva se chamada fora de STATE_OBSTACULO.

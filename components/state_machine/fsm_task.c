@@ -169,12 +169,12 @@ static void _atualiza_radar_display(void)
    ───────────────────────────
    @brief Itera os veículos activos e injeta eventos pendentes na FSM.
 
-   Cada veículo pode ter até 4 flags de evento activas simultaneamente.
+   Cada veículo pode ter até 5 flags de evento activas simultaneamente.
    A ordem de processamento respeita a prioridade lógica:
-     1. DETECTED   — primeiro avistamento (sem luz ainda)
-     2. LOCAL      — veículo confirmado local (T++, muda estado, propaga)
-     3. PASSING    — a aproximar-se (agenda pré-acendimento ETA)
-     4. PASSED     — saiu do radar (T--, SPD ao vizinho direito)
+     1. DETECTED   — primeiro avistamento (sem luz, sem T++)
+     2. APPROACHING — a aproximar-se (só ETA, sem T++, sem TC_INC)
+     3. LOCAL      — entrou na zona local (T++, TC_INC, PASSED se Tc>0)
+     4. PASSED     — saiu do radar (T-- ou aguarda confirmação de B)
      5. OBSTACULO  — veículo parado (STATE_OBSTACULO)
 
    Após consumir todos os eventos, chama tracking_manager_clear_events()
@@ -196,6 +196,7 @@ static void _processa_eventos_tracking(void)
         /* Nenhum evento pendente — passa para o próximo */
         if (!v->event_detected_pending   &&
             !v->event_approach_pending   &&
+            !v->event_local_pending      &&
             !v->event_passed_pending     &&
             !v->event_obstaculo_pending) {
             continue;
@@ -207,19 +208,27 @@ static void _processa_eventos_tracking(void)
                              v->id, v->speed_kmh, v->eta_ms, (int16_t)v->x_mm);
         }
 
-        /* 2. Veículo confirmado local — T++, muda estado, TC_INC + SPD ao vizinho */
+        /* 2. Veículo a aproximar-se — só agenda ETA, SEM T++ SEM TC_INC
+              O veículo ainda não chegou à zona local do radar.          */
         if (v->event_approach_pending) {
+            sm_process_event(SM_EVT_VEHICLE_APPROACHING,
+                             v->id, v->speed_kmh, v->eta_ms, (int16_t)v->x_mm);
+        }
+
+        /* 3. Veículo confirmado NA ZONA LOCAL — T++, TC_INC, PASSED
+              distance_m ≤ RADAR_DETECT_M confirmado pelo tracking.      */
+        if (v->event_local_pending) {
             sm_process_event(SM_EVT_VEHICLE_LOCAL,
                              v->id, v->speed_kmh, v->eta_ms, (int16_t)v->x_mm);
         }
 
-        /* 3. Veículo saiu — T--, agenda apagamento, SPD ao vizinho direito */
+        /* 4. Veículo saiu do radar — T-- ou aguarda confirmação de B */
         if (v->event_passed_pending) {
             sm_process_event(SM_EVT_VEHICLE_PASSED,
                              v->id, v->speed_kmh, 0, (int16_t)v->x_mm);
         }
 
-        /* 4. Veículo parado — entra em STATE_OBSTACULO */
+        /* 5. Veículo parado — entra em STATE_OBSTACULO */
         if (v->event_obstaculo_pending) {
             sm_process_event(SM_EVT_VEHICLE_OBSTACULO,
                              v->id, v->speed_kmh, 0, (int16_t)v->x_mm);

@@ -42,6 +42,7 @@ typedef struct {
     uint8_t  speed_win_filled;
     bool     occupied;
     uint64_t last_seen_ms;
+    bool     local_disparado;  /* LOCAL só dispara UMA VEZ por veículo */
 } trk_slot_t;
 
 /* ── Estado interno do módulo ─────────────────────────────── */
@@ -313,6 +314,22 @@ void tracking_manager_update(const radar_data_t *data)
                     sl->pub.obstaculo_frames = 0;
                 }
 
+                /* ── event_local_pending — UMA VEZ por veículo ──────────
+                   Activado quando o veículo entra fisicamente na zona local
+                   (distance_m ≤ RADAR_DETECT_M). Usa sl->local_disparado
+                   como guarda permanente — não é limpa pelo clear_events(),
+                   só reseta quando o slot é limpo em _limpar_slot().
+                   Garante que T++ acontece exactamente uma vez por veículo,
+                   independentemente de quantos frames o veículo passa na zona. */
+                if (sl->pub.distance_m <= (float)RADAR_DETECT_M &&
+                    !sl->local_disparado                          &&
+                    !sl->pub.event_obstaculo_pending) {
+                    sl->pub.event_local_pending = true;
+                    sl->local_disparado         = true;
+                    ESP_LOGI(TAG, "[ID %u] LOCAL — entrou na zona (dist=%.2fm)",
+                             sl->pub.id, sl->pub.distance_m);
+                }
+
                 /* Actualiza ETA ou volta a CONFIRMED se inverteu */
                 if (sl->pub.speed_signed <= AFASTAR_THRESHOLD_KMH) {
                     sl->pub.eta_ms = _calcular_eta(sl->pub.distance_m,
@@ -399,6 +416,7 @@ void tracking_manager_clear_events(uint16_t vehicle_id)
         if (s_pub[i].id == vehicle_id) {
             s_pub[i].event_detected_pending  = false;
             s_pub[i].event_approach_pending  = false;
+            s_pub[i].event_local_pending     = false;
             s_pub[i].event_passed_pending    = false;
             s_pub[i].event_obstaculo_pending = false;
             break;
@@ -410,6 +428,7 @@ void tracking_manager_clear_events(uint16_t vehicle_id)
         if (s_slots[s].occupied && s_slots[s].pub.id == vehicle_id) {
             s_slots[s].pub.event_detected_pending  = false;
             s_slots[s].pub.event_approach_pending  = false;
+            s_slots[s].pub.event_local_pending     = false;
             s_slots[s].pub.event_passed_pending    = false;
             s_slots[s].pub.event_obstaculo_pending = false;
             break;

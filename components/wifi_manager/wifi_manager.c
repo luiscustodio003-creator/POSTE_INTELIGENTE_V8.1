@@ -15,6 +15,7 @@
 #include "esp_log.h"
 #include "esp_netif.h"
 #include "esp_timer.h"
+#include "lwip/ip4_addr.h"   
 #include "freertos/FreeRTOS.h"
 #include "freertos/portmacro.h"
 #include <string.h>
@@ -103,7 +104,17 @@ void wifi_manager_init(void)
     ESP_ERROR_CHECK(esp_timer_create(&ta, &s_reconect_timer));
 
     /* Cria interface de rede STA */
-    esp_netif_create_default_wifi_sta();
+    esp_netif_t *netif = esp_netif_create_default_wifi_sta();
+
+        /* IP estático baseado na posição — previsível e sem DHCP
+        pos=1 → 192.168.4.2 | pos=2 → 192.168.4.3 | etc.     */
+        esp_netif_dhcpc_stop(netif);
+
+        esp_netif_ip_info_t ip_info = {0};
+        IP4_ADDR(&ip_info.ip,      192, 168, 4, POST_POSITION + 1);
+        IP4_ADDR(&ip_info.gw,      192, 168, 4, 1);
+        IP4_ADDR(&ip_info.netmask, 255, 255, 255, 0);
+        esp_netif_set_ip_info(netif, &ip_info);
 
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
@@ -185,6 +196,16 @@ void wifi_manager_assume_ap(void)
     esp_wifi_set_config(WIFI_IF_AP, &ap_config);
     esp_wifi_start();
 
-    ESP_LOGI(TAG, "[AP] Rede criada: %s", WIFI_SSID);
-    s_modo_ap = true;
+    /* IP fixo do AP — definido pelas constantes do system_config.h
+       Por defeito ESP-IDF: 192.168.4.1 quando em modo AP puro      */
+    snprintf(s_ip, sizeof(s_ip), "%d.%d.%d.%d",
+             WIFI_AP_IP_1, WIFI_AP_IP_2, WIFI_AP_IP_3, WIFI_AP_GW_LAST);
+    s_conectado = true;
+    s_modo_ap   = true;
+
+    /* Informa o display — igual ao que acontece nos postes STA
+       O técnico vê o IP no ecrã e sabe onde aceder pelo browser */
+    display_manager_set_wifi(true, s_ip);
+
+    ESP_LOGI(TAG, "[AP] Rede criada: %s | IP: %s", WIFI_SSID, s_ip);
 }

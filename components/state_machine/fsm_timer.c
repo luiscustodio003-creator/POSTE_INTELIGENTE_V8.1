@@ -1,7 +1,7 @@
 /* ============================================================
    MÓDULO     : fsm_timer
    FICHEIRO   : fsm_timer.c — Gestão de Timers e Timeouts
-   VERSÃO     : 1.2  |  2026-04-30
+   VERSÃO     : 1.3  |  2026-05-03
    PROJECTO   : Poste Inteligente v8
    AUTORES    : Luis Custódio | Tiago Moreno
    PLATAFORMA : ESP32 (ESP-IDF v5.x)
@@ -13,20 +13,16 @@
    - Recuperação automática de estados de erro (Obstáculo).
    - Heartbeat de rede para o papel de Master.
 
-   CORRECÇÕES v1.1 → v1.2:
+   ALTERAÇÕES v1.2 → v1.3:
    ─────────────────────────
-   - REMOVIDO: dali_fade_up() em _passo6_processar_eta().
-     A mudança de estado para LIGHT_ON é detectada por
-     fsm_aplicar_luz() em fsm_task.c no ciclo seguinte.
-   - REMOVIDO: dali_fade_down() em _passo7_gestao_apagamento().
-     Idem — fsm_aplicar_luz() aplica o fade down ao detectar
-     a transição para IDLE / MASTER / AUTONOMO.
-   - REMOVIDO: #include "dali_manager.h" — já não necessário.
-   - REMOVIDO: fsm_timer_process_timeouts() — função duplicada
-     que repetia a lógica do _passo9_timeout_seguranca_tc().
-     A única função pública é fsm_timer_update().
-   - REMOVIDO: segundo #include "system_config.h" duplicado.
-   - MANTIDO: toda a lógica de timeouts e transições de estado.
+   - CORRIGIDO: _passo9_timeout_seguranca_tc()
+     Antes: só resetava g_fsm_Tc quando o timeout expirava.
+     Agora: também reseta g_fsm_enviados_dir e faz T-- para
+     cada envio pendente sem confirmação — evita que env_dir
+     fique preso indefinidamente quando um veículo anunciado
+     a B não chegou (saiu do radar de A antes de entrar em B).
+     A condição de activação foi alargada: dispara quando
+     g_fsm_Tc > 0 OU g_fsm_enviados_dir > 0, não apenas Tc.
 ============================================================ */
 
 #include "fsm_timer.h"
@@ -49,6 +45,7 @@ static void _passo5_verificar_t_estagnado(uint64_t agora)
     }
 }
 
+
 /* ── Passo 6: Execução de Pré-acendimento (ETA) ───────────── */
 static void _passo6_processar_eta(uint64_t agora)
 {
@@ -56,7 +53,6 @@ static void _passo6_processar_eta(uint64_t agora)
         g_fsm_acender_em_ms = 0;
 
         if (g_fsm_Tc > 0) {
-            /* Muda estado — fsm_aplicar_luz() aplica dali no ciclo seguinte */
             if (g_fsm_state == STATE_IDLE   ||
                 g_fsm_state == STATE_MASTER ||
                 g_fsm_state == STATE_AUTONOMO) {
@@ -66,6 +62,7 @@ static void _passo6_processar_eta(uint64_t agora)
         }
     }
 }
+
 
 /* ── Passo 7: Timeout de Apagamento ───────────────────────── */
 static void _passo7_gestao_apagamento(uint64_t agora, bool is_master)
@@ -80,7 +77,6 @@ static void _passo7_gestao_apagamento(uint64_t agora, bool is_master)
         g_fsm_last_speed    = 0.0f;
         g_fsm_acender_em_ms = 0;
 
-        /* Define estado de destino — fsm_aplicar_luz() aplica dali no ciclo seguinte */
         if (is_master) {
             g_fsm_state = STATE_MASTER;
         } else if (g_fsm_era_autonomo) {
@@ -90,27 +86,20 @@ static void _passo7_gestao_apagamento(uint64_t agora, bool is_master)
             g_fsm_state = STATE_IDLE;
         }
 
-        ESP_LOGI(TAG, "Timeout de tráfego: estado → %s", state_machine_get_state_name());
+        ESP_LOGI(TAG, "Timeout de tráfego: estado → %s",
+                 state_machine_get_state_name());
     }
 }
 
+
 /* ── Passo 8: Auto-remoção de Estado de Obstáculo ─────────── */
-/*
-   CORRECÇÃO v1.2:
-   O obstáculo ocupa T=1. Ao ser removido por inactividade,
-   T-- é necessário antes de apagar — senão T fica preso em 1
-   e o passo 7 nunca apaga a luz.
-   Se ainda há outros veículos (T>1), volta a LIGHT_ON.
-*/
 static void _passo8_limpeza_obstaculo(uint64_t agora, bool is_master)
 {
     (void)is_master;
 
     if (g_fsm_state != STATE_OBSTACULO || g_fsm_obstaculo_last_ms == 0) return;
-
     if ((agora - g_fsm_obstaculo_last_ms) < OBSTACULO_REMOVE_MS) return;
 
-    /* Obstáculo desapareceu — decrementa T do slot do obstáculo */
     if (g_fsm_T > 0) g_fsm_T--;
     g_fsm_obstaculo_last_ms = 0;
 
@@ -118,33 +107,71 @@ static void _passo8_limpeza_obstaculo(uint64_t agora, bool is_master)
              g_fsm_T, g_fsm_Tc);
 
     if (g_fsm_T == 0 && g_fsm_Tc == 0) {
-        /* Nenhum veículo — apagamento normal via passo 7 */
         fsm_agendar_apagar();
         ESP_LOGI(TAG, "Apagamento agendado após remoção de obstáculo.");
     } else {
-        /* Ainda há outros veículos — volta a LIGHT_ON */
         g_fsm_state = STATE_LIGHT_ON;
         ESP_LOGI(TAG, "Outros veículos presentes → LIGHT_ON.");
     }
 }
 
-/* ── Passo 9: Timeout de Segurança do Tráfego Remoto (Tc) ──── */
+
+/* ── Passo 9: Timeout de Segurança (Tc + env_dir) ─────────────
+   Activado quando:
+     - g_fsm_Tc > 0: veículo anunciado pela esquerda não chegou
+     - g_fsm_enviados_dir > 0: veículo anunciado à direita não
+       foi confirmado por B (B nunca enviou PASSED)
+
+   Em ambos os casos, o TC_TIMEOUT_MS deve ter sido definido
+   quando o TC_INC foi enviado/recebido.
+
+   Acção:
+     - Reseta Tc e env_dir
+     - Para cada env_dir pendente, faz T-- (o veículo perdeu-se)
+     - Agenda apagamento se T=0 e Tc=0
+──────────────────────────────────────────────────────────── */
 static void _passo9_timeout_seguranca_tc(uint64_t agora)
 {
-    if (g_fsm_Tc <= 0 || g_fsm_tc_timeout_ms == 0) return;
+    /* Sem timeout definido — nada a fazer */
+    if (g_fsm_tc_timeout_ms == 0) return;
 
-    if (agora > g_fsm_tc_timeout_ms) {
-        ESP_LOGW(TAG, "Veículo esperado (Tc) não chegou. Limpando registo.");
+    /* Timeout ainda não expirou */
+    if (agora <= g_fsm_tc_timeout_ms) return;
+
+    bool algo_resetado = false;
+
+    /* Reset de Tc — veículo anunciado da esquerda não chegou */
+    if (g_fsm_Tc > 0) {
+        ESP_LOGW(TAG, "[TMR] Tc timeout — veículo não chegou (Tc=%d)", g_fsm_Tc);
         g_fsm_Tc = 0;
+        algo_resetado = true;
+    }
+
+    /* Reset de env_dir — B não confirmou os veículos que A anunciou.
+       Para cada envio pendente, T-- pois o veículo perdeu-se entre postes. */
+    if (g_fsm_enviados_dir > 0) {
+        ESP_LOGW(TAG, "[TMR] env_dir timeout — B não confirmou (env_dir=%d T=%d)",
+                 g_fsm_enviados_dir, g_fsm_T);
+        while (g_fsm_enviados_dir > 0) {
+            if (g_fsm_T > 0) g_fsm_T--;
+            g_fsm_enviados_dir--;
+        }
+        algo_resetado = true;
+    }
+
+    if (algo_resetado) {
         g_fsm_tc_timeout_ms = 0;
-        fsm_agendar_apagar();
+        ESP_LOGI(TAG, "[TMR] Após timeout: T=%d Tc=%d env_dir=%d",
+                 g_fsm_T, g_fsm_Tc, g_fsm_enviados_dir);
+        if (g_fsm_T == 0 && g_fsm_Tc == 0)
+            fsm_agendar_apagar();
     }
 }
+
 
 /* ── Passo 12: Manutenção do Papel Master (Heartbeat) ─────── */
 static void _passo12_master_heartbeat(uint64_t agora, bool is_master)
 {
-    /* Apenas o poste na posição 0 pode ser Master Claimer */
     if (!is_master || POST_POSITION != 0) return;
 
     if ((agora - g_fsm_master_claim_ms) >= MASTER_CLAIM_HB_MS) {
@@ -156,9 +183,6 @@ static void _passo12_master_heartbeat(uint64_t agora, bool is_master)
 
 /* ============================================================
    fsm_timer_update — ponto de entrada único
-   ──────────────────────────────────────────
-   Executa todos os passos de timer do ciclo 100ms.
-   Chamada por state_machine_update() em fsm_core.c.
 ============================================================ */
 void fsm_timer_update(bool comm_ok, bool is_master)
 {
@@ -171,5 +195,5 @@ void fsm_timer_update(bool comm_ok, bool is_master)
     _passo9_timeout_seguranca_tc(agora);
     _passo12_master_heartbeat(agora, is_master);
 
-    (void)comm_ok; /* Reservado para uso futuro */
+    (void)comm_ok;
 }
