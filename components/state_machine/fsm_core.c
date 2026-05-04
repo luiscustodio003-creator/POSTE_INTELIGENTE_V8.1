@@ -1,7 +1,7 @@
 /* ============================================================
    MÓDULO     : fsm_core
    FICHEIRO   : fsm_core.c — Núcleo da FSM (Versão Produção)
-   VERSÃO     : 2.7  |  2026-05-03
+   VERSÃO     : 2.8  |  2026-05-04
    PROJECTO   : Poste Inteligente v8
    AUTORES    : Luis Custódio | Tiago Moreno
    PLATAFORMA : ESP32 (ESP-IDF v5.x)
@@ -12,14 +12,17 @@
    - Monitorização da saúde do radar real com debounce.
    - Ponto de entrada state_machine_update() (Sem Simulação).
 
+   ALTERAÇÕES v2.7 → v2.8:
+   ─────────────────────────
+   - ADICIONADO: g_fsm_tc_last_vehicle_id (inicializado a 0)
+     Regista o ID do último veículo que gerou TC_INC, para que
+     EVT_LOCAL do mesmo veículo não produza TC_INC duplicado.
+     Ver comentário detalhado em fsm_core.h e fsm_events.c.
+
    ALTERAÇÕES v2.6 → v2.7:
    ─────────────────────────
    - ADICIONADO: g_fsm_enviados_dir
      Conta TC_INC enviados ao vizinho direito que aguardam PASSED.
-     Separado de g_fsm_Tc (veículos a caminho vindos da esquerda).
-     EVT_LOCAL: incrementa quando envia TC_INC a B.
-     EVT_PASSED: aguarda PASSED de B se g_fsm_enviados_dir > 0.
-     on_prev_passed_received: decrementa quando B confirma.
 ============================================================ */
 
 #include "fsm_core.h"
@@ -59,6 +62,13 @@ uint64_t g_fsm_master_claim_ms   = 0;
 uint64_t g_fsm_sem_vizinho_ms    = 0;
 uint64_t g_fsm_obstaculo_last_ms = 0;
 
+/* ── NOVO v2.8 ────────────────────────────────────────────────
+   ID do último objecto físico que gerou um TC_INC.
+   0 = nenhum veículo anunciado ainda (valor de reset seguro,
+   pois o tracking_manager começa os IDs em 1).
+──────────────────────────────────────────────────────────── */
+uint16_t g_fsm_tc_last_vehicle_id = 0;
+
 
 /* ============================================================
    UTILITÁRIOS INTERNOS
@@ -88,38 +98,28 @@ void fsm_obstaculo_keepalive(void)
    fsm_verificar_radar
    ──────────────────────────────────────────────────────────
    Usa radar_is_connected() como fonte de verdade.
-   O HLK-LD2450 envia frames APENAS quando detecta alvos.
-   Sem alvos, a UART pode ficar silenciosa — comportamento NORMAL.
-   radar_is_connected() fica false após NO_FRAME_LIMIT ciclos
-   sem qualquer BYTE na UART.
+   Debounce bidirecional: exige N frames consecutivos para
+   mudar de estado (evita flapping em falhas transitórias).
 ============================================================ */
 void fsm_verificar_radar(bool teve_frame, bool comm_ok)
 {
-    bool uart_activa = radar_is_connected();
+    (void)comm_ok;
 
-    if (teve_frame) {
-        /* Frame válido recebido — sensor OK */
-        g_fsm_radar_fail_cnt = 0;
-        if (!g_fsm_radar_ok) {
-            g_fsm_radar_ok_cnt++;
-            if (g_fsm_radar_ok_cnt >= RADAR_OK_COUNT) {
-                g_fsm_radar_ok     = true;
-                g_fsm_radar_ok_cnt = 0;
-                ESP_LOGI(TAG, "[RADAR] Sensor recuperado — saída de SAFE MODE.");
-            }
-        }
-    } else if (!uart_activa) {
-        /* UART morta — sensor desligado ou falha física */
-        g_fsm_radar_fail_cnt++;
+    bool uart_ok = radar_is_connected();
+
+    if (!uart_ok) {
         g_fsm_radar_ok_cnt = 0;
+        g_fsm_radar_fail_cnt++;
 
-        if (g_fsm_radar_ok && g_fsm_radar_fail_cnt >= RADAR_FAIL_COUNT) {
+        if (g_fsm_radar_fail_cnt >= RADAR_FAIL_COUNT &&
+            g_fsm_radar_ok) {
             g_fsm_radar_ok = false;
-            ESP_LOGW(TAG, "[RADAR] Sensor offline — SAFE MODE activado.");
+            ESP_LOGW(TAG, "[RADAR] Falha detectada — SAFE MODE activado.");
+            if (g_fsm_state != STATE_OBSTACULO)
+                g_fsm_state = STATE_SAFE_MODE;
         }
 
     } else {
-        /* Sem alvos mas UART activa — comportamento normal */
         g_fsm_radar_fail_cnt = 0;
 
         if (!g_fsm_radar_ok) {
@@ -131,7 +131,7 @@ void fsm_verificar_radar(bool teve_frame, bool comm_ok)
         }
     }
 
-    (void)comm_ok;
+    (void)teve_frame;
 }
 
 
@@ -140,25 +140,26 @@ void fsm_verificar_radar(bool teve_frame, bool comm_ok)
 ============================================================ */
 void state_machine_init(void)
 {
-    g_fsm_state             = STATE_IDLE;
-    g_fsm_T                 = 0;
-    g_fsm_Tc                = 0;
-    g_fsm_enviados_dir      = 0;
-    g_fsm_last_speed        = 0.0f;
-    g_fsm_apagar_pend       = false;
-    g_fsm_radar_ok          = true;
-    g_fsm_radar_fail_cnt    = 0;
-    g_fsm_radar_ok_cnt      = 0;
-    g_fsm_right_online      = true;
-    g_fsm_era_autonomo      = false;
-    g_fsm_acender_em_ms     = 0;
-    g_fsm_master_claim_ms   = 0;
-    g_fsm_sem_vizinho_ms    = 0;
-    g_fsm_obstaculo_last_ms = 0;
-    g_fsm_left_was_offline  = false;
-    g_fsm_left_offline_ms   = 0;
-    g_fsm_tc_timeout_ms     = 0;
-    g_fsm_last_detect_ms    = 0;
+    g_fsm_state                = STATE_IDLE;
+    g_fsm_T                    = 0;
+    g_fsm_Tc                   = 0;
+    g_fsm_enviados_dir         = 0;
+    g_fsm_tc_last_vehicle_id   = 0;   /* NOVO v2.8 — reset do ID de controlo */
+    g_fsm_last_speed           = 0.0f;
+    g_fsm_apagar_pend          = false;
+    g_fsm_radar_ok             = true;
+    g_fsm_radar_fail_cnt       = 0;
+    g_fsm_radar_ok_cnt         = 0;
+    g_fsm_right_online         = true;
+    g_fsm_era_autonomo         = false;
+    g_fsm_acender_em_ms        = 0;
+    g_fsm_master_claim_ms      = 0;
+    g_fsm_sem_vizinho_ms       = 0;
+    g_fsm_obstaculo_last_ms    = 0;
+    g_fsm_left_was_offline     = false;
+    g_fsm_left_offline_ms      = 0;
+    g_fsm_tc_timeout_ms        = 0;
+    g_fsm_last_detect_ms       = 0;
 
     ESP_LOGI(TAG, "FSM Produção inicializada — Modo Hardware Real");
 }

@@ -238,7 +238,12 @@
 #define MARGEM_ACENDER_MS        500
 
 /* Timeouts derivados — não editar directamente */
-#define TC_TIMEOUT_MS           (TRAFIC_TIMEOUT_MS * 2)
+#if MODO_LABORATORIO
+  #define TC_TIMEOUT_MS         60000ULL   /* 60s — laboratório, mão lenta */
+#else
+  #define TC_TIMEOUT_MS         (TRAFIC_TIMEOUT_MS * 2)
+#endif
+
 #define T_STUCK_TIMEOUT_MS      (TRAFIC_TIMEOUT_MS * 3)
 #define OBSTACULO_REMOVE_MS     8000
 #define AUTONOMO_DELAY_MS       10000ULL
