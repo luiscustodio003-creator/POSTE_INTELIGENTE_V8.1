@@ -1,11 +1,32 @@
-#include <inttypes.h>
 /* ============================================================
    WIFI MANAGER — IMPLEMENTAÇÃO
    @file      wifi_manager.c
-   @version   1.5  |  2026-04-07
-   Projecto  : Poste Inteligente v8
-   Estudantes: Luis Custodio | Tiago Moreno
-   Plataforma: ESP32 (ESP-IDF v5.x)
+   @version   2.0  |  2026-05-07
+   PROJECTO   : Poste Inteligente v8
+   AUTORES    : Luis Custódio | Tiago Moreno
+   PLATAFORMA : ESP32 (ESP-IDF v5.x)
+
+   ALTERAÇÕES v1.5 → v2.0:
+   ─────────────────────────
+   PROBLEMA CORRIGIDO: IP dinâmico + mudança STA↔AP causava split-brain.
+   
+   SOLUÇÃO:
+   • IP FIXO estático baseado em POST_POSITION (nunca DHCP)
+   • Modo WiFi FIXO no arranque (NUNCA muda em runtime)
+   • pos=0 → AP permanente (192.168.4.1)
+   • pos>0 → STA permanente (192.168.4.X onde X=pos+1)
+   • wifi_manager_assume_ap() REMOVIDA (só loga warning)
+   
+   VANTAGENS:
+   ✅ IP nunca muda (mesmo que papel master↔slave mude)
+   ✅ Sem perda de conexão em failover
+   ✅ Sem conflito de IP entre postes
+   ✅ Transições suaves master→slave→master
+
+   DEPENDÊNCIAS:
+   ─────────────
+   system_config.h (POST_POSITION, WIFI_SSID, etc.)
+   display_manager.h (notificação de estado WiFi)
 ============================================================ */
 #include "wifi_manager.h"
 #include "display_manager.h"
@@ -15,7 +36,8 @@
 #include "esp_log.h"
 #include "esp_netif.h"
 #include "esp_timer.h"
-#include "lwip/ip4_addr.h"   
+#include "lwip/ip4_addr.h"
+#include "esp_mac.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/portmacro.h"
 #include <string.h>
@@ -31,32 +53,48 @@ static bool s_modo_ap     = false;
 /* Spinlock para proteger s_ip (acedido de event handler e monitor) */
 static portMUX_TYPE s_ip_mux = portMUX_INITIALIZER_UNLOCKED;
 
-/* ── Timer de reconexão após falha de retries ─────────────── */
+/* Timer de reconexão após falha de retries */
 static esp_timer_handle_t s_reconect_timer = NULL;
 
+
+/* ============================================================
+   _reconect_cb — Callback do timer de reconexão
+============================================================ */
 static void _reconect_cb(void *arg)
 {
+    (void)arg;
     ESP_LOGI(TAG, "Timer de reconexão disparado — a tentar ligar");
     s_retries = 0;
     esp_wifi_connect();
 }
 
+
 /* ============================================================
-   wifi_event_handler
-   Handler de eventos Wi-Fi e IP registado no event loop.
+   wifi_event_handler — Handler de eventos Wi-Fi e IP
 ============================================================ */
 static void wifi_event_handler(void *arg,
                                 esp_event_base_t base,
                                 int32_t          id,
                                 void            *data)
 {
+    (void)arg;
+    
     if (base == WIFI_EVENT) {
+        
         if (id == WIFI_EVENT_STA_START) {
             esp_wifi_connect();
-            ESP_LOGI(TAG, "STA iniciado — a tentar ligar");
+            ESP_LOGI(TAG, "STA iniciado — a tentar ligar ao AP");
 
         } else if (id == WIFI_EVENT_STA_CONNECTED) {
-            ESP_LOGI(TAG, "Ligado — aguarda IP");
+            ESP_LOGI(TAG, "Ligado ao AP — IP já está fixo (192.168.4.%d)",
+                     POST_POSITION + 1);
+            /* IP fixo configurado no init, não há evento GOT_IP */
+            taskENTER_CRITICAL(&s_ip_mux);
+            snprintf(s_ip, sizeof(s_ip), "192.168.4.%d", POST_POSITION + 1);
+            taskEXIT_CRITICAL(&s_ip_mux);
+            s_conectado = true;
+            s_retries = 0;
+            display_manager_set_wifi(true, s_ip);
 
         } else if (id == WIFI_EVENT_STA_DISCONNECTED) {
             s_conectado = false;
@@ -76,23 +114,25 @@ static void wifi_event_handler(void *arg,
                 esp_timer_start_once(s_reconect_timer,
                                      (uint64_t)WIFI_RECONNECT_MS * 1000);
             }
+        
+        } else if (id == WIFI_EVENT_AP_STACONNECTED) {
+            wifi_event_ap_staconnected_t *ev = (wifi_event_ap_staconnected_t *)data;
+            ESP_LOGI(TAG, "[AP] Cliente conectado: " MACSTR, MAC2STR(ev->mac));
+        
+        } else if (id == WIFI_EVENT_AP_STADISCONNECTED) {
+            wifi_event_ap_stadisconnected_t *ev = (wifi_event_ap_stadisconnected_t *)data;
+            ESP_LOGI(TAG, "[AP] Cliente desconectado: " MACSTR, MAC2STR(ev->mac));
         }
-
-    } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
-        ip_event_got_ip_t *ev = (ip_event_got_ip_t *)data;
-        taskENTER_CRITICAL(&s_ip_mux);
-        snprintf(s_ip, sizeof(s_ip), IPSTR, IP2STR(&ev->ip_info.ip));
-        taskEXIT_CRITICAL(&s_ip_mux);
-
-        s_conectado = true;
-        s_retries   = 0;
-        ESP_LOGI(TAG, "IP obtido: %s", s_ip);
-        display_manager_set_wifi(true, s_ip);
     }
+    /* Nota: Não há IP_EVENT_STA_GOT_IP porque usamos IP estático! */
 }
 
+
 /* ============================================================
-   wifi_manager_init
+   wifi_manager_init — Inicializa em modo STA com IP fixo
+   ──────────────────────────────────────────────────────────
+   Chamado por postes com POST_POSITION > 0.
+   Configura IP estático: 192.168.4.(POST_POSITION + 1)
 ============================================================ */
 void wifi_manager_init(void)
 {
@@ -106,81 +146,71 @@ void wifi_manager_init(void)
     /* Cria interface de rede STA */
     esp_netif_t *netif = esp_netif_create_default_wifi_sta();
 
-        /* IP estático baseado na posição — previsível e sem DHCP
-        pos=1 → 192.168.4.2 | pos=2 → 192.168.4.3 | etc.     */
-        esp_netif_dhcpc_stop(netif);
+    /* ── IP ESTÁTICO (não DHCP!) ──────────────────────────
+       Calcula IP baseado em POST_POSITION:
+       pos=1 → 192.168.4.2
+       pos=2 → 192.168.4.3
+       pos=3 → 192.168.4.4
+       ...
+       
+       CRÍTICO: IP nunca muda, mesmo que papel master/slave mude!
+    ──────────────────────────────────────────────────────── */
+    esp_netif_dhcpc_stop(netif);
 
-        esp_netif_ip_info_t ip_info = {0};
-        IP4_ADDR(&ip_info.ip,      192, 168, 4, POST_POSITION + 1);
-        IP4_ADDR(&ip_info.gw,      192, 168, 4, 1);
-        IP4_ADDR(&ip_info.netmask, 255, 255, 255, 0);
-        esp_netif_set_ip_info(netif, &ip_info);
+    esp_netif_ip_info_t ip_info = {0};
+    IP4_ADDR(&ip_info.ip,      192, 168, 4, POST_POSITION + 1);
+    IP4_ADDR(&ip_info.gw,      192, 168, 4, 1);  /* Gateway = AP do master */
+    IP4_ADDR(&ip_info.netmask, 255, 255, 255, 0);
+    ESP_ERROR_CHECK(esp_netif_set_ip_info(netif, &ip_info));
 
+    ESP_LOGI(TAG, "IP fixo configurado: 192.168.4.%d (baseado em pos=%d)",
+             POST_POSITION + 1, POST_POSITION);
+
+    /* Inicializa stack WiFi */
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
 
-    /* Regista handlers */
+    /* Regista handlers de eventos */
     ESP_ERROR_CHECK(esp_event_handler_instance_register(
         WIFI_EVENT, ESP_EVENT_ANY_ID, wifi_event_handler, NULL, NULL));
-    ESP_ERROR_CHECK(esp_event_handler_instance_register(
-        IP_EVENT, IP_EVENT_STA_GOT_IP, wifi_event_handler, NULL, NULL));
 
-    /* Configura credenciais */
+    /* Configura credenciais do AP master */
     wifi_config_t wc = {0};
     strncpy((char *)wc.sta.ssid,     WIFI_SSID, sizeof(wc.sta.ssid) - 1);
     strncpy((char *)wc.sta.password, WIFI_PASS,  sizeof(wc.sta.password) - 1);
 
+    /* Inicia em modo STA */
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wc));
     ESP_ERROR_CHECK(esp_wifi_start());
 
-    ESP_LOGI(TAG, "Wi-Fi STA iniciado | SSID: %s", WIFI_SSID);
-}
-
-/* ── API ──────────────────────────────────────────────────── */
-bool wifi_manager_is_connected(void) { return s_conectado; }
-
-const char *wifi_manager_get_ip(void)
-{
-    /* Leitura sem lock — string pequena, worst case = leitura
-     * parcialmente actualizada, aceitável para display */
-    return s_ip;
-}
-
-void wifi_manager_reset_retry(void)
-{
-    s_retries = 0;
-    esp_wifi_connect();
+    s_modo_ap = false;
+    ESP_LOGI(TAG, "Wi-Fi STA iniciado | SSID: %s | IP: 192.168.4.%d",
+             WIFI_SSID, POST_POSITION + 1);
 }
 
 
-void wifi_manager_init_auto(void)
+/* ============================================================
+   wifi_manager_init_ap — Cria AP (só pos=0)
+   ──────────────────────────────────────────────────────────
+   Chamado por poste com POST_POSITION == 0.
+   Cria rede WiFi para outros postes se ligarem.
+   IP fixo do AP: 192.168.4.1 (automático ESP-IDF)
+============================================================ */
+void wifi_manager_init_ap(void)
 {
-    if (POST_POSITION == 0) {
-        /* Sou o MASTER — crio o AP */
-        wifi_manager_assume_ap();
-    } else {
-        /* Sou IDLE — ligo ao AP do MASTER */
-        /* Usa o código actual mas com WIFI_AP_SSID/PASS */
-        wifi_manager_init();
-    }
-}
-
-
-
-/* Nova função — cria AP com DHCP interno */
-void wifi_manager_assume_ap(void)
-{
-    /* Para o modo STA actual */
-    esp_wifi_stop();
-    esp_wifi_deinit();
-
     /* Cria interface AP */
     esp_netif_create_default_wifi_ap();
 
+    /* Inicializa stack WiFi */
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-    esp_wifi_init(&cfg);
+    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
 
+    /* Regista handlers de eventos */
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(
+        WIFI_EVENT, ESP_EVENT_ANY_ID, wifi_event_handler, NULL, NULL));
+
+    /* Configura AP */
     wifi_config_t ap_config = {
         .ap = {
             .ssid            = WIFI_SSID,
@@ -192,20 +222,90 @@ void wifi_manager_assume_ap(void)
         }
     };
 
-    esp_wifi_set_mode(WIFI_MODE_AP);
-    esp_wifi_set_config(WIFI_IF_AP, &ap_config);
-    esp_wifi_start();
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &ap_config));
+    ESP_ERROR_CHECK(esp_wifi_start());
 
-    /* IP fixo do AP — definido pelas constantes do system_config.h
-       Por defeito ESP-IDF: 192.168.4.1 quando em modo AP puro      */
-    snprintf(s_ip, sizeof(s_ip), "%d.%d.%d.%d",
-             WIFI_AP_IP_1, WIFI_AP_IP_2, WIFI_AP_IP_3, WIFI_AP_GW_LAST);
+    /* IP fixo do AP — ESP-IDF configura automaticamente 192.168.4.1 */
+    snprintf(s_ip, sizeof(s_ip), "192.168.4.1");
     s_conectado = true;
     s_modo_ap   = true;
 
-    /* Informa o display — igual ao que acontece nos postes STA
-       O técnico vê o IP no ecrã e sabe onde aceder pelo browser */
     display_manager_set_wifi(true, s_ip);
+    ESP_LOGI(TAG, "[AP] Rede criada: %s | IP: 192.168.4.1", WIFI_SSID);
+}
 
-    ESP_LOGI(TAG, "[AP] Rede criada: %s | IP: %s", WIFI_SSID, s_ip);
+
+/* ============================================================
+   wifi_manager_init_auto — Escolhe AP ou STA por posição
+   ──────────────────────────────────────────────────────────
+   Chamado no arranque do sistema (main.c).
+   
+   POST_POSITION == 0 → Cria AP (master físico)
+   POST_POSITION > 0  → Liga-se ao AP (STA com IP fixo)
+============================================================ */
+void wifi_manager_init_auto(void)
+{
+    if (POST_POSITION == 0) {
+        /* pos=0 → sempre AP, sempre 192.168.4.1 */
+        wifi_manager_init_ap();
+    } else {
+        /* pos>0 → sempre STA, IP=192.168.4.(pos+1) */
+        wifi_manager_init();
+    }
+}
+
+
+/* ============================================================
+   wifi_manager_assume_ap — REMOVIDA!
+   ──────────────────────────────────────────────────────────
+   Função OBSOLETA mantida por compatibilidade.
+   
+   PROBLEMA: Mudar STA→AP em runtime causava:
+   • Perda de IP (transitava de .X para .1)
+   • Perda de conexão durante transição
+   • Split-brain quando master original recuperava
+   
+   SOLUÇÃO v2.0: Modo WiFi NUNCA muda!
+   • pos=0 sempre AP
+   • pos>0 sempre STA
+   • Papel master/slave é LÓGICO (gerido por fsm_network)
+   • IP permanece fixo independente do papel
+============================================================ */
+void wifi_manager_assume_ap(void)
+{
+    ESP_LOGW(TAG, "wifi_manager_assume_ap() OBSOLETA!");
+    ESP_LOGW(TAG, "Modo WiFi NÃO muda em runtime (v2.0).");
+    ESP_LOGW(TAG, "Papel master/slave é lógico, não físico (WiFi).");
+    ESP_LOGW(TAG, "IP mantém-se: %s", s_ip);
+    
+    /* NÃO faz nada — modo WiFi é fixo! */
+}
+
+
+/* ============================================================
+   API PÚBLICA — Getters
+============================================================ */
+
+bool wifi_manager_is_connected(void)
+{
+    return s_conectado;
+}
+
+const char *wifi_manager_get_ip(void)
+{
+    /* Leitura sem lock — string pequena, worst case = leitura
+       parcialmente actualizada, aceitável para display */
+    return s_ip;
+}
+
+bool wifi_manager_is_ap_mode(void)
+{
+    return s_modo_ap;
+}
+
+void wifi_manager_reset_retry(void)
+{
+    s_retries = 0;
+    esp_wifi_connect();
 }

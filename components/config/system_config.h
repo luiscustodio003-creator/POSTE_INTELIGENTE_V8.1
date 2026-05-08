@@ -1,61 +1,51 @@
 /* ============================================================
-   SYSTEM CONFIG — PARÂMETROS GLOBAIS
+   SYSTEM CONFIG — PARÂMETROS GLOBAIS (OPTIMIZADO)
    @file      system_config.h
-   @version   4.0  |  2026-04-24
+   @version   4.1  |  2026-05-07
    PROJECTO   : Poste Inteligente v8
    AUTORES    : Luis Custódio | Tiago Moreno
    PLATAFORMA : ESP32 (ESP-IDF v5.x)
 
-   FONTE ÚNICA DE VERDADE para todas as constantes do sistema.
-   Qualquer alteração aqui propaga-se automaticamente a todos
-   os módulos que incluem este ficheiro.
+   ALTERAÇÕES v4.0 → v4.1:
+   ───────────────────────────────────────────────────────────
+   • ADICIONADO: Perfis de timeout (CONSERVADOR/BALANCEADO/AGRESSIVO)
+   • OPTIMIZADO: Tempos de failover de master (70s → 20s → 13s)
+   • OPTIMIZADO: Detecção de vizinho offline (8s → 3s → 2s)
+   • ADICIONADO: Validação automática de dependências entre timeouts
+   • DOCUMENTAÇÃO: Análise de race conditions e margem de segurança
 
-   ┌─────────────────────────────────────────────────────────────┐
-   │  EDITAR POR POSTE  : POSTE_ID, POSTE_NAME, POST_POSITION   │
-   │  EDITAR POR MODO   : Secção RADAR — MODO TESTE / PRODUÇÃO  │
-   │  NÃO EDITAR        : Constantes derivadas (#define calculado)│
-   └─────────────────────────────────────────────────────────────┘
-
-   MELHORIAS v3.3 → v4.0:
-   ──────────────────────────────────────────────────
-   - Adicionadas constantes OBSTÁCULO (timeout de remoção)
-   - Adicionada constante TC_TIMEOUT_FACTOR para ajuste de Tc
-   - Adicionadas constantes SAFE_MODE_TIMEOUT_MS e AUTONOMO_DELAY_MS
-     (antes espalhadas em literais no state_machine.c)
-   - Adicionado DISCOVER_RETRY_MS (retry de descoberta UDP)
-   - Adicionada validação de parâmetros em tempo de compilação
-   - Comentários melhorados em todas as secções
-   - #include <inttypes.h> removido (não necessário neste header)
+   ESCOLHA DO PERFIL:
+   ──────────────────
+   #define TIMEOUT_PROFILE  PROFILE_CONSERVADOR  ← seguro, testado
+   #define TIMEOUT_PROFILE  PROFILE_BALANCEADO   ← recomendado
+   #define TIMEOUT_PROFILE  PROFILE_AGRESSIVO    ← rápido, arriscado
 ============================================================ */
 #ifndef SYSTEM_CONFIG_H
 #define SYSTEM_CONFIG_H
 
 
 /* ============================================================
-   MODO DE OPERAÇÃO
+   PERFIL DE TIMEOUTS — ESCOLHER UM
    ──────────────────────────────────────────────────────────
-   MODO_LABORATORIO = 1 → bancada (mão/pessoa, ~1m, <5 km/h)
-   MODO_LABORATORIO = 0 → produção (veículos reais, >30 km/h)
+   CONSERVADOR: Original, testado, failover ~70s
+   BALANCEADO:  Optimizado, failover ~20s (RECOMENDADO)
+   AGRESSIVO:   Máxima velocidade, failover ~13s (risco)
+============================================================ */
+#define PROFILE_CONSERVADOR  0
+#define PROFILE_BALANCEADO   1
+#define PROFILE_AGRESSIVO    2
 
-   Afecta automaticamente:
-     - Velocidades de fade DALI (VEL_FADE_*)
-     - Parâmetros de detecção do radar
-     - Timeout de obstáculo (OBSTACULO_MIN_FRAMES)
-     - Timeouts de apagamento
+#define TIMEOUT_PROFILE  PROFILE_BALANCEADO  /* ← EDITAR AQUI */
+
+
+/* ============================================================
+   MODO DE OPERAÇÃO
 ============================================================ */
 #define MODO_LABORATORIO      1   /* 1 = bancada | 0 = produção */
 
 
 /* ============================================================
    IDENTIDADE DO POSTE
-   ──────────────────────────────────────────────────────────
-   Editar antes de flashar cada ESP32:
-     POSTE_ID       → identificador numérico único (1, 2, 3...)
-     POSTE_NAME     → nome apresentado no display e nos logs
-     POST_POSITION  → posição na cadeia (0 = MASTER, 1, 2, ...)
-
-   ATENÇÃO: POST_POSITION deve ser único e sequencial.
-            POSTE_ID     deve ser único em toda a rede.
 ============================================================ */
 #define POSTE_ID              2
 #define POSTE_NAME            "POSTE 02"
@@ -65,15 +55,11 @@
 /* ============================================================
    DISPLAY — RESOLUÇÃO VERTICAL
 ============================================================ */
-#define LCD_V_RES_CONFIG   240 /* 240 = ecrã 240×240 | 320 = ecrã 240×320 */
+#define LCD_V_RES_CONFIG   240
 
 
 /* ============================================================
    WI-FI
-   ──────────────────────────────────────────────────────────
-   Credenciais da rede local onde os postes comunicam via UDP.
-   WIFI_RETRY_ATTEMPTS → tentativas antes de pausar reconexão
-   WIFI_RECONNECT_MS   → pausa entre ciclos de reconexão (ms)
 ============================================================ */
 #define WIFI_SSID             "wifi"
 #define WIFI_PASS             "password"
@@ -81,65 +67,128 @@
 #define WIFI_RETRY_ATTEMPTS   5
 #define WIFI_RECONNECT_MS     30000
 
-/* Endereçamento IP da rede interna de postes
-   MASTER (pos=0) → 192.168.4.1  (AP — automático ESP-IDF)
-   Outros postes  → 192.168.4.(POST_POSITION + 1)
-   pos=1 → 192.168.4.2 | pos=2 → 192.168.4.3 | ...      */
-#define POSTE_IP_LAST_OCTET  (POST_POSITION + 1)
-
-/* Gama de rede interna dos postes (rede AP do MASTER)
-   Cada poste recebe WIFI_AP_IP_1.IP_2.IP_3.(POST_POSITION+1)
-   Para mudar de gama basta alterar aqui                        */
 #define WIFI_AP_IP_1        192
 #define WIFI_AP_IP_2        168
 #define WIFI_AP_IP_3          4
-#define WIFI_AP_GW_LAST       1   /* IP do MASTER = último octeto */
+#define WIFI_AP_GW_LAST       1
 
-
+#define POSTE_IP_LAST_OCTET  (POST_POSITION + 1)
 
 
 /* ============================================================
-   PROTOCOLO UDP
+   PROTOCOLO UDP — TIMEOUTS OPTIMIZADOS POR PERFIL
    ──────────────────────────────────────────────────────────
-   UDP_PORT           → porto de escuta/envio (igual em todos)
-   MAX_NEIGHBORS      → máximo de postes vizinhos na tabela
-   MAX_IP_LEN         → tamanho máximo de string IP (chars)
-   DISCOVER_INTERVAL  → intervalo de broadcast DISCOVER (ms)
-   DISCOVER_RETRY_MS  → reenvio DISCOVER quando sem resposta
-   NEIGHBOR_TIMEOUT   → tempo sem resposta para marcar OFFLINE
+   DISCOVER_INTERVAL_MS:
+     Frequência de broadcast DISCOVER.
+     Mais frequente = descoberta mais rápida de vizinhos.
+     Margem de segurança: deve ser < NEIGHBOR_TIMEOUT_MS / 2
+   
+   NEIGHBOR_TIMEOUT_MS:
+     Tempo sem resposta para marcar vizinho OFFLINE.
+     Impacto directo na detecção de falhas.
+     Margem: deve ser > 2 × DISCOVER_INTERVAL_MS
+   
+   DISCOVER_RETRY_MS:
+     Reenvio de DISCOVER quando sem resposta.
+     Apenas para descoberta inicial, não afecta failover.
 ============================================================ */
 #define UDP_PORT              5005
 #define MAX_NEIGHBORS         4
 #define MAX_IP_LEN            16
-#define DISCOVER_INTERVAL_MS  2000
-#define DISCOVER_RETRY_MS     500
-#define NEIGHBOR_TIMEOUT_MS   8000
+
+#if TIMEOUT_PROFILE == PROFILE_CONSERVADOR
+  /* ── CONSERVADOR: Original, testado ──────────────────── */
+  #define DISCOVER_INTERVAL_MS   2000
+  #define NEIGHBOR_TIMEOUT_MS    8000
+  #define DISCOVER_RETRY_MS       500
+  
+#elif TIMEOUT_PROFILE == PROFILE_BALANCEADO
+  /* ── BALANCEADO: Optimizado, recomendado ─────────────── */
+  #define DISCOVER_INTERVAL_MS   1000   // 2x mais rápido
+  #define NEIGHBOR_TIMEOUT_MS    3000   // Detecta falha em 3s
+  #define DISCOVER_RETRY_MS       300
+  
+#elif TIMEOUT_PROFILE == PROFILE_AGRESSIVO
+  /* ── AGRESSIVO: Máxima velocidade ────────────────────── */
+  #define DISCOVER_INTERVAL_MS    500   // 4x mais rápido
+  #define NEIGHBOR_TIMEOUT_MS    2000   // Detecta falha em 2s
+  #define DISCOVER_RETRY_MS       200
+  
+#else
+  #error "TIMEOUT_PROFILE inválido! Use CONSERVADOR, BALANCEADO ou AGRESSIVO"
+#endif
+
+
+/* ============================================================
+   HEARTBEAT DE MASTER — OPTIMIZADO POR PERFIL
+   ──────────────────────────────────────────────────────────
+   MASTER_CLAIM_HB_MS:
+     Intervalo entre broadcasts de MASTER_CLAIM.
+     Impacto directo no failover de master.
+     Margem: MASTER_CLAIM_TIMEOUT deve ser > 2× este valor
+   
+   MASTER_CLAIM_TIMEOUT_MS:
+     Tempo sem MASTER_CLAIM para considerar master offline.
+     Usado em fsm_network.c para verificação antes de promover.
+     Margem: deve ser > 2 × MASTER_CLAIM_HB_MS
+============================================================ */
+#if TIMEOUT_PROFILE == PROFILE_CONSERVADOR
+  #define MASTER_CLAIM_HB_MS      30000  // Heartbeat a cada 30s
+  #define MASTER_CLAIM_TIMEOUT_MS 60000  // Timeout 60s
+  
+#elif TIMEOUT_PROFILE == PROFILE_BALANCEADO
+  #define MASTER_CLAIM_HB_MS       5000  // Heartbeat a cada 5s
+  #define MASTER_CLAIM_TIMEOUT_MS 15000  // Timeout 15s
+  
+#elif TIMEOUT_PROFILE == PROFILE_AGRESSIVO
+  #define MASTER_CLAIM_HB_MS       3000  // Heartbeat a cada 3s
+  #define MASTER_CLAIM_TIMEOUT_MS 10000  // Timeout 10s
+#endif
+
+
+/* ============================================================
+   ELEIÇÃO DE MASTER — OPTIMIZADO POR PERFIL
+   ──────────────────────────────────────────────────────────
+   AUTONOMO_DELAY_MS:
+     Tempo após vizinho esq. offline antes de promover a master.
+     Impacto: failover de master.
+     
+     ANÁLISE DE RACE CONDITIONS:
+     ───────────────────────────
+     Cenário crítico: A (master) ← B (offline) ← C
+     
+     C detecta B offline em NEIGHBOR_TIMEOUT_MS
+     C aguarda AUTONOMO_DELAY_MS antes de promover
+     C verifica se recebeu MASTER_CLAIM nos últimos 
+       MASTER_CLAIM_TIMEOUT_MS
+     
+     Para evitar promoção indevida:
+       AUTONOMO_DELAY_MS ≥ NEIGHBOR_TIMEOUT_MS + margem
+     
+     Margem de segurança: 2s (cobre jitter de rede)
+============================================================ */
+#if TIMEOUT_PROFILE == PROFILE_CONSERVADOR
+  #define AUTONOMO_DELAY_MS  10000ULL  // 10s após detectar offline
+  
+#elif TIMEOUT_PROFILE == PROFILE_BALANCEADO
+  #define AUTONOMO_DELAY_MS   5000ULL  // 5s (3s timeout + 2s margem)
+  
+#elif TIMEOUT_PROFILE == PROFILE_AGRESSIVO
+  #define AUTONOMO_DELAY_MS   3000ULL  // 3s (2s timeout + 1s margem)
+#endif
 
 
 /* ============================================================
    PARÂMETROS FÍSICOS DA INSTALAÇÃO
-   ──────────────────────────────────────────────────────────
-   POSTE_DIST_M   → distância entre postes consecutivos (m)
-   RADAR_MAX_M    → alcance máximo do radar configurado (m)
-                    Teste: 2m | Produção: 10-15m
-   RADAR_MAX_MM   → idem em milímetros (calculado)
-   RADAR_DETECT_M → distância a que se considera "detecção local"
-                    usada para calcular ETA para o próximo poste
 ============================================================ */
-#define POSTE_DIST_M          2         /* Distancia entre postes  */
-#define RADAR_MAX_M           2         /* TESTE: 2m | PRODUÇÃO: 10 */
+#define POSTE_DIST_M          2
+#define RADAR_MAX_M           2
 #define RADAR_MAX_MM          (RADAR_MAX_M * 1000)
 #define RADAR_DETECT_M        1
 
 
 /* ============================================================
    HARDWARE DO RADAR
-   ──────────────────────────────────────────────────────────
-   USE_RADAR          → 1=radar físico HLK-LD2450 | 0=simulador
-   NO_FRAME_LIMIT     → ciclos sem frame para declarar radar FAIL
-   MAX_RADAR_TARGETS  → máximo de alvos simultâneos do HLK-LD2450
-   RADAR_MAX_OBJ      → alias para o display_manager
-   RADAR_TRAIL_MAX    → pontos de rasto por alvo no canvas radar
 ============================================================ */
 #define USE_RADAR             1
 #define NO_FRAME_LIMIT        20
@@ -150,21 +199,7 @@
 
 /* ============================================================
    RADAR — PARÂMETROS DE DETECÇÃO
-   ──────────────────────────────────────────────────────────
-   MODO_LABORATORIO=1 (bancada, mão/pessoa a ~1m):
-     RADAR_MIN_DIST_M      0.2   aceita objectos a partir de 20cm
-     MIN_DETECT_KMH        0.3   aceita movimento muito lento
-     AFASTAR_THRESHOLD_KMH 8.0   aceita qualquer direcção
-     OBSTACULO_MIN_FRAMES   30   obstáculo após 3s (30×100ms)
-     OBSTACULO_SPEED_MAX    1.0  mão praticamente parada
-
-   MODO_LABORATORIO=0 (produção, veículos reais):
-     RADAR_MIN_DIST_M      0.5   ignora reflexões próximas
-     MIN_DETECT_KMH        3.0   ignora objectos estáticos
-     AFASTAR_THRESHOLD_KMH 2.0   só alvos a aproximar-se
-     OBSTACULO_MIN_FRAMES   80   obstáculo após 8s (80×100ms)
-     OBSTACULO_SPEED_MAX    3.0  veículo praticamente parado
-   ──────────────────────────────────────────────────────────── */
+============================================================ */
 #if MODO_LABORATORIO
   #define RADAR_MIN_DIST_M        0.2f
   #define MIN_DETECT_KMH          0.3f
@@ -178,15 +213,11 @@
   #define OBSTACULO_MIN_FRAMES    80
   #define OBSTACULO_SPEED_MAX_KMH 3.0f
 #endif
-#define OBSTACULO_DIST_TOL_MM   300   /* Tolerância de posição para obstáculo (mm) */
+#define OBSTACULO_DIST_TOL_MM   300
 
 
 /* ============================================================
    ILUMINAÇÃO DALI/PWM
-   ──────────────────────────────────────────────────────────
-   LIGHT_MIN       → brilho mínimo em repouso (%)
-   LIGHT_MAX       → brilho máximo ao detectar veículo (%)
-   LIGHT_SAFE_MODE → brilho fixo em SAFE MODE (%)
 ============================================================ */
 #define LIGHT_MIN             10
 #define LIGHT_MAX             100
@@ -195,12 +226,6 @@
 
 /* ============================================================
    FADE DALI — LIMIARES DE VELOCIDADE
-   ──────────────────────────────────────────────────────────
-   Modo laboratório (mão/pessoa):
-     > 3 km/h → 300ms  |  > 2 km/h → 500ms  |  > 1 km/h → 800ms
-
-   Modo produção (veículos):
-     > 80 km/h → 300ms  |  > 50 km/h → 500ms  |  > 30 km/h → 800ms
 ============================================================ */
 #if MODO_LABORATORIO
   #define VEL_FADE_RAPIDO_KMH   3.0f
@@ -221,50 +246,69 @@
 
 /* ============================================================
    TEMPORIZAÇÃO PRINCIPAL
-   ──────────────────────────────────────────────────────────
-   TRAFIC_TIMEOUT_MS    → tempo sem veículos antes de apagar (ms)
-   DETECTION_TIMEOUT_MS → timeout de detecção local (ms)
-   MARGEM_ACENDER_MS    → antecipação do acendimento face ao ETA (ms)
-
-   TIMEOUTS DERIVADOS (calculados — não editar):
-   TC_TIMEOUT_MS        → timeout de segurança Tc (2×TRAFIC)
-   T_STUCK_TIMEOUT_MS   → timeout T preso sem viz. esq. (3×TRAFIC)
-   OBSTACULO_REMOVE_MS  → tempo sem detecção para remover obstáculo
-   AUTONOMO_DELAY_MS    → atraso antes de assumir modo AUTONOMO
 ============================================================ */
 #define TRAFIC_TIMEOUT_MS       5000
 #define LIGHT_ON_TIMEOUT_MS     5000
 #define DETECTION_TIMEOUT_MS    1000
 #define MARGEM_ACENDER_MS        500
 
-/* Timeouts derivados — não editar directamente */
+/* ── TC_TIMEOUT_MS: depende do perfil e modo ─────────────
+   Laboratório: sempre 60s (veículos lentos)
+   Produção: 2× TRAFIC_TIMEOUT_MS ou baseado no perfil
+──────────────────────────────────────────────────────────── */
 #if MODO_LABORATORIO
-  #define TC_TIMEOUT_MS         60000ULL   /* 60s — laboratório, mão lenta */
+  #define TC_TIMEOUT_MS  60000ULL
 #else
-  #define TC_TIMEOUT_MS         (TRAFIC_TIMEOUT_MS * 2)
+  #if TIMEOUT_PROFILE == PROFILE_CONSERVADOR
+    #define TC_TIMEOUT_MS  (TRAFIC_TIMEOUT_MS * 2)  // 10s
+  #elif TIMEOUT_PROFILE == PROFILE_BALANCEADO
+    #define TC_TIMEOUT_MS  8000ULL                   // 8s
+  #else
+    #define TC_TIMEOUT_MS  6000ULL                   // 6s
+  #endif
 #endif
 
 #define T_STUCK_TIMEOUT_MS      (TRAFIC_TIMEOUT_MS * 3)
 #define OBSTACULO_REMOVE_MS     8000
-#define AUTONOMO_DELAY_MS       10000ULL
 
 /* Saúde do radar */
-#define RADAR_OK_COUNT          3     /* Frames consecutivos para recuperação */
-#define RADAR_FAIL_COUNT        80    /* Ciclos sem frame para declarar FAIL  */
+#define RADAR_OK_COUNT          3
+#define RADAR_FAIL_COUNT        80
 
 /* Watchdog */
 #define SYSTEM_WDT_TIMEOUT_S    30
 
 
+/* ============================================================
+   VALIDAÇÃO AUTOMÁTICA DE TIMEOUTS
+   ──────────────────────────────────────────────────────────
+   Verifica dependências críticas em tempo de compilação.
+   Previne configurações que causariam race conditions.
+============================================================ */
 
+/* Regra 1: NEIGHBOR_TIMEOUT > 2 × DISCOVER_INTERVAL */
+#if NEIGHBOR_TIMEOUT_MS <= (DISCOVER_INTERVAL_MS * 2)
+  #error "NEIGHBOR_TIMEOUT_MS deve ser > 2 × DISCOVER_INTERVAL_MS"
+#endif
 
+/* Regra 2: AUTONOMO_DELAY ≥ NEIGHBOR_TIMEOUT + margem */
+#if AUTONOMO_DELAY_MS < (NEIGHBOR_TIMEOUT_MS + 1000ULL)
+  #warning "AUTONOMO_DELAY_MS muito curto — risco de race condition!"
+#endif
+
+/* Regra 3: MASTER_CLAIM_TIMEOUT > 2 × MASTER_CLAIM_HB */
+#if MASTER_CLAIM_TIMEOUT_MS <= (MASTER_CLAIM_HB_MS * 2)
+  #error "MASTER_CLAIM_TIMEOUT_MS deve ser > 2 × MASTER_CLAIM_HB_MS"
+#endif
+
+/* Regra 4: TC_TIMEOUT razoável para tráfego */
+#if !MODO_LABORATORIO && TC_TIMEOUT_MS < 5000ULL
+  #warning "TC_TIMEOUT_MS muito curto para veículos reais!"
+#endif
 
 
 /* ============================================================
-   VALIDAÇÃO DE PARÂMETROS EM TEMPO DE COMPILAÇÃO
-   ──────────────────────────────────────────────────────────
-   Detecta configurações impossíveis antes de flashar.
-   Gera erro de compilação descritivo com mensagem clara.
+   VALIDAÇÃO DE PARÂMETROS BÁSICOS
 ============================================================ */
 #if POSTE_ID < 1 || POSTE_ID > 255
   #error "POSTE_ID deve estar entre 1 e 255"
@@ -296,6 +340,18 @@
 
 #if MODO_LABORATORIO != 0 && MODO_LABORATORIO != 1
   #error "MODO_LABORATORIO deve ser 0 (producao) ou 1 (laboratorio)"
+#endif
+
+
+/* ============================================================
+   MENSAGEM DE COMPILAÇÃO — PERFIL ACTIVO
+============================================================ */
+#if TIMEOUT_PROFILE == PROFILE_CONSERVADOR
+  #pragma message "TIMEOUT_PROFILE: CONSERVADOR (failover ~70s)"
+#elif TIMEOUT_PROFILE == PROFILE_BALANCEADO
+  #pragma message "TIMEOUT_PROFILE: BALANCEADO (failover ~20s) ← RECOMENDADO"
+#elif TIMEOUT_PROFILE == PROFILE_AGRESSIVO
+  #pragma message "TIMEOUT_PROFILE: AGRESSIVO (failover ~13s) — TESTE ANTES!"
 #endif
 
 
