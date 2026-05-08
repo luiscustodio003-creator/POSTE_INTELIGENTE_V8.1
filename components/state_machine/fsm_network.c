@@ -1,7 +1,7 @@
 /* ============================================================
    MÓDULO     : fsm_network
    FICHEIRO   : fsm_network.c — Gestão de rede da FSM
-   VERSÃO     : 3.0  |  2026-05-02
+   VERSÃO     : 3.1  |  2026-05-08
    PROJECTO   : Poste Inteligente v8
    AUTORES    : Luis Custódio | Tiago Moreno
    PLATAFORMA : ESP32 (ESP-IDF v5.x)
@@ -13,25 +13,45 @@
    - Failover a meio da linha: sub-segmento mantém liderança local
    - Transições para estados degradados (SAFE_MODE, AUTONOMO)
 
-   CORRECÇÕES v2.9 → v3.0:
+   ALTERAÇÕES v3.0 → v3.1:
    ─────────────────────────
-   BUG 1 CORRIGIDO: MASTER_CLAIM não propagava em cadeia.
-     on_master_claim_received() só fazia log. Agora delega para
-     fsm_network_master_claim_relay() que faz relay completo.
+   BUG 6 CORRIGIDO: Promoção indevida em topologia A←B(off)←C.
+   
+   PROBLEMA:
+     Cenário: A (master pos=0) ← B (pos=1 offline) ← C (pos=2)
+     C detectava B offline e promovia-se a MASTER após 5s,
+     MESMO recebendo MASTER_CLAIM de A via broadcast/relay.
+     RESULTADO: 2 masters simultâneos (A e C)!
+   
+   SOLUÇÃO:
+     Antes de promover a MASTER temporário, verifica se:
+     - Recebeu MASTER_CLAIM nos últimos MASTER_CLAIM_TIMEOUT_MS
+     - O master conhecido tem ID MENOR que este poste
+     - Se SIM → NÃO promove (master activo continua a coordenar)
+   
+   IMPACTO:
+     Cenário A←B(off)←C:
+       - C detecta B offline
+       - C aguarda AUTONOMO_DELAY (5s)
+       - C verifica: recebeu CLAIM de A há 2s (< 15s timeout)
+       - C verifica: A(id=1) < C(id=3)
+       - C NÃO se promove ✅
+       - A continua único master ✅
+     
+     Cenário A-B-C, A falha:
+       - C detecta B offline
+       - C aguarda 5s
+       - C verifica: último CLAIM foi há 20s (> 15s timeout)
+       - C promove-se a MASTER ✅
+       - Sub-segmento C-D-E funciona coordenado ✅
 
-   BUG 2 CORRIGIDO: promoção a MASTER temporário não notificava
-     sub-segmento à direita. Agora envia comm_send_master_claim_id()
-     imediatamente ao ser promovido (sem aguardar heartbeat de 30s).
-
-   BUG 3 CORRIGIDO: promoção bloqueada por STATE_LIGHT_ON.
-     Guarda alargada: aceita qualquer estado excepto STATE_MASTER,
-     STATE_SAFE_MODE e STATE_OBSTACULO.
-
-   BUG 4 CORRIGIDO: AUTONOMO activado sobre STATE_MASTER.
-     Agora STATE_MASTER exclui explicitamente a activação de AUTONOMO.
-
-   BUG 5 CORRIGIDO: recuperação do viz.esq. propagava MASTER_CLAIM
-     com ID errado (POSTE_ID local). Agora usa s_master_id_conhecido.
+   CORRECÇÕES v2.9 → v3.0 (mantidas):
+   ───────────────────────────────────
+   BUG 1: MASTER_CLAIM relay completo
+   BUG 2: Notificação imediata ao promover
+   BUG 3: Guarda alargada para promoção
+   BUG 4: AUTONOMO não sobrepõe MASTER
+   BUG 5: Propagação do ID real na recuperação
 ============================================================ */
 
 #include "fsm_network.h"
@@ -44,26 +64,33 @@
 
 static const char *TAG = "FSM_NET";
 
-/* ID do MASTER actual conhecido — 0 por defeito */
-static int s_master_id_conhecido = 0;
+/* ── Tracking do MASTER actual ──────────────────────────── */
+static int      s_master_id_conhecido   = 0;     /* ID do master */
+static uint64_t s_master_claim_last_ms  = 0;     /* Timestamp último CLAIM */
 
 
 /* ============================================================
    fsm_network_master_claim_relay
    ──────────────────────────────────────────────────────────
-   FIX BUG 1 + BUG 5.
+   FIX BUG 1 + BUG 5 + BUG 6 (v3.1).
    Chamado por on_master_claim_received_ext() em fsm_events.c.
 
    1. Regista o ID do MASTER real
-   2. Se era MASTER temporário → cede → STATE_IDLE
-   3. Propaga MASTER_CLAIM ao vizinho direito sem alterar master_id
+   2. Regista timestamp da recepção (NOVO v3.1)
+   3. Se era MASTER temporário → cede → STATE_IDLE
+   4. Relay: se este poste não é o final, envia MASTER_CLAIM
+      preservando master_id ao longo de toda a cadeia
 ============================================================ */
 void fsm_network_master_claim_relay(int from_id, int master_id)
 {
+    uint64_t agora = fsm_agora_ms();
+    
     ESP_LOGI(TAG, "[MASTER_CLAIM] relay: from=%d master=%d | estado=%s",
              from_id, master_id, state_machine_get_state_name());
 
-    s_master_id_conhecido = master_id;
+    /* ── Actualiza tracking (NOVO v3.1) ────────────────────── */
+    s_master_id_conhecido  = master_id;
+    s_master_claim_last_ms = agora;
 
     /* Cede MASTER se éramos temporários */
     if (g_fsm_state == STATE_MASTER && POST_POSITION > 0) {
@@ -147,7 +174,8 @@ void fsm_network_vizinhos(bool comm_ok, bool is_master)
    fsm_network_master — Passo 10
    ──────────────────────────────────────────────────────────
    FIX BUG 2: ao ser promovido envia MASTER_CLAIM imediato.
-   FIX BUG 3: guarda alargada — aceita LIGHT_ON e outros estados.
+   FIX BUG 3: guarda alargada — aceita LIGHT_ON e outros.
+   FIX BUG 6 (v3.1): verifica MASTER_CLAIM antes de promover.
 ============================================================ */
 void fsm_network_master(bool comm_ok, bool is_master)
 {
@@ -169,7 +197,7 @@ void fsm_network_master(bool comm_ok, bool is_master)
 
     /* ── Promoção a MASTER temporário ─────────────────────────
        FIX BUG 3: pode_promover aceita LIGHT_ON, AUTONOMO, etc.
-       Só exclui estados onde a promoção seria incoerente.
+       FIX BUG 6 (v3.1): verifica MASTER_CLAIM antes de promover.
     ─────────────────────────────────────────────────────────── */
     bool pode_promover = (g_fsm_state != STATE_MASTER    &&
                           g_fsm_state != STATE_SAFE_MODE &&
@@ -181,20 +209,54 @@ void fsm_network_master(bool comm_ok, bool is_master)
         pode_promover &&
         (agora - g_fsm_left_offline_ms) > AUTONOMO_DELAY_MS) {
 
-        g_fsm_state           = STATE_MASTER;
-        s_master_id_conhecido = POSTE_ID;
+        /* ── VERIFICAÇÃO NOVA v3.1 ──────────────────────────────
+           Antes de promover, verifica se há um MASTER com ID
+           MENOR que ainda está activo (enviando MASTER_CLAIM).
+           
+           CENÁRIO CRÍTICO: A (id=1) ← B (id=2 off) ← C (id=3)
+           - C detecta B offline
+           - C aguarda AUTONOMO_DELAY (5s)
+           - MAS A continua a enviar MASTER_CLAIM via broadcast!
+           - C verifica: último CLAIM há 2s (< 15s timeout)
+           - C verifica: A(id=1) < C(id=3)
+           - C NÃO se promove ✅
+           
+           CENÁRIO VÁLIDO: A-B-C, A falha
+           - C detecta B offline
+           - C aguarda 5s
+           - Último CLAIM foi há 20s (> 15s timeout)
+           - C promove-se a MASTER ✅
+        ──────────────────────────────────────────────────────── */
+        bool master_menor_existe = false;
 
-        ESP_LOGW(TAG, "[MASTER] MASTER temporário — viz.esq. offline há %llus",
-                 (unsigned long long)((agora - g_fsm_left_offline_ms) / 1000ULL));
-
-        /* FIX BUG 2: notifica sub-segmento IMEDIATAMENTE */
-        if (comm_right_known()) {
-            comm_send_master_claim_id(POSTE_ID);
-            ESP_LOGI(TAG, "[MASTER] MASTER_CLAIM(id=%d) → cadeia direita (imediato)",
-                     POSTE_ID);
+        if (s_master_claim_last_ms > 0 &&
+            (agora - s_master_claim_last_ms) < MASTER_CLAIM_TIMEOUT_MS) {
+            
+            /* Master conhecido ainda está activo */
+            if (s_master_id_conhecido > 0 && s_master_id_conhecido < POSTE_ID) {
+                master_menor_existe = true;
+                ESP_LOGI(TAG, "[MASTER] Master id=%d activo — NÃO promovo (nós id=%d)",
+                         s_master_id_conhecido, POSTE_ID);
+            }
         }
 
-        g_fsm_master_claim_ms = agora;
+        /* Só promove se NÃO há master menor activo */
+        if (!master_menor_existe) {
+            g_fsm_state           = STATE_MASTER;
+            s_master_id_conhecido = POSTE_ID;
+
+            ESP_LOGW(TAG, "[MASTER] MASTER temporário — viz.esq. offline há %llus",
+                     (unsigned long long)((agora - g_fsm_left_offline_ms) / 1000ULL));
+
+            /* FIX BUG 2: notifica sub-segmento IMEDIATAMENTE */
+            if (comm_right_known()) {
+                comm_send_master_claim_id(POSTE_ID);
+                ESP_LOGI(TAG, "[MASTER] MASTER_CLAIM(id=%d) → cadeia direita (imediato)",
+                         POSTE_ID);
+            }
+
+            g_fsm_master_claim_ms = agora;
+        }
     }
 }
 
