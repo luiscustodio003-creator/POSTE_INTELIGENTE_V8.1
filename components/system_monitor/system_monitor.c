@@ -22,6 +22,8 @@
 #include "dali_manager.h"
 #include "system_config.h"
 #include "post_config.h"
+#include "web_manager.h"
+#include "web_data_provider.h"
 #include "esp_task_wdt.h"
 #include "esp_log.h"
 #include "esp_timer.h"
@@ -143,20 +145,63 @@ void system_monitor_start(void)
     printf("│ [5] WiFi  STA  SSID: %-16s │\n", WIFI_SSID);
     printf("└───────────────────────────────────────┘\n");
 
-    /* ── [6] Tasks ── */
+    /* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+       [6] WEB MANAGER - INTERFACE DE MONITORIZAÇÃO
+       ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */
+    
+    /* Esperar WiFi obter IP (obrigatório antes do servidor HTTP) */
+    printf("┌───────────────────────────────────────┐\n");
+    printf("│ [6] Web  A aguardar IP do WiFi...     │\n");
+    
+    int timeout = 0;
+    while (!wifi_manager_is_connected() && timeout < 100) {
+        vTaskDelay(pdMS_TO_TICKS(100));
+        timeout++;
+    }
+    
+    if (wifi_manager_is_connected()) {
+        /* Inicializar agregador de dados */
+        web_data_provider_init();
+        
+        /* Inicializar servidor HTTP */
+        esp_err_t ret = web_manager_init();
+        
+        if (ret == ESP_OK) {
+            /* Obter IP para mostrar na box */
+            const char* ip = wifi_manager_get_ip();
+            
+            printf("│     ✓ Servidor HTTP activo           │\n");
+            printf("│     IP: %-29s │\n", ip);
+            printf("│     Porta: 80                         │\n");
+            printf("│                                       │\n");
+            printf("│     Acesso via browser:               │\n");
+            printf("│     http://%-26s │\n", ip);
+            printf("└───────────────────────────────────────┘\n");
+        } else {
+            printf("│     ✗ ERRO ao iniciar servidor web   │\n");
+            printf("│     Código: %-25s │\n", esp_err_to_name(ret));
+            printf("└───────────────────────────────────────┘\n");
+        }
+    } else {
+        printf("│     ✗ TIMEOUT - WiFi sem IP           │\n");
+        printf("│     Servidor web NÃO iniciado         │\n");
+        printf("└───────────────────────────────────────┘\n");
+    }
+
+    /* ── [7] Tasks ── */
     state_machine_task_start();
     radar_manager_task_start();
     display_manager_task_start();
     udp_manager_task_start();
     printf("┌───────────────────────────────────────┐\n");
-    printf("│ [6] Tasks criadas                     │\n");
+    printf("│ [7] Tasks criadas                     │\n");
     printf("│     FSM    Core1  Prio6  100ms        │\n");
     printf("│     RADAR  Core0  Prio6  100ms        │\n");
     printf("│     DISP   Core0  Prio4   20ms        │\n");
     printf("│     UDP    Core0  Prio5   10ms        │\n");
     printf("└───────────────────────────────────────┘\n");
 
-    /* ── [7] Watchdog ── */
+    /* ── [8] Watchdog ── */
     esp_task_wdt_config_t wdt_cfg = {
         .timeout_ms     = SYSTEM_WDT_TIMEOUT_S * 1000,
         .idle_core_mask = 0,
@@ -164,10 +209,9 @@ void system_monitor_start(void)
     };
     esp_task_wdt_reconfigure(&wdt_cfg);
     printf("┌───────────────────────────────────────┐\n");
-    printf("│ [7] WDT %-2ds  Sistema operacional      │\n", SYSTEM_WDT_TIMEOUT_S);
+    printf("│ [8] WDT %-2ds  Sistema operacional      │\n", SYSTEM_WDT_TIMEOUT_S);
     printf("╘═══════════════════════════════════════╛\n");
     printf("\n");
 
-    xTaskCreatePinnedToCore(_monitor_task, "monitor_task",
-                            3072, NULL, 7, NULL, 1);
+    xTaskCreatePinnedToCore(_monitor_task, "monitor_task",3072, NULL, 7, NULL, 1);
 }

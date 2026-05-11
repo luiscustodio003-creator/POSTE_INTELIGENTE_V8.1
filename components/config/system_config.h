@@ -47,9 +47,9 @@
 /* ============================================================
    IDENTIDADE DO POSTE
 ============================================================ */
-#define POSTE_ID              2
-#define POSTE_NAME            "POSTE 02"
-#define POST_POSITION         1
+#define POSTE_ID              1
+#define POSTE_NAME            "POSTE 01"
+#define POST_POSITION         0
 
 
 /* ============================================================

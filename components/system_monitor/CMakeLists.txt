@@ -10,6 +10,7 @@ idf_component_register(
         wifi_manager
         dali_manager
         config
+        web_manager    
         nvs_flash
         freertos
         esp_timer
