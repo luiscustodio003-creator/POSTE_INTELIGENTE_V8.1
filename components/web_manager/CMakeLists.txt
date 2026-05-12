@@ -19,9 +19,12 @@ idf_component_register(
         json
         nvs_flash
         esp_wifi
-        esp_timer 
+        esp_timer
+        state_machine      
+        comm_manager      
+        config             
 )
-
+ 
 # Optimizações de compilação
 target_compile_options(${COMPONENT_LIB} PRIVATE 
     -Os              # Optimizar para tamanho

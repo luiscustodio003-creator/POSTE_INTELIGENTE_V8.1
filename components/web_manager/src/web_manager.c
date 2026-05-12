@@ -144,10 +144,10 @@ static esp_err_t handler_api_line(httpd_req_t *req) {
     httpd_resp_send(req, json_str, strlen(json_str));
     
     // Libertar memória
+    size_t json_size = strlen(json_str);  // ← ADICIONAR
     free(json_str);
     cJSON_Delete(json);
-    
-    ESP_LOGI(TAG, "API /line servido (%.1f KB)", strlen(json_str) / 1024.0f);
+    ESP_LOGI(TAG, "API /line servido (%.1f KB)", json_size / 1024.0f);  // ✅   
     return ESP_OK;
 }
 

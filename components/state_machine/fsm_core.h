@@ -142,5 +142,7 @@ int            state_machine_get_Tc(void);
 float          state_machine_get_last_speed(void);
 bool           state_machine_radar_ok(void);
 bool           sm_is_obstaculo(void);
+uint8_t fsm_core_get_duty_cycle(void);
+uint16_t fsm_core_get_last_vehicle_id(void);
 
 #endif /* FSM_CORE_H */

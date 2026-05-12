@@ -1,27 +1,28 @@
 /* ============================================================
-   UDP MANAGER — DECLARAÇÃO
+   UDP MANAGER — DECLARAÇÃO CORRIGIDA
    @file      udp_manager.h
-   @version   5.2  |  2026-05-02
+   @version   5.3  |  2026-05-12
    PROJECTO   : Poste Inteligente v8
    AUTORES    : Luis Custódio | Tiago Moreno
    PLATAFORMA : ESP32 (ESP-IDF v5.x)
 
-   ALTERAÇÕES v5.1 → v5.2:
-   ─────────────────────────
-   - ADICIONADO: udp_manager_send_master_claim_id(ip, master_id)
-     Envia "MASTER_CLAIM:<from_id>:<master_id>" preservando o
-     ID do MASTER original ao longo de toda a cadeia de relays.
+   ALTERAÇÕES v5.2 → v5.3 (CORRECÇÃO UDP OBSTÁCULO):
+   ───────────────────────────────────────────────────────────
+   🔴 BUG UDP CORRIGIDO — Falta comunicação de obstáculo
 
-   - ADICIONADO: on_master_claim_received_ext(from_id, master_id)
-     Callback com dois parâmetros para suportar o novo formato.
-     Versão weak definida no udp_manager, implementada no fsm_events.
+   PROBLEMA:
+   Quando Poste A detecta obstáculo, Poste B não é notificado.
+   B assume TC_TIMEOUT e apaga luz prematuramente mesmo que
+   veículo ainda esteja parado em A.
 
-   - MANTIDO: on_master_claim_received(from_id) — compatibilidade
-     com código existente. Versão weak faz relay com from_id==master_id.
-
-   - ALTERADO: parser de MASTER_CLAIM suporta ambos os formatos:
-     "MASTER_CLAIM:<id>"          → formato antigo (from_id = master_id)
-     "MASTER_CLAIM:<from>:<master>" → formato novo (relay completo)
+   SOLUÇÃO:
+   - ADICIONADO: udp_manager_send_obstaculo(ip, vehicle_id, speed, x_mm)
+     Envia notificação específica quando veículo para.
+   
+   - ADICIONADO: on_obstaculo_received(vehicle_id, speed, x_mm)
+     Callback weak que cancela TC_TIMEOUT e mantém Tc.
+   
+   FORMATO UDP: "OBSTACULO:<from_id>:<vehicle_id>:<speed>:<x_mm>"
 ============================================================ */
 #ifndef UDP_MANAGER_H
 #define UDP_MANAGER_H
@@ -67,6 +68,8 @@ typedef struct {
     uint32_t timeouts_vizinhos;
     uint32_t tc_inc_enviados;
     uint32_t tc_inc_recebidos;
+    uint32_t obstaculo_enviados;    /* NOVO v5.3 */
+    uint32_t obstaculo_recebidos;   /* NOVO v5.3 */
 } udp_stats_t;
 
 
@@ -87,17 +90,30 @@ bool udp_manager_send_spd(const char *ip, float speed,
                            uint32_t eta_ms, uint32_t dist_m, int16_t x_mm);
 bool udp_manager_send_status(const char *ip, neighbor_status_t status);
 bool udp_manager_send_master_claim(const char *ip);
+bool udp_manager_send_master_claim_id(const char *ip, int master_id);
 
 /**
- * @brief Envia MASTER_CLAIM com ID do MASTER real (relay em cadeia).
+ * @brief Envia notificação de obstáculo ao vizinho direito (NOVO v5.3)
  *
- * Formato: "MASTER_CLAIM:<POSTE_ID>:<master_id>"
- * O from_id (POSTE_ID) muda a cada relay; master_id mantém-se.
+ * Formato: "OBSTACULO:<from_id>:<vehicle_id>:<speed>:<x_mm>"
  *
- * @param ip        IP do destinatário
- * @param master_id ID do MASTER real (não muda ao longo dos relays)
+ * QUANDO USAR:
+ *   - Em fsm_events.c, caso SM_EVT_VEHICLE_OBSTACULO
+ *   - Só se g_fsm_right_online == true
+ *
+ * EFEITO NO RECEPTOR:
+ *   - Cancela TC_TIMEOUT (sabe que veículo parou)
+ *   - Mantém Tc (veículo ainda presente na linha)
+ *   - Luz fica acesa até receber PASSED real
+ *
+ * @param ip         IP do vizinho direito
+ * @param vehicle_id ID do veículo parado
+ * @param speed      Velocidade quando parou (para logs)
+ * @param x_mm       Posição lateral em mm
+ * @return true se enviado com sucesso
  */
-bool udp_manager_send_master_claim_id(const char *ip, int master_id);
+bool udp_manager_send_obstaculo(const char *ip, uint16_t vehicle_id, 
+                                float speed, int16_t x_mm);
 
 
 /* ============================================================
@@ -117,18 +133,27 @@ void        udp_manager_get_stats(udp_stats_t *out);
 void on_tc_inc_received(float speed, int16_t x_mm);
 void on_prev_passed_received(float speed);
 void on_spd_received(float speed, uint32_t eta_ms, int16_t x_mm);
-
-/**
- * @brief Callback legado — recebe MASTER_CLAIM com um só campo.
- *        Mantido para compatibilidade. A versão ext é preferida.
- */
 void on_master_claim_received(int from_id);
+void on_master_claim_received_ext(int from_id, int master_id);
 
 /**
- * @brief Callback novo — recebe MASTER_CLAIM com from_id e master_id.
- *        Implementado em fsm_events.c, delega para fsm_network_master_claim_relay().
+ * @brief Callback quando vizinho esquerdo notifica obstáculo (NOVO v5.3)
+ *
+ * CHAMADO POR: udp_manager quando processa "OBSTACULO:..."
+ *
+ * IMPLEMENTADO EM: fsm_events.c
+ *
+ * ACÇÃO ESPERADA:
+ *   - Cancela TC_TIMEOUT (sabe que veículo parou no poste anterior)
+ *   - Mantém Tc inalterado (veículo ainda presente na "linha")
+ *   - Actualiza g_fsm_last_detect_ms
+ *   - Log estruturado para diagnóstico
+ *
+ * @param vehicle_id ID do veículo parado
+ * @param speed      Velocidade quando parou
+ * @param x_mm       Posição lateral em mm
  */
-void on_master_claim_received_ext(int from_id, int master_id);
+void on_obstaculo_received(uint16_t vehicle_id, float speed, int16_t x_mm);
 
 
 /* ============================================================

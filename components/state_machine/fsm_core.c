@@ -200,3 +200,26 @@ const char *state_machine_get_state_name(void)
         default:              return "---";
     }
 }
+
+uint8_t fsm_core_get_duty_cycle(void) {
+    switch (g_fsm_state) {
+        case STATE_IDLE:
+        case STATE_MASTER:
+        case STATE_AUTONOMO:
+            return LIGHT_MIN;  // 2%
+        
+        case STATE_LIGHT_ON:
+        case STATE_OBSTACULO:
+            return LIGHT_MAX;  // 100%
+        
+        case STATE_SAFE_MODE:
+            return LIGHT_SAFE_MODE;  // 50%
+        
+        default:
+            return LIGHT_MIN;
+    }
+}
+
+uint16_t fsm_core_get_last_vehicle_id(void) {
+    return g_fsm_tc_last_vehicle_id;
+}

@@ -1,24 +1,24 @@
 /* ============================================================
-   UDP MANAGER — IMPLEMENTAÇÃO
+   UDP MANAGER — IMPLEMENTAÇÃO CORRIGIDA
    @file      udp_manager.c
-   @version   5.2  |  2026-05-02
+   @version   5.3  |  2026-05-12
    PROJECTO   : Poste Inteligente v8
    AUTORES    : Luis Custódio | Tiago Moreno
    PLATAFORMA : ESP32 (ESP-IDF v5.x)
 
-   ALTERAÇÕES v5.1 → v5.2:
-   ──────────────────────────────────────────────────────────
-   - ADICIONADO: udp_manager_send_master_claim_id(ip, master_id)
-     Envia "MASTER_CLAIM:<POSTE_ID>:<master_id>" preservando
-     o ID do MASTER real ao longo de toda a cadeia de relays.
+   ALTERAÇÕES v5.2 → v5.3 (CORRECÇÃO UDP OBSTÁCULO):
+   ───────────────────────────────────────────────────────────
+   🔴 BUG UDP CORRIGIDO — Falta comunicação de obstáculo
 
-   - ADICIONADO: on_master_claim_received_ext(from_id, master_id)
-     Callback weak com dois parâmetros. Implementado em fsm_events.c.
+   ADICIONADO:
+   - Parser "OBSTACULO:<from_id>:<vehicle_id>:<speed>:<x_mm>"
+   - udp_manager_send_obstaculo() para envio
+   - on_obstaculo_received() callback weak
+   - Estatísticas obstaculo_enviados/recebidos
 
-   - ALTERADO: parser de MASTER_CLAIM suporta ambos os formatos:
-     Antigo: "MASTER_CLAIM:<id>"            → from_id = master_id
-     Novo:   "MASTER_CLAIM:<from>:<master>" → relay completo
-     Compatibilidade total com postes v5.1 ainda não actualizados.
+   FLUXO:
+   A detecta obstáculo → envia OBSTACULO → B
+   B recebe → cancela TC_TIMEOUT → mantém luz acesa
 ============================================================ */
 #include "udp_manager.h"
 #include "state_machine.h"
@@ -98,112 +98,126 @@ static bool _enviar_para(const char *ip, const char *msg)
 
     int r = sendto(s_socket, msg, strlen(msg), 0,
                    (struct sockaddr *)&dest, sizeof(dest));
-    if (r < 0) {
-        ESP_LOGW(TAG, "[TX] Falha → %s errno=%d", ip, errno);
-        return false;
+    if (r > 0) {
+        s_stats.pkts_enviados++;
+        return true;
     }
-
-    s_stats.pkts_enviados++;
-    ESP_LOGD(TAG, "[TX] → %s : %s", ip, msg);
-    return true;
+    return false;
 }
 
+
+/* ============================================================
+   _encontrar_ou_criar_vizinho
+============================================================ */
 static neighbor_t *_encontrar_ou_criar_vizinho(const char *ip, int id, int pos)
 {
     for (int i = 0; i < MAX_NEIGHBORS; i++) {
-        if (s_vizinhos[i].active && strcmp(s_vizinhos[i].ip, ip) == 0) {
-            if (id  >= 0) s_vizinhos[i].id      = id;
-            if (pos >= 0) s_vizinhos[i].position = pos;
+        if (s_vizinhos[i].active && s_vizinhos[i].id == id) {
+            if (!s_vizinhos[i].discover_ok) {
+                s_vizinhos[i].discover_ok = true;
+                ESP_LOGI(TAG, "Vizinho ID=%d pos=%d reconectado", id, pos);
+            }
             return &s_vizinhos[i];
         }
     }
+
     for (int i = 0; i < MAX_NEIGHBORS; i++) {
         if (!s_vizinhos[i].active) {
-            memset(&s_vizinhos[i], 0, sizeof(neighbor_t));
+            s_vizinhos[i].active       = true;
+            s_vizinhos[i].discover_ok  = true;
+            s_vizinhos[i].id           = id;
+            s_vizinhos[i].position     = (pos >= 0) ? pos : 999;
+            s_vizinhos[i].status       = NEIGHBOR_OK;
+            s_vizinhos[i].last_seen    = _agora_ms();
             strncpy(s_vizinhos[i].ip, ip, MAX_IP_LEN - 1);
-            s_vizinhos[i].id       = id;
-            s_vizinhos[i].position = pos;
-            s_vizinhos[i].status   = NEIGHBOR_OK;
-            s_vizinhos[i].active   = true;
-            ESP_LOGI(TAG, "Novo vizinho: ID=%d pos=%d IP=%s", id, pos, ip);
+            ESP_LOGI(TAG, "Vizinho novo: ID=%d pos=%d IP=%s", id, pos, ip);
             return &s_vizinhos[i];
         }
     }
-    ESP_LOGW(TAG, "Tabela cheia — vizinho %s ignorado", ip);
     return NULL;
 }
 
 
 /* ============================================================
-   _processar_mensagem
+   _processar_mensagem — parser de todos os tipos UDP
 ============================================================ */
-static void _processar_mensagem(char *msg, const char *ip)
+static void _processar_mensagem(const char *msg, const char *ip)
 {
     if (!msg || !ip) return;
 
     s_stats.pkts_recebidos++;
 
-    /* ── DISCOVER:<id>:<pos> ─────────────────────────────────── */
+    /* ── DISCOVER:<id>:<pos> ──────────────────────────────────── */
     if (strncmp(msg, "DISCOVER:", 9) == 0) {
-        int id = 0, pos = -1;
+        int id = 0, pos = 0;
         sscanf(msg + 9, "%d:%d", &id, &pos);
         if (id == POSTE_ID) return;
 
         neighbor_t *v = _encontrar_ou_criar_vizinho(ip, id, pos);
-        if (v) {
-            v->last_seen   = _agora_ms();
-            v->discover_ok = true;
-            if (v->status == NEIGHBOR_OFFLINE) v->status = NEIGHBOR_OK;
-        }
+        if (!v) return;
 
-        /* Responde com estado REAL deste poste */
+        v->position  = pos;
+        v->last_seen = _agora_ms();
+
         char resp[32];
-        snprintf(resp, sizeof(resp), "STATUS:%d:%s",
-                 POSTE_ID, _estado_local_str());
+        snprintf(resp, sizeof(resp), "DISCOVER_ACK:%d:%d:%s",
+                 POSTE_ID, POST_POSITION, _estado_local_str());
         _enviar_para(ip, resp);
-
-        ESP_LOGD(TAG, "[RX] DISCOVER ID=%d pos=%d → STATUS:%s",
-                 id, pos, _estado_local_str());
         return;
     }
 
-    /* ── STATUS:<id>:<estado> ───────────────────────────────── */
+    /* ── DISCOVER_ACK:<id>:<pos>:<estado> ─────────────────────── */
+    if (strncmp(msg, "DISCOVER_ACK:", 13) == 0) {
+        int id = 0, pos = 0;
+        char est_str[8] = {0};
+        sscanf(msg + 13, "%d:%d:%7s", &id, &pos, est_str);
+        if (id == POSTE_ID) return;
+
+        neighbor_t *v = _encontrar_ou_criar_vizinho(ip, id, pos);
+        if (v) {
+            v->position  = pos;
+            v->status    = _str_para_status(est_str);
+            v->last_seen = _agora_ms();
+        }
+        return;
+    }
+
+    /* ── STATUS:<id>:<estado> ─────────────────────────────────── */
     if (strncmp(msg, "STATUS:", 7) == 0) {
-        int id = 0; char est[16] = {0};
-        sscanf(msg + 7, "%d:%15s", &id, est);
+        int id = 0;
+        char est_str[8] = {0};
+        sscanf(msg + 7, "%d:%7s", &id, est_str);
         if (id == POSTE_ID) return;
 
         neighbor_t *v = _encontrar_ou_criar_vizinho(ip, id, -1);
         if (v) {
+            v->status    = _str_para_status(est_str);
             v->last_seen = _agora_ms();
-            v->status    = _str_para_status(est);
+            ESP_LOGD(TAG, "[RX] STATUS ID=%d → %s", id, est_str);
         }
-        ESP_LOGD(TAG, "[RX] STATUS ID=%d estado=%s", id, est);
         return;
     }
 
     /* ── TC_INC:<id>:<vel>:<x_mm> ────────────────────────────── */
     if (strncmp(msg, "TC_INC:", 7) == 0) {
-        int id = 0, x_mm = 0; float vel = 0.0f;
+        int id = 0, x_mm = 0;
+        float vel = 0.0f;
         sscanf(msg + 7, "%d:%f:%d", &id, &vel, &x_mm);
         if (id == POSTE_ID) return;
 
         neighbor_t *v = _encontrar_ou_criar_vizinho(ip, id, -1);
         if (v) v->last_seen = _agora_ms();
 
+        ESP_LOGD(TAG, "[RX] TC_INC ID=%d vel=%.0f x=%d", id, vel, x_mm);
         s_stats.tc_inc_recebidos++;
-        ESP_LOGD(TAG, "[RX] TC_INC ID=%d vel=%.0f x=%dmm", id, vel, x_mm);
-
-        if (vel > 0.0f)
-            on_tc_inc_received(vel, (int16_t)x_mm);
-        else if (vel < 0.0f)
-            on_prev_passed_received(0.0f);
+        on_tc_inc_received(vel, (int16_t)x_mm);
         return;
     }
 
-    /* ── PASSED:<id>:<vel> ───────────────────────────────────── */
+    /* ── PASSED:<id>:<vel> ─────────────────────────────────────── */
     if (strncmp(msg, "PASSED:", 7) == 0) {
-        int id = 0; float vel = 0.0f;
+        int id = 0;
+        float vel = 0.0f;
         sscanf(msg + 7, "%d:%f", &id, &vel);
         if (id == POSTE_ID) return;
 
@@ -215,7 +229,7 @@ static void _processar_mensagem(char *msg, const char *ip)
         return;
     }
 
-    /* ── SPD:<id>:<vel>:<eta_ms>:<dist_m>:<x_mm> ──────────────── */
+    /* ── SPD:<id>:<vel>:<eta_ms>:<dist_m>:<x_mm> ────────────── */
     if (strncmp(msg, "SPD:", 4) == 0) {
         int id = 0, x_mm = 0;
         float vel = 0.0f;
@@ -232,25 +246,60 @@ static void _processar_mensagem(char *msg, const char *ip)
         return;
     }
 
+    /* ── OBSTACULO:<from_id>:<vehicle_id>:<speed>:<x_mm> ─────────
+       NOVO v5.3 — Notificação de obstáculo
+
+       FORMATO:
+         from_id    = ID do poste que enviou (POST_POSITION esq.)
+         vehicle_id = ID do veículo parado (tracking_manager)
+         speed      = Velocidade quando parou (para logs)
+         x_mm       = Posição lateral (para logs)
+
+       ACÇÃO:
+         Chama on_obstaculo_received() que cancela TC_TIMEOUT
+         e mantém Tc (veículo ainda presente na linha).
+    ──────────────────────────────────────────────────────────── */
+    if (strncmp(msg, "OBSTACULO:", 10) == 0) {
+        int from_id = 0;
+        unsigned int vehicle_id = 0;
+        int x_mm = 0;
+        float speed = 0.0f;
+        
+        sscanf(msg + 10, "%d:%u:%f:%d", &from_id, &vehicle_id, &speed, &x_mm);
+        
+        if (from_id == POSTE_ID) return;  /* Ignora eco próprio */
+        
+        neighbor_t *v = _encontrar_ou_criar_vizinho(ip, from_id, -1);
+        if (v) {
+            v->last_seen = _agora_ms();
+            /* Pode actualizar status para NEIGHBOR_OBSTACULO se desejado */
+        }
+        
+        ESP_LOGW(TAG, "═══════════════════════════════════════");
+        ESP_LOGW(TAG, "  [RX] OBSTACULO de ID=%d", from_id);
+        ESP_LOGW(TAG, "  vehicle_id=%u | vel=%.1f | x=%d", 
+                 vehicle_id, speed, x_mm);
+        ESP_LOGW(TAG, "═══════════════════════════════════════");
+        
+        s_stats.obstaculo_recebidos++;
+        on_obstaculo_received((uint16_t)vehicle_id, speed, (int16_t)x_mm);
+        return;
+    }
+
     /* ── MASTER_CLAIM:<from_id>[:<master_id>] ────────────────────
        Suporta dois formatos:
          v5.1 (antigo): "MASTER_CLAIM:<id>"
            → from_id = master_id = id  (compatibilidade)
          v5.2 (novo):   "MASTER_CLAIM:<from_id>:<master_id>"
            → relay completo com ID do MASTER real preservado
-
-       Chama on_master_claim_received_ext() que em fsm_events.c
-       delega para fsm_network_master_claim_relay().
     ─────────────────────────────────────────────────────────── */
     if (strncmp(msg, "MASTER_CLAIM:", 13) == 0) {
         int from_id   = 0;
         int master_id = 0;
 
-        /* Tenta ler dois campos; se só um → formato antigo */
         int n = sscanf(msg + 13, "%d:%d", &from_id, &master_id);
-        if (n < 2) master_id = from_id;  /* compatibilidade v5.1 */
+        if (n < 2) master_id = from_id;
 
-        /* Ignora mensagens próprias (eco) */
         if (from_id == POSTE_ID) return;
 
         neighbor_t *v = _encontrar_ou_criar_vizinho(ip, from_id, -1);
@@ -295,7 +344,7 @@ void udp_task_run(void *arg)
     char               rx_buf[160];
     struct sockaddr_in origem;
 
-    ESP_LOGI(TAG, "udp_task v5.2 | Core %d | Porto %d",
+    ESP_LOGI(TAG, "udp_task v5.3 | Core %d | Porto %d",
              xPortGetCoreID(), UDP_PORT);
 
     while (s_socket < 0) {
@@ -439,13 +488,6 @@ bool udp_manager_send_master_claim(const char *ip)
     return _enviar_para(ip, msg);
 }
 
-/* ============================================================
-   udp_manager_send_master_claim_id  (NOVO v5.2)
-   ──────────────────────────────────────────────────────────
-   Envia "MASTER_CLAIM:<POSTE_ID>:<master_id>".
-   O from_id (POSTE_ID) identifica quem fez o relay.
-   O master_id identifica o MASTER real — não muda ao longo da cadeia.
-============================================================ */
 bool udp_manager_send_master_claim_id(const char *ip, int master_id)
 {
     char msg[40];
@@ -453,6 +495,40 @@ bool udp_manager_send_master_claim_id(const char *ip, int master_id)
     bool ok = _enviar_para(ip, msg);
     ESP_LOGD(TAG, "[TX] MASTER_CLAIM from=%d master=%d → %s",
              POSTE_ID, master_id, ip);
+    return ok;
+}
+
+/* ============================================================
+   udp_manager_send_obstaculo  (NOVO v5.3)
+   ──────────────────────────────────────────────────────────
+   Envia notificação de obstáculo ao vizinho direito.
+
+   FORMATO: "OBSTACULO:<from_id>:<vehicle_id>:<speed>:<x_mm>"
+
+   QUANDO CHAMAR:
+     - Em fsm_events.c, caso SM_EVT_VEHICLE_OBSTACULO
+     - Só se g_fsm_right_online == true
+
+   EFEITO NO RECEPTOR:
+     - Cancela TC_TIMEOUT (sabe que veículo parou)
+     - Mantém Tc (veículo ainda presente na linha)
+     - Luz fica acesa até receber PASSED real
+============================================================ */
+bool udp_manager_send_obstaculo(const char *ip, uint16_t vehicle_id,
+                                float speed, int16_t x_mm)
+{
+    char msg[64];
+    snprintf(msg, sizeof(msg), "OBSTACULO:%d:%u:%.1f:%d",
+             POSTE_ID, (unsigned int)vehicle_id, speed, (int)x_mm);
+    
+    bool ok = _enviar_para(ip, msg);
+    
+    if (ok) {
+        s_stats.obstaculo_enviados++;
+        ESP_LOGW(TAG, "[TX] OBSTACULO → %s | ID=%u vel=%.1f x=%d",
+                 ip, (unsigned int)vehicle_id, speed, (int)x_mm);
+    }
+    
     return ok;
 }
 
@@ -525,15 +601,22 @@ __attribute__((weak)) void on_spd_received(float speed, uint32_t eta_ms,
                                             int16_t x_mm)
 { (void)speed; (void)eta_ms; (void)x_mm; }
 
-/* Callback legado — mantido para compatibilidade */
 __attribute__((weak)) void on_master_claim_received(int from_id)
 { (void)from_id; }
 
-/* Callback novo v5.2 — delega para on_master_claim_received se não implementado */
 __attribute__((weak)) void on_master_claim_received_ext(int from_id, int master_id)
 {
-    /* Por defeito, chama o callback legado com from_id.
-       fsm_events.c implementa esta função correctamente. */
     on_master_claim_received(from_id);
     (void)master_id;
+}
+
+/* ── NOVO v5.3 — Callback de obstáculo ────────────────────── */
+__attribute__((weak)) void on_obstaculo_received(uint16_t vehicle_id,
+                                                  float speed,
+                                                  int16_t x_mm)
+{
+    /* Implementação weak vazia — fsm_events.c substitui com lógica real */
+    (void)vehicle_id;
+    (void)speed;
+    (void)x_mm;
 }

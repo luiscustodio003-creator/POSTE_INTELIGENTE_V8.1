@@ -1,7 +1,7 @@
 /* ============================================================
-   COMM MANAGER — IMPLEMENTAÇÃO
+   COMM MANAGER — IMPLEMENTAÇÃO CORRIGIDA
    @file      comm_manager.c
-   @version   3.1  |  2026-05-02
+   @version   3.2  |  2026-05-12
    PROJECTO   : Poste Inteligente v8
    AUTORES    : Luis Custódio | Tiago Moreno
    PLATAFORMA : ESP32 (ESP-IDF v5.x)
@@ -10,12 +10,13 @@
    Resolve IPs de vizinhos, calcula ETA e chama as funções
    de envio correctas sem expor detalhes de protocolo à FSM.
 
-   ALTERAÇÕES v3.0 → v3.1:
-   ─────────────────────────
-   - ADICIONADO: comm_send_master_claim_id(int master_id)
-     Envia MASTER_CLAIM com ID do MASTER real para relay em cadeia.
-     Chama udp_manager_send_master_claim_id() que usa o novo
-     formato de protocolo "MASTER_CLAIM:<from_id>:<master_id>".
+   ALTERAÇÕES v3.1 → v3.2 (CORRECÇÃO UDP OBSTÁCULO):
+   ───────────────────────────────────────────────────────────
+   🔴 BUG UDP CORRIGIDO — Falta comunicação de obstáculo
+
+   - ADICIONADO: comm_send_obstaculo(vehicle_id, speed, x_mm)
+     Envia notificação específica quando veículo para.
+     Resolve IP do vizinho direito automaticamente.
 ============================================================ */
 #include "comm_manager.h"
 #include "udp_manager.h"
@@ -55,7 +56,8 @@ static const char *_ip_vizinho_direito(void)
    ──────────────────────────────────────────────────────────
    Retorna IP do vizinho direito mesmo que não esteja operacional,
    desde que esteja activo (conhecido). Usado para MASTER_CLAIM
-   relay — precisamos de enviar mesmo que o poste esteja em SAFE.
+   relay e OBSTACULO — precisamos de enviar mesmo que o poste
+   esteja em SAFE ou outro estado degradado.
 ============================================================ */
 static const char *_ip_vizinho_direito_qualquer(void)
 {
@@ -97,7 +99,7 @@ bool comm_init(void)
     if (s_iniciado) return true;
     s_iniciado = udp_manager_init();
     if (s_iniciado)
-        ESP_LOGI(TAG, "Comm iniciado — UDP v3.1 activo");
+        ESP_LOGI(TAG, "Comm iniciado — UDP v3.2 activo (obstáculo corrigido)");
     else
         ESP_LOGE(TAG, "Falha ao iniciar UDP");
     return s_iniciado;
@@ -253,10 +255,6 @@ void comm_notify_prev_passed(float speed)
 
 /* ============================================================
    comm_send_master_claim
-   ──────────────────────────────────────────────────────────
-   Anuncia que ESTE poste é MASTER ao vizinho direito.
-   Usa o formato original "MASTER_CLAIM:<POSTE_ID>".
-   Mantido para compatibilidade com código existente.
 ============================================================ */
 void comm_send_master_claim(void)
 {
@@ -268,16 +266,7 @@ void comm_send_master_claim(void)
 
 
 /* ============================================================
-   comm_send_master_claim_id  (NOVO v3.1)
-   ──────────────────────────────────────────────────────────
-   Relay de MASTER_CLAIM preservando o ID do MASTER original.
-   Usa o novo formato "MASTER_CLAIM:<POSTE_ID>:<master_id>".
-
-   Envia ao vizinho direito mesmo que esteja em SAFE_MODE
-   (o relay tem de chegar a toda a cadeia independentemente
-   do estado do vizinho, desde que esteja activo e não OFFLINE).
-
-   @param master_id  ID do MASTER real (não muda ao longo dos relays)
+   comm_send_master_claim_id
 ============================================================ */
 void comm_send_master_claim_id(int master_id)
 {
@@ -285,4 +274,38 @@ void comm_send_master_claim_id(int master_id)
     if (!ip) return;
     udp_manager_send_master_claim_id(ip, master_id);
     ESP_LOGI(TAG, "MASTER_CLAIM(id=%d) → %s", master_id, ip);
+}
+
+
+/* ============================================================
+   comm_send_obstaculo  (NOVO v3.2)
+   ──────────────────────────────────────────────────────────
+   Envia notificação de obstáculo ao vizinho direito.
+
+   QUANDO CHAMAR:
+     - Em fsm_events.c, caso SM_EVT_VEHICLE_OBSTACULO
+     - Só quando g_fsm_right_online == true
+
+   RESOLUÇÃO AUTOMÁTICA:
+     - Usa _ip_vizinho_direito_qualquer() para permitir envio
+       mesmo que vizinho esteja em SAFE_MODE ou OBSTACULO.
+     - Só falha se vizinho estiver OFFLINE ou não conhecido.
+
+   EFEITO NO RECEPTOR:
+     - Cancela TC_TIMEOUT (sabe que veículo parou)
+     - Mantém Tc (veículo ainda presente na linha)
+     - Luz fica acesa até receber PASSED real
+============================================================ */
+void comm_send_obstaculo(uint16_t vehicle_id, float speed, int16_t x_mm)
+{
+    const char *ip = _ip_vizinho_direito_qualquer();
+    if (!ip) {
+        ESP_LOGW(TAG, "OBSTACULO: sem vizinho direito conhecido");
+        return;
+    }
+    
+    udp_manager_send_obstaculo(ip, vehicle_id, speed, x_mm);
+    
+    ESP_LOGW(TAG, "OBSTACULO → %s | ID=%u vel=%.1f x=%d",
+             ip, (unsigned int)vehicle_id, speed, (int)x_mm);
 }
