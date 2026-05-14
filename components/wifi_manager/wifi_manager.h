@@ -152,4 +152,46 @@ void wifi_manager_reset_retry(void);
 void wifi_manager_assume_ap(void);
 
 
+/* ============================================================
+   CONTROLO DE ACTIVAÇÃO/DESACTIVAÇÃO (SAFE MODE)
+============================================================ */
+
+/**
+ * @brief Desliga WiFi completamente (safe mode).
+ * 
+ * Usado quando radar falha para evitar propagação de TC
+ * sem detecção de veículos.
+ * 
+ * Efeito:
+ * - Para envio/recepção UDP
+ * - Desconecta de AP (se STA)
+ * - Para AP (se modo AP)
+ * - Poste fica isolado da rede
+ * 
+ * Chamado por: fsm_network.c quando radar offline
+ */
+void wifi_manager_disable(void);
+
+/**
+ * @brief Religa WiFi após safe mode.
+ * 
+ * Restaura conectividade quando radar recupera.
+ * 
+ * Efeito:
+ * - Reinicia WiFi no modo original (STA ou AP)
+ * - IP mantém-se fixo (não muda)
+ * - Reconecta automaticamente
+ * 
+ * Chamado por: fsm_network.c quando radar volta online
+ */
+void wifi_manager_enable(void);
+
+/**
+ * @brief Verifica se WiFi está activo.
+ * 
+ * @return true se WiFi ligado, false se desligado (safe mode)
+ */
+bool wifi_manager_is_enabled(void);
+
+
 #endif /* WIFI_MANAGER_H */

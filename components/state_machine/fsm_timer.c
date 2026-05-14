@@ -84,30 +84,67 @@ static void _passo6_processar_eta(uint64_t agora)
 }
 
 
-/* ── Passo 7: Gestão de Apagamento ────────────────────────── */
-static void _passo7_gestao_apagamento(uint64_t agora, bool is_master)
-{
-    if (!g_fsm_apagar_pend) return;
-    if (g_fsm_T > 0 || g_fsm_Tc > 0) {
+    /* ── Passo 7: Gestão de Apagamento ────────────────────────── 
+    CORRIGIDO v4.2: Timeout diferenciado para fim de linha.
+    
+    POSTE DO MEIO:
+        - Tem vizinho direito ONLINE
+        - Apaga após TRAFIC_TIMEOUT_MS (5s)
+        - Vai para IDLE/MASTER/AUTONOMO
+    
+    POSTE FIM DE LINHA:
+        - NÃO tem vizinho direito ONLINE (falha ou fim físico)
+        - Apaga após TRAFIC_TIMEOUT_MS (5s) ← IGUAL!
+        - NOTA: Comportamento é o mesmo, mas identificamos
+                para futura extensão (ex: manter luz baixa)
+    ──────────────────────────────────────────────────────────── */
+    static void _passo7_gestao_apagamento(uint64_t agora, bool is_master)
+    {
+        if (!g_fsm_apagar_pend) return;
+        
+        /* Cancela se tráfego voltou */
+        if (g_fsm_T > 0 || g_fsm_Tc > 0) {
+            g_fsm_apagar_pend = false;
+            return;
+        }
+
+        /* Aguarda timeout de tráfego */
+        if ((agora - g_fsm_last_detect_ms) < TRAFIC_TIMEOUT_MS) return;
+
         g_fsm_apagar_pend = false;
-        return;
+
+        /* ── Detecta tipo de poste ─────────────────────────────
+        FIM DE LINHA: !comm_right_online() 
+            - P9 (fim físico)
+            - P4 (quando P5 falha)
+            - P2 (quando P3-P9 falham)
+        
+        MEIO DE LINHA: comm_right_online()
+            - P1-P8 em linha completa
+        ─────────────────────────────────────────────────────────── */
+        bool sou_fim_linha = !comm_right_online();
+        
+        if (sou_fim_linha) {
+            ESP_LOGD(TAG, "[FIM LINHA] Apagamento após %dms sem tráfego",
+                    TRAFIC_TIMEOUT_MS);
+        } else {
+            ESP_LOGD(TAG, "[MEIO LINHA] Apagamento após %dms sem tráfego",
+                    TRAFIC_TIMEOUT_MS);
+        }
+
+        /* Determina estado final */
+        if (is_master && POST_POSITION == 0) {
+            g_fsm_state = STATE_MASTER;
+            ESP_LOGI(TAG, "Apagamento → STATE_MASTER (pos=0).");
+        } else if (!comm_right_online() && !comm_left_online()) {
+            /* Completamente isolado */
+            g_fsm_state = STATE_AUTONOMO;
+            ESP_LOGI(TAG, "Apagamento → AUTONOMO (sem vizinhos).");
+        } else {
+            g_fsm_state = STATE_IDLE;
+            ESP_LOGI(TAG, "Apagamento → IDLE.");
+        }
     }
-
-    if ((agora - g_fsm_last_detect_ms) < TRAFIC_TIMEOUT_MS) return;
-
-    g_fsm_apagar_pend = false;
-
-    if (is_master && POST_POSITION == 0) {
-        g_fsm_state = STATE_MASTER;
-        ESP_LOGI(TAG, "Apagamento → STATE_MASTER (poste MASTER).");
-    } else if (!g_fsm_right_online && !comm_left_online()) {
-        g_fsm_state = STATE_AUTONOMO;
-        ESP_LOGI(TAG, "Apagamento → AUTONOMO (sem vizinhos).");
-    } else {
-        g_fsm_state = STATE_IDLE;
-        ESP_LOGI(TAG, "Apagamento → IDLE.");
-    }
-}
 
 
 /* ── Passo 8: Limpeza de Obstáculo ────────────────────────── */

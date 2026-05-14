@@ -34,11 +34,7 @@
 /**
  * @brief Processa um evento do pipeline tracking → FSM.
  */
-void sm_process_event(sm_event_type_t type,
-                      uint16_t vehicle_id,
-                      float vel,
-                      uint32_t eta_ms,
-                      int16_t x_mm);
+void sm_process_event(sm_event_type_t type,uint16_t vehicle_id,float vel,uint32_t eta_ms,int16_t x_mm);
 
 /* ── Callbacks UDP ────────────────────────────────────────── */
 

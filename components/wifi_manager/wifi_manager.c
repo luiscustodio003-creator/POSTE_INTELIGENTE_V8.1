@@ -49,6 +49,7 @@ static bool s_conectado   = false;
 static char s_ip[16]      = "---";
 static int  s_retries     = 0;
 static bool s_modo_ap     = false;
+static bool s_wifi_enabled = true;
 
 /* Spinlock para proteger s_ip (acedido de event handler e monitor) */
 static portMUX_TYPE s_ip_mux = portMUX_INITIALIZER_UNLOCKED;
@@ -308,4 +309,75 @@ void wifi_manager_reset_retry(void)
 {
     s_retries = 0;
     esp_wifi_connect();
+}
+
+/* ============================================================
+   wifi_manager_disable — Desliga WiFi (safe mode)
+   ──────────────────────────────────────────────────────────
+   Chamado quando radar falha para evitar propagação de TC
+   sem detecção de veículos.
+============================================================ */
+void wifi_manager_disable(void)
+{
+    if (!s_wifi_enabled) {
+        ESP_LOGW(TAG, "WiFi já estava desligado");
+        return;
+    }
+    
+    ESP_LOGW(TAG, "🔴 DESLIGANDO WiFi (SAFE MODE - radar offline)");
+    
+    // Para WiFi
+    esp_wifi_stop();
+    
+    // Actualiza estado
+    s_wifi_enabled = false;
+    s_conectado = false;
+    
+    taskENTER_CRITICAL(&s_ip_mux);
+    strncpy(s_ip, "OFFLINE", sizeof(s_ip));
+    taskEXIT_CRITICAL(&s_ip_mux);
+    
+    display_manager_set_wifi(false, NULL);
+    
+    ESP_LOGW(TAG, "WiFi desligado — poste isolado da rede");
+}
+
+
+/* ============================================================
+   wifi_manager_enable — Religa WiFi (recuperação)
+   ──────────────────────────────────────────────────────────
+   Chamado quando radar recupera para restaurar conectividade.
+============================================================ */
+void wifi_manager_enable(void)
+{
+    if (s_wifi_enabled) {
+        ESP_LOGI(TAG, "WiFi já estava ligado");
+        return;
+    }
+    
+    ESP_LOGI(TAG, "🟢 RELIGANDO WiFi (radar recuperado)");
+    
+    // Reinicia WiFi no modo original
+    esp_wifi_start();
+    
+    // Actualiza estado
+    s_wifi_enabled = true;
+    s_retries = 0;
+    
+    // Reconecta se era STA
+    if (!s_modo_ap) {
+        esp_wifi_connect();
+        ESP_LOGI(TAG, "A reconectar ao AP...");
+    }
+    
+    ESP_LOGI(TAG, "WiFi religado — a restaurar conectividade");
+}
+
+
+/* ============================================================
+   wifi_manager_is_enabled — Verifica se WiFi está activo
+============================================================ */
+bool wifi_manager_is_enabled(void)
+{
+    return s_wifi_enabled;
 }

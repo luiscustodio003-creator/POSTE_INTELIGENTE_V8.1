@@ -54,7 +54,7 @@
    CONSTANTES INTERNAS
 ============================================================ */
 
-#define MASTER_CLAIM_HB_MS  30000ULL
+//#define MASTER_CLAIM_HB_MS  30000ULL
 
 /* ============================================================
    VARIÁVEIS DE ESTADO — partilhadas entre sub-módulos
@@ -82,24 +82,7 @@ extern uint64_t  g_fsm_master_claim_ms;
 extern uint64_t  g_fsm_sem_vizinho_ms;
 extern uint64_t  g_fsm_obstaculo_last_ms;
 
-/* ── NOVO v1.2 ────────────────────────────────────────────────
-   ID do último objecto que gerou TC_INC.
-
-   PROBLEMA (Bug 2):
-     sm_process_event() recebia o vehicle_id mas descartava-o
-     com (void)vehicle_id. Sem esse ID, a FSM não distinguia
-     um segundo EVT_LOCAL do mesmo veículo (retry interno do
-     tracking) de um EVT_LOCAL de um veículo diferente.
-     O "if (Tc==0) Tc=1" protegia contra duplicados mas
-     impedia Tc=2 quando dois carros reais estavam em trânsito.
-
-   SOLUÇÃO:
-     Guardar o ID do último veículo anunciado. Em EVT_LOCAL,
-     só envia TC_INC se o vehicle_id for diferente do último
-     registado. Dois veículos distintos têm IDs distintos →
-     Tc incrementa correctamente para cada um.
-     O mesmo veículo com EVT_LOCAL duplicado → TC_INC suprimido.
-──────────────────────────────────────────────────────────── */
+/*──────────────────────────────────────────────────────────── */
 extern uint16_t g_fsm_tc_last_vehicle_id;
 
 /* ============================================================
@@ -126,8 +109,7 @@ void fsm_obstaculo_keepalive(void);
 void state_machine_init(void);
 
 /** Ciclo de manutenção a 100ms */
-void state_machine_update(bool comm_ok, bool is_master,
-                          bool radar_teve_frame);
+void state_machine_update(bool comm_ok, bool is_master,bool radar_teve_frame);
 
 /** Cria fsm_task no Core 1 */
 void state_machine_task_start(void);

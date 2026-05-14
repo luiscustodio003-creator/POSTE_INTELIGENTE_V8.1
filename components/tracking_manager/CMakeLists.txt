@@ -4,6 +4,8 @@ idf_component_register(
     REQUIRES
         radar_manager
         system_monitor
+        display_manager
+        wifi_manager
         config
         freertos
         esp_timer

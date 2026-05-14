@@ -59,6 +59,7 @@
 #include "fsm_events.h"
 #include "comm_manager.h"
 #include "system_config.h"
+#include "wifi_manager.h"
 #include "esp_log.h"
 #include <inttypes.h>
 
@@ -68,6 +69,8 @@ static const char *TAG = "FSM_NET";
 static int      s_master_id_conhecido   = 0;     /* ID do master */
 static uint64_t s_master_claim_last_ms  = 0;     /* Timestamp último CLAIM */
 
+/* ── Tracking do estado WiFi (safe mode) ────────────────── */
+static bool     s_wifi_was_disabled     = false; /* WiFi foi desligado? */
 
 /* ============================================================
    fsm_network_master_claim_relay
@@ -270,22 +273,41 @@ void fsm_network_master(bool comm_ok, bool is_master)
 ============================================================ */
 void fsm_network_estados_degradados(bool comm_ok, bool is_master)
 {
-    /* ── 1. SAFE MODE — falha física do radar ──────────────────*/
-    if (!g_fsm_radar_ok) {
-        if (g_fsm_state != STATE_SAFE_MODE) {
-            g_fsm_state = STATE_SAFE_MODE;
-            ESP_LOGW(TAG, "[REDE] → SAFE_MODE (radar offline)");
-        }
-        return;
-    }
+            /* ── 1. SAFE MODE — falha física do radar  */
 
-    /* Saída de SAFE_MODE quando radar recupera */
-    if (g_fsm_state == STATE_SAFE_MODE) {
-        g_fsm_state = is_master ? STATE_MASTER : STATE_IDLE;
-        ESP_LOGI(TAG, "[REDE] Saída SAFE_MODE → %s",
-                 state_machine_get_state_name());
-        return;
-    }
+        if (!g_fsm_radar_ok) {
+            if (g_fsm_state != STATE_SAFE_MODE) {
+                g_fsm_state = STATE_SAFE_MODE;
+                ESP_LOGW(TAG, "[REDE] → SAFE_MODE (radar offline)");
+                
+                /* CRÍTICO: Desliga WiFi para isolamento seguro */
+                if (wifi_manager_is_enabled() && !s_wifi_was_disabled) {
+                    ESP_LOGW(TAG, "[SAFE_MODE] 🔴 Desligando WiFi (radar sem detecção)");
+                    ESP_LOGW(TAG, "[SAFE_MODE] Razão: Evitar propagação de TC sem veículos");
+                    wifi_manager_disable();
+                    s_wifi_was_disabled = true;
+                }
+            }
+            return;
+        }
+
+        /* Saída de SAFE_MODE quando radar recupera */
+        if (g_fsm_state == STATE_SAFE_MODE && g_fsm_radar_ok) {
+            ESP_LOGI(TAG, "[REDE] Saída SAFE_MODE → radar recuperado");
+            
+            /* liga o  WiFi se foi desligado */
+            if (s_wifi_was_disabled) {
+                ESP_LOGI(TAG, "[SAFE_MODE] 🟢 Religando WiFi (radar operacional)");
+                wifi_manager_enable();
+                s_wifi_was_disabled = false;
+            }
+            
+            /* Volta para IDLE (discovering) para reintegrar na rede */
+            g_fsm_state = STATE_IDLE;
+            
+            ESP_LOGI(TAG, "[REDE] Estado: IDLE (aguarda discovery de vizinhos)");
+            return;
+        }
 
     /* ── 2. AUTONOMO — sem vizinhos conhecidos ─────────────────
        FIX BUG 4: não activar AUTONOMO se já somos STATE_MASTER.

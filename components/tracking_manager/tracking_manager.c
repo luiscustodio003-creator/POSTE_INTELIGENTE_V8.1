@@ -30,6 +30,7 @@
 #include "tracking_manager.h"
 #include "fsm_core.h"  /* ← NOVO: para fsm_obstaculo_keepalive() */
 #include "system_config.h"
+#include "display_manager.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
@@ -470,6 +471,33 @@ void tracking_manager_update(const radar_data_t *data)
     /* ── PASSO 5: Cópia thread-safe para buffer público ───── */
 
     _copiar_para_publico();
+
+ 
+
+/* ── PASSO 6: Sincronização com o Display ─────────────────── */
+    tracked_vehicle_t vehicles[TRK_MAX_VEHICLES];
+    uint8_t count = 0;
+    if (tracking_manager_get_vehicles(vehicles, &count)) {
+        // 1. Converter para o formato que o display_manager.h espera
+        radar_obj_t display_objs[RADAR_MAX_OBJ];
+        float top_speed = 0;
+        
+        for (int i = 0; i < count && i < RADAR_MAX_OBJ; i++) {
+            display_objs[i].x_mm = (int)vehicles[i].x_mm;
+            display_objs[i].y_mm = (int)vehicles[i].y_mm;
+            display_objs[i].speed_kmh = vehicles[i].speed_kmh;
+            
+            if (vehicles[i].speed_kmh > top_speed) top_speed = vehicles[i].speed_kmh;
+        }
+        
+        // 2. Enviar para a fila do display (Thread-safe)
+        display_manager_set_radar(display_objs, count);
+        display_manager_set_speed((int)top_speed);
+    } else {
+        // Se não há veículos, garante que o display limpa o valor
+        display_manager_set_radar(NULL, 0);
+        display_manager_set_speed(0);
+    }
 }
 
 
@@ -567,5 +595,37 @@ const char *tracking_state_name(trk_state_t state)
         case TRK_STATE_COASTING:    return "COASTING";
         case TRK_STATE_EXITED:      return "EXITED";
         default:                    return "---";
+    }
+}
+
+static void _sync_to_display(void) 
+{
+    tracked_vehicle_t vehicles[TRK_MAX_VEHICLES];
+    uint8_t count = 0;
+    
+    // Obtém os veículos já processados e suavizados
+    if (tracking_manager_get_vehicles(vehicles, &count)) {
+        radar_obj_t display_objs[RADAR_MAX_OBJ];
+        float top_speed = 0;
+        uint8_t target_count = (count > RADAR_MAX_OBJ) ? RADAR_MAX_OBJ : count;
+
+        for (int i = 0; i < target_count; i++) {
+            display_objs[i].x_mm = (int)vehicles[i].x_mm;
+            display_objs[i].y_mm = (int)vehicles[i].y_mm;
+            display_objs[i].speed_kmh = vehicles[i].speed_kmh;
+
+            // Lógica para o card: mostra a maior velocidade actual
+            if (vehicles[i].speed_kmh > top_speed) {
+                top_speed = vehicles[i].speed_kmh;
+            }
+        }
+        
+        // Envia para a fila do display manager (Thread-safe)
+        display_manager_set_radar(display_objs, target_count);
+        display_manager_set_speed((int)top_speed);
+    } else {
+        // Sem alvos: limpa os elementos visuais
+        display_manager_set_radar(NULL, 0);
+        display_manager_set_speed(0);
     }
 }

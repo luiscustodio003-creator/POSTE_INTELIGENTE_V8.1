@@ -47,15 +47,15 @@
 /* ============================================================
    IDENTIDADE DO POSTE
 ============================================================ */
-#define POSTE_ID              2
-#define POSTE_NAME            "POSTE 02"
-#define POST_POSITION         1
+#define POSTE_ID              3
+#define POSTE_NAME            "POSTE 03"
+#define POST_POSITION         2
 
 
 /* ============================================================
    DISPLAY — RESOLUÇÃO VERTICAL
 ============================================================ */
-#define LCD_V_RES_CONFIG   240
+#define LCD_V_RES_CONFIG   320
 
 
 /* ============================================================

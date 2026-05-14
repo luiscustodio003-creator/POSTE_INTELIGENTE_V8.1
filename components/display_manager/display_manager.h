@@ -126,14 +126,7 @@ void display_manager_set_hardware(const char *radar_st,
  */
 void display_manager_set_traffic(int T, int Tc);
 
-/**
- * @brief Actualiza card de velocidade km/h.
- *        NOTA v5.2: NÃO actualiza mais o interpolador s_interp[].
- *        A velocidade do interpolador vem de radar_obj_t.speed_kmh
- *        fornecido por display_manager_set_radar() — mais precisa.
- * @param speed Velocidade em km/h (0-300).
- */
-void display_manager_set_speed(int speed);
+
 
 /**
  * @brief Actualiza estado dos vizinhos UDP.
@@ -155,6 +148,15 @@ void display_manager_set_neighbors(const char *nebL, const char *nebR,
  * @param count Número de objectos (0..RADAR_MAX_OBJ).
  */
 void display_manager_set_radar(const radar_obj_t *objs, uint8_t count);
+/**
+ * @brief Actualiza card de velocidade km/h.
+ *        NOTA v5.2: NÃO actualiza mais o interpolador s_interp[].
+ *        A velocidade do interpolador vem de radar_obj_t.speed_kmh
+ *        fornecido por display_manager_set_radar() — mais precisa.
+ * @param speed Velocidade em km/h (0-300).
+ */
+void display_manager_set_speed(int speed);
+
 
 
 #endif /* DISPLAY_MANAGER_H */

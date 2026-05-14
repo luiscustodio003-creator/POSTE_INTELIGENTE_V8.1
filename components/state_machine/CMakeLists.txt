@@ -24,6 +24,7 @@ idf_component_register(
         display_manager
         tracking_manager
         system_monitor
+        wifi_manager
         config
         freertos
         esp_timer

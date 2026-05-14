@@ -61,6 +61,7 @@
 #include "radar_manager.h"
 #include "system_config.h"
 
+
 /* ── Constantes de configuração ───────────────────────────── */
 
 /* Raio de associação nearest-neighbour (mm).
@@ -79,6 +80,7 @@
 
 /* Máximo de veículos rastreados simultaneamente */
 #define TRK_MAX_VEHICLES        MAX_RADAR_TARGETS
+
 
 
 /* ── Estados do ciclo de vida do veículo ──────────────────── */
@@ -114,31 +116,9 @@ typedef struct {
 
     bool        active;         /* Actualizado no último frame        */
 
-    /* ── Flags de eventos pendentes ────────────────────────────
-       Consumidas pela fsm_task a cada ciclo de 100ms.
-       Limpas por tracking_manager_clear_events() após consumo.
-
-       event_detected_pending  → SM_EVT_VEHICLE_DETECTED
-         Activado: TENTATIVE → CONFIRMED (primeiro avistamento confirmado)
-         FSM: prepara ETA, muda estado para LIGHT_ON. SEM T++.
-
-       event_approach_pending  → SM_EVT_VEHICLE_APPROACHING
-         Activado: CONFIRMED → APPROACHING (velocidade em direcção ao poste)
-         FSM: só agenda pré-acendimento por ETA. SEM T++. SEM TC_INC.
-
-       event_local_pending     → SM_EVT_VEHICLE_LOCAL       [NOVO v1.2]
-         Activado: estado APPROACHING + distance_m ≤ RADAR_DETECT_M
-         FSM: T++, Tc--, TC_INC→dir, PASSED→esq se Tc>0.
-         É este o evento que representa "veículo na minha zona física".
-
-       event_passed_pending    → SM_EVT_VEHICLE_PASSED
-         Activado: COASTING → EXITED (radar perdeu o veículo)
-         FSM: T-- (ou aguarda PASSED de B), SPD→dir.
-
-       event_obstaculo_pending → SM_EVT_VEHICLE_OBSTACULO
-         Activado: N frames consecutivos com vel ≤ OBSTACULO_SPEED_MAX
-         FSM: STATE_OBSTACULO, luz 100%, posição fixa no display.
-    ──────────────────────────────────────────────────────────── */
+    
+    /*──────────────────────────────────────────────────────────── */
+    
     bool        event_detected_pending;   /* VEHICLE_DETECTED         */
     bool        event_approach_pending;   /* VEHICLE_APPROACHING       */
     bool        event_local_pending;      /* VEHICLE_LOCAL    [v1.2]  */
@@ -157,6 +137,7 @@ typedef struct {
 } trk_stats_t;
 
 
+
 /* ── API pública ───────────────────────────────────────────── */
 
 /** Inicializa o módulo — chamar uma vez antes de qualquer update */
@@ -166,8 +147,7 @@ void tracking_manager_init(void);
 void tracking_manager_update(const radar_data_t *data);
 
 /** Copia estado actual dos veículos — thread-safe */
-bool tracking_manager_get_vehicles(tracked_vehicle_t *out,
-                                   uint8_t *out_count);
+bool tracking_manager_get_vehicles(tracked_vehicle_t *out,uint8_t *out_count);
 
 /** Marca eventos de um veículo como consumidos */
 void tracking_manager_clear_events(uint16_t vehicle_id);
@@ -186,6 +166,8 @@ void tracking_manager_task_notify_frame(bool ok);
 
 /** Retorna saúde do radar */
 bool tracking_manager_get_radar_status(void);
+
+
 
 
 #endif /* TRACKING_MANAGER_H */

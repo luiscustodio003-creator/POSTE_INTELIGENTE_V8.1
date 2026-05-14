@@ -5,45 +5,8 @@
    @version   6.0  |  2026-04-24
    PROJECTO   : Poste Inteligente v8
    AUTORES    : Luis Custódio | Tiago Moreno
+
    PLATAFORMA : ESP32 (ESP-IDF v5.x)
-
-   Layout do ecrã:
-   ───────────────────────────────────────
-     y=  0.. 35  → ZONA IDENTIDADE
-     y= 36.. 36  → separador
-     y= 37.. 92  → ZONA HARDWARE
-     y= 93.. 93  → separador
-     y= 94..145  → ZONA TRÁFEGO
-     y=146..146  → separador
-     y=147..239  → ZONA RADAR (canvas 230×90 px)
-
-   MUDANÇA PRINCIPAL v5.7 → v6.0:
-   ──────────────────────────────────────────────────────────
-   REMOVIDO: interpolador preditivo (radar_interp_t, _interp_update,
-   _interp_aplicar_frame).
-   O interpolador avançava a posição do objecto com base na
-   velocidade entre frames reais — mostrava onde o algoritmo
-   ACHAVA que o objecto estava, não onde ele REALMENTE estava.
-
-   SUBSTITUÍDO POR: posição directa (dm_alvo_t).
-   O canvas mostra exactamente a posição x_mm / y_mm que vem
-   do tracking_manager a cada frame.
-   O rasto é construído com posições REAIS anteriores (buffer
-   circular preenchido apenas quando chega um frame real),
-   nunca com posições simuladas.
-
-   Timeout de visibilidade: ALVO_HOLD_MS (500ms).
-   Se não chegar frame real durante esse tempo, o alvo
-   desaparece do canvas — sem "fantasma" a mover-se sozinho.
-
-   Dependências:
-   ─────────────
-     display_manager.h : API pública
-     st7789.h          : driver SPI do display físico
-     system_config.h   : LCD_H_RES, LCD_V_RES, RADAR_MAX_MM
-     hw_config.h       : LCD_PIN_*
-     post_config.h     : post_get_name(), post_get_id()
-     lvgl              : v8.3.x (LV_USE_CANVAS=1 em lv_conf.h)
 ============================================================ */
 
 #include "display_manager.h"
@@ -124,13 +87,7 @@ static QueueHandle_t s_fila = NULL;
 /* ============================================================
    DIMENSÕES DO CANVAS DO RADAR
 ============================================================ */
-/* ── DIMENSÕES DO CANVAS DO RADAR — ADAPTATIVAS ──────────────────
-   LCD_V_RES é variável global (g_lcd_v_res) lida da NVS em st7789_init().
-   RADAR_H adapta-se automaticamente:
-     240×240: RADAR_H = 240 - 149 =  91px
-     240×320: RADAR_H = 320 - 149 = 171px
-   Nenhuma alteração necessária ao mudar de ecrã.
-────────────────────────────────────────────────────────────────── */
+
 #define RADAR_X_OFF   5                          /* margem esquerda fixa  */
 #define RADAR_Y_OFF   149                        /* fim das zonas fixas   */
 #define RADAR_W       (LCD_H_RES - 10)           /* largura do canvas     */
@@ -170,13 +127,7 @@ static lv_color_t radar_buf[RADAR_BUF_MAX];
 /* ============================================================
    ESTADO DOS ALVOS — POSIÇÕES REAIS
    ──────────────────────────────────────────────────────────
-   dm_alvo_t armazena a última posição REAL recebida do
-   tracking_manager e um buffer circular de posições reais
-   anteriores (rasto).
-
-   Não existe nenhum campo de velocidade para movimento
-   preditivo — o alvo só se move quando chega um novo frame.
-   Se não chegar frame dentro de ALVO_HOLD_MS, desaparece.
+  
 ============================================================ */
 typedef struct {
     float    x_mm;                      /* Posição lateral real (mm)         */
@@ -209,9 +160,7 @@ static void st7789_flush_cb(lv_disp_drv_t  *disp_drv,
 {
     int32_t w = area->x2 - area->x1 + 1;
     int32_t h = area->y2 - area->y1 + 1;
-    st7789_draw_bitmap((uint16_t)area->x1, (uint16_t)area->y1,
-                       (uint16_t)w, (uint16_t)h,
-                       (const uint16_t *)color_p);
+    st7789_draw_bitmap((uint16_t)area->x1, (uint16_t)area->y1,(uint16_t)w, (uint16_t)h,(const uint16_t *)color_p);
     lv_disp_flush_ready(disp_drv);
 }
 
@@ -229,8 +178,7 @@ static void _separador(lv_obj_t *pai, int y_pos)
 }
 
 /* Cria label LVGL com posição, cor e texto iniciais */
-static lv_obj_t *_label_novo(lv_obj_t *pai, int x, int y,
-                              uint32_t cor, const char *texto)
+static lv_obj_t *_label_novo(lv_obj_t *pai, int x, int y,uint32_t cor, const char *texto)
 {
     lv_obj_t *l = lv_label_create(pai);
     lv_label_set_text(l, texto);
@@ -278,8 +226,7 @@ static void _circulo_px(int cx, int cy, int r, lv_color_t cor)
 }
 
 /* Anel (halo) com gradiente entre raio interior e exterior */
-static void _halo_px(int cx, int cy, int r_int, int r_ext,
-                     lv_color_t cor, uint8_t alpha_base)
+static void _halo_px(int cx, int cy, int r_int, int r_ext,lv_color_t cor, uint8_t alpha_base)
 {
     int ri2  = r_int * r_int;
     int re2  = r_ext * r_ext;
@@ -1137,15 +1084,11 @@ void display_manager_set_wifi(bool connected, const char *ip)
     xQueueSend(s_fila, &msg, 0);
 }
 
-void display_manager_set_hardware(const char *radar_st,
-                                   bool        radar_ok,
-                                   uint8_t     brightness)
+void display_manager_set_hardware(const char *radar_st,bool radar_ok,uint8_t brightness)
 {
     if (!s_fila) return;
     dm_msg_t msg = { .tipo = DM_MSG_HARDWARE };
-    strncpy(msg.hw.radar_st,
-            radar_st ? radar_st : "---",
-            sizeof(msg.hw.radar_st) - 1);
+    strncpy(msg.hw.radar_st,radar_st ? radar_st : "---",sizeof(msg.hw.radar_st) - 1);
     msg.hw.radar_st[sizeof(msg.hw.radar_st) - 1] = '\0';
     msg.hw.radar_ok   = radar_ok;
     msg.hw.brightness = brightness;
@@ -1169,8 +1112,7 @@ void display_manager_set_speed(int speed)
     xQueueSend(s_fila, &msg, 0);
 }
 
-void display_manager_set_neighbors(const char *nebL, const char *nebR,
-                                   bool leftOk, bool rightOk)
+void display_manager_set_neighbors(const char *nebL, const char *nebR,bool leftOk, bool rightOk)
 {
     if (!s_fila) return;
     dm_msg_t msg = { .tipo = DM_MSG_NEIGHBORS };
@@ -1198,5 +1140,8 @@ void display_manager_set_radar(const radar_obj_t *objs, uint8_t count)
     /* Se fila cheia, descarta — o próximo frame real substitui */
     xQueueSend(s_fila, &msg, 0);
 }
+
+
+
 
 
