@@ -6,8 +6,7 @@
    AUTORES    : Luis Custódio | Tiago Moreno
    PLATAFORMA : ESP32 (ESP-IDF v5.x)
 
-   ALTERAÇÕES v1.1 → v1.2:
-   ─────────────────────────
+
    - ADICIONADO: event_local_pending na struct tracked_vehicle_t.
      Separa o conceito de "veículo confirmado fisicamente na zona
      local" (LOCAL → T++) de "veículo a aproximar-se" (APPROACHING
@@ -28,8 +27,7 @@
        event_passed_pending    : APPROACHING/CONFIRMED → COASTING → EXITED
        event_obstaculo_pending : speed_kmh ≤ OBSTACULO_SPEED_MAX por N frames
 
-   ALTERAÇÕES v1.0 → v1.1:
-   ─────────────────────────
+   
    - Adicionados campos de detecção de obstáculo estático:
        speed_kmh_max, obstaculo_frames, event_obstaculo_pending
 

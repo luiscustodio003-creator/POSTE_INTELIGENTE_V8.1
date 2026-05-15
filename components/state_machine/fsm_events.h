@@ -11,8 +11,7 @@
    Processamento de todos os eventos do pipeline tracking → FSM
    e dos callbacks UDP recebidos do comm_manager.
 
-   ALTERAÇÕES v3.1 → v3.2:
-   ─────────────────────────
+   
    - ADICIONADO: on_master_claim_received_ext(from_id, master_id)
      Callback com dois parâmetros para suporte ao relay em cadeia.
      Delega para fsm_network_master_claim_relay().

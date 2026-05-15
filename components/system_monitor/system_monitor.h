@@ -35,7 +35,7 @@
    monitor_task verifica heartbeats dos outros módulos
    e regista aviso LOGW se algum exceder o timeout.
 
-   Alterações v2.0 → v2.1:
+   
    ──────────────────────────────────────────────────────────
    - CORRIGIDO: tabela de cores — radar/display no Core 0.
    - CORRIGIDO: timeout DISPLAY 500ms → 2000ms (falso alarme no arranque).

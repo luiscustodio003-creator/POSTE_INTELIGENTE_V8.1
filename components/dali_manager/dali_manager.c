@@ -6,8 +6,7 @@
    Estudantes: Luis Custodio | Tiago Moreno
    Plataforma: ESP32 (ESP-IDF v5.x)
 
-   Alterações v3.0 → v3.1:
-   ────────────────────────
+   
    - CORRIGIDO: _pct_to_duty() implementa curva DALI IEC 62386
      correcta usando Look-Up Table com interpolação linear.
    - CORRIGIDO: duty máximo de 255 → 254 (conforme norma DALI).

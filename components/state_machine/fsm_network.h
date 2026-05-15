@@ -19,8 +19,6 @@
    ─────────────
    fsm_core.h, fsm_events.h, comm_manager.h, system_config.h
 
-   ALTERAÇÕES v1.0 → v3.0:
-   ─────────────────────────
    - ADICIONADO: fsm_network_master_claim_relay() — relay de MASTER_CLAIM
 ============================================================ */
 

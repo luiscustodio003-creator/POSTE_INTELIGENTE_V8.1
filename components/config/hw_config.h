@@ -6,7 +6,7 @@
    PROJECTO   : Poste Inteligente v8
    AUTORES    : Luis Custódio | Tiago Moreno
 
-   AUTO-DETECÇÃO DE RESOLUÇÃO (v6.2):
+   AUTO-DETECÇÃO DE RESOLUÇÃO
    ────────────────────────────────────
    LCD_V_RES deixou de ser um #define fixo.
    É agora uma variável global uint16_t g_lcd_v_res definida

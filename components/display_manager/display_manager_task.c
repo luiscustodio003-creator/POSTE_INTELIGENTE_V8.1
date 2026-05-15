@@ -10,8 +10,7 @@
    ÚNICA task que chama funções LVGL — sem mutex LVGL necessário.
    Drena fila de mensagens e chama lv_timer_handler() a 50Hz.
 
-   MUDANÇAS v1.0 → v2.0:
-   ─────────────────────────
+   
    - CORRIGIDO: display_task estava no Core 1 em conflito com
      fsm_task (Prio 6) e comm_task no mesmo core.
      A fsm_task preemptava o render LVGL a cada 100ms,

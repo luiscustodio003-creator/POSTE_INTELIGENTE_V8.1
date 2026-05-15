@@ -6,18 +6,16 @@
    AUTORES    : Luis Custódio | Tiago Moreno
    PLATAFORMA : ESP32 (ESP-IDF v5.x)
 
-   ALTERAÇÕES v2.0 → v2.1:
-   ─────────────────────────
+   
    • REMOVIDAS: wifi_manager_assume_ap(), wifi_manager_reset_retry(),
      wifi_manager_is_ap_mode() — nunca chamadas.
    • CORRIGIDO: duplo esp_wifi_connect() em wifi_manager_enable().
 
-   ALTERAÇÕES v1.5 → v2.0:
-   ─────────────────────────
+   
    • REMOVIDA lógica de mudança STA↔AP em runtime
    • ADICIONADA wifi_manager_init_ap() para pos=0
    
-   MODELO v2.0:
+   
    • POST_POSITION == 0 → AP permanente (192.168.4.1)
    • POST_POSITION > 0  → STA permanente (192.168.4.X)
    • IP FIXO nunca muda

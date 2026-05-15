@@ -6,14 +6,12 @@
    Estudantes: Luis Custodio | Tiago Moreno
    Plataforma: ESP32 (ESP-IDF v5.x)
 
-   Alterações v3.1 → v3.2:
-   ────────────────────────
+  
    - REMOVIDAS: dali_turn_on(), dali_turn_off() — nunca chamadas.
    - REMOVIDAS: dali_fade_stop(), dali_get_brightness_real() — nunca chamadas.
    - REMOVIDA: dali_test_curve() — ferramenta de diagnóstico sem chamadores.
 
-   Alterações v3.0 → v3.1:
-   ────────────────────────
+   
    - CORRIGIDO: Curva logarítmica em _pct_to_duty() — LUT IEC 62386.
 ============================================================ */
 #ifndef DALI_MANAGER_H
