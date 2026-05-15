@@ -1,5 +1,10 @@
-/* fsm_timer.c — v1.4 | 2026-05-04 | Poste Inteligente v8
-   Timeouts de tráfego, pré-acendimento ETA, obstáculo, heartbeat master. */
+/* ============================================================
+   MÓDULO     : fsm_timer
+   FICHEIRO   : fsm_timer.c — Gestão de timeouts: tráfego, ETA, obstáculo, heartbeat
+   PROJECTO   : Poste Inteligente v8
+   AUTORES    : Luis Custódio | Tiago Moreno
+   PLATAFORMA : ESP32 (ESP-IDF v5.x)
+============================================================ */
 
 #include "fsm_timer.h"
 #include "fsm_core.h"
@@ -120,14 +125,17 @@ static void _passo9_timeout_seguranca_tc(uint64_t agora)
 }
 
 
-/* ── Passo 12: Heartbeat de master (só pos=0) ─────────────── */
+/* ── Passo 12: Heartbeat de master (qualquer MASTER) ─────────
+   Correcção: MASTER temporário (pos>0) também envia heartbeat.
+   Sem isto, o cluster à direita perde autoridade após 15s e
+   pode eleger um segundo MASTER dentro do mesmo cluster. */
 static void _passo12_master_heartbeat(uint64_t agora, bool is_master)
 {
-    if (!is_master || POST_POSITION != 0) return;
+    if (!is_master) return;
 
     if ((agora - g_fsm_master_claim_ms) >= MASTER_CLAIM_HB_MS) {
         g_fsm_master_claim_ms = agora;
-        comm_send_master_claim();
+        comm_send_master_claim_id(POSTE_ID);
     }
 }
 

@@ -1,5 +1,10 @@
-/* fsm_task.c — v5.1 | 2026-04-30 | Poste Inteligente v8
-   Task principal da FSM — Core 1, Prio 6, Stack 6144B, ciclo 100ms. */
+/* ============================================================
+   MÓDULO     : fsm_task
+   FICHEIRO   : fsm_task.c — Task principal da FSM e controlo DALI
+   PROJECTO   : Poste Inteligente v8
+   AUTORES    : Luis Custódio | Tiago Moreno
+   PLATAFORMA : ESP32 (ESP-IDF v5.x)
+============================================================ */
 
 #include "fsm_core.h"
 #include "fsm_events.h"

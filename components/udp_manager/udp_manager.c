@@ -1,32 +1,18 @@
 /* ============================================================
-   UDP MANAGER — IMPLEMENTAÇÃO CORRIGIDA
-   @file      udp_manager.c
-   @version   5.4  |  2026-05-14
+   MÓDULO     : udp_manager
+   FICHEIRO   : udp_manager.c — Gestão UDP: descoberta, vizinhos e protocolo
    PROJECTO   : Poste Inteligente v8
    AUTORES    : Luis Custódio | Tiago Moreno
    PLATAFORMA : ESP32 (ESP-IDF v5.x)
-
-   ALTERAÇÕES v5.3 → v5.4:
-   ─────────────────────────
-   - REMOVIDO: s_iniciado — variável nunca lida (comm_manager tem a sua).
-   - REMOVIDO: udp_manager_get_all_neighbors() — nunca chamada.
-   - REMOVIDO: udp_manager_reset_neighbor() — nunca chamada.
-   - REMOVIDO: branch "FAIL" em _str_para_status() — nunca enviado.
-   - ALTERADO: udp_task_run() → static (só usada internamente).
-
-   ALTERAÇÕES v5.2 → v5.3 (CORRECÇÃO UDP OBSTÁCULO):
-   ───────────────────────────────────────────────────────────
-   - Parser "OBSTACULO:<from_id>:<vehicle_id>:<speed>:<x_mm>"
-   - udp_manager_send_obstaculo() para envio
-   - on_obstaculo_received() callback weak
-   - Estatísticas obstaculo_enviados/recebidos
 ============================================================ */
 #include "udp_manager.h"
 #include "state_machine.h"
 #include "system_monitor.h"
 #include "system_config.h"
+#include "wifi_manager.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "esp_random.h"
 #include "lwip/sockets.h"
 #include "lwip/inet.h"
 #include "freertos/FreeRTOS.h"
@@ -150,7 +136,16 @@ static void _processar_mensagem(const char *msg, const char *ip)
     if (strncmp(msg, "DISCOVER:", 9) == 0) {
         int id = 0, pos = 0;
         sscanf(msg + 9, "%d:%d", &id, &pos);
-        if (id == POSTE_ID) return;
+        if (id == POSTE_ID) {
+            const char *my_ip = wifi_manager_get_ip();
+            if (my_ip &&
+                strcmp(my_ip, "---")     != 0 &&
+                strcmp(my_ip, "OFFLINE") != 0 &&
+                strcmp(ip,    my_ip)     != 0)
+                ESP_LOGE(TAG, "COLISÃO POSTE_ID=%d — remoto=%s local=%s — verificar NVS!",
+                         POSTE_ID, ip, my_ip);
+            return;
+        }
 
         neighbor_t *v = _encontrar_ou_criar_vizinho(ip, id, pos);
         if (!v) return;
@@ -349,6 +344,16 @@ static void udp_task_run(void *arg)
     while (s_socket < 0) {
         system_monitor_heartbeat(MOD_UDP);
         vTaskDelay(pdMS_TO_TICKS(200));
+    }
+
+    /* Jitter de arranque: evita colisão de DISCOVERs em boot simultâneo.
+       POST_POSITION×30ms separa postes adjacentes; +0-199ms cobre resto.
+       Cap em 2000ms: evita atraso excessivo em linhas longas (pos>60). */
+    uint32_t jitter_ms = (uint32_t)POST_POSITION * 30u + (uint32_t)(esp_random() % 200u);
+    if (jitter_ms > 2000u) jitter_ms = 2000u;
+    if (jitter_ms > 0) {
+        ESP_LOGI(TAG, "Boot jitter: %lums (pos=%d)", (unsigned long)jitter_ms, POST_POSITION);
+        vTaskDelay(pdMS_TO_TICKS(jitter_ms));
     }
 
     udp_manager_discover();

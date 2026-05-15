@@ -1,5 +1,10 @@
-/* radar_manager.c — v3.3 | 2026-04-09 | Poste Inteligente v8
-   HLK-LD2450: formato magnitude + bit de sinal (bit15), NÃO complemento a 2. */
+/* ============================================================
+   MÓDULO     : radar_manager
+   FICHEIRO   : radar_manager.c — Parser HLK-LD2450 e interface de leitura
+   PROJECTO   : Poste Inteligente v8
+   AUTORES    : Luis Custódio | Tiago Moreno
+   PLATAFORMA : ESP32 (ESP-IDF v5.x)
+============================================================ */
 
 #include "radar_manager.h"
 #include "system_config.h"

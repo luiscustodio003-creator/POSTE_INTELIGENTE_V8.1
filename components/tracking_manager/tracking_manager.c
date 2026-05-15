@@ -1,4 +1,10 @@
-/* tracking_manager.c — v1.2 | 2026-05-12 | Poste Inteligente v8 */
+/* ============================================================
+   MÓDULO     : tracking_manager
+   FICHEIRO   : tracking_manager.c — Rastreio multi-alvo e detecção de eventos
+   PROJECTO   : Poste Inteligente v8
+   AUTORES    : Luis Custódio | Tiago Moreno
+   PLATAFORMA : ESP32 (ESP-IDF v5.x)
+============================================================ */
 
 #include "tracking_manager.h"
 #include "fsm_core.h"

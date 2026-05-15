@@ -1,22 +1,9 @@
 /* ============================================================
-   COMM MANAGER — IMPLEMENTAÇÃO CORRIGIDA
-   @file      comm_manager.c
-   @version   3.2  |  2026-05-12
+   MÓDULO     : comm_manager
+   FICHEIRO   : comm_manager.c — Camada de abstracção UDP para a FSM
    PROJECTO   : Poste Inteligente v8
    AUTORES    : Luis Custódio | Tiago Moreno
    PLATAFORMA : ESP32 (ESP-IDF v5.x)
-
-   Camada de abstracção sobre o udp_manager.
-   Resolve IPs de vizinhos, calcula ETA e chama as funções
-   de envio correctas sem expor detalhes de protocolo à FSM.
-
-   ALTERAÇÕES v3.1 → v3.2 (CORRECÇÃO UDP OBSTÁCULO):
-   ───────────────────────────────────────────────────────────
-   🔴 BUG UDP CORRIGIDO — Falta comunicação de obstáculo
-
-   - ADICIONADO: comm_send_obstaculo(vehicle_id, speed, x_mm)
-     Envia notificação específica quando veículo para.
-     Resolve IP do vizinho direito automaticamente.
 ============================================================ */
 #include "comm_manager.h"
 #include "udp_manager.h"

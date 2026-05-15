@@ -1,5 +1,10 @@
-/* fsm_events.c — v3.7 | 2026-05-14 | Poste Inteligente v8
-   Callbacks UDP e sm_process_event — ponto central de eventos do tracking. */
+/* ============================================================
+   MÓDULO     : fsm_events
+   FICHEIRO   : fsm_events.c — Callbacks UDP e processamento de eventos de tracking
+   PROJECTO   : Poste Inteligente v8
+   AUTORES    : Luis Custódio | Tiago Moreno
+   PLATAFORMA : ESP32 (ESP-IDF v5.x)
+============================================================ */
 
 #include "fsm_events.h"
 #include "fsm_core.h"

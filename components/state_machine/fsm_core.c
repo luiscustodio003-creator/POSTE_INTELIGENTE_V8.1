@@ -1,5 +1,10 @@
-/* fsm_core.c — v2.8 | 2026-05-04 | Poste Inteligente v8
-   Variáveis de estado, saúde do radar, state_machine_update(). */
+/* ============================================================
+   MÓDULO     : fsm_core
+   FICHEIRO   : fsm_core.c — Variáveis de estado globais e ciclo principal da FSM
+   PROJECTO   : Poste Inteligente v8
+   AUTORES    : Luis Custódio | Tiago Moreno
+   PLATAFORMA : ESP32 (ESP-IDF v5.x)
+============================================================ */
 
 #include "fsm_core.h"
 #include "fsm_timer.h"

@@ -1,21 +1,9 @@
 /* ============================================================
-   SUPERVISOR DO SISTEMA
-   @file      system_monitor.c
-   @version   5.2  |  2026-05-14
+   MÓDULO     : system_monitor
+   FICHEIRO   : system_monitor.c — Supervisor de módulos, watchdog e diagnóstico
    PROJECTO   : Poste Inteligente v8
    AUTORES    : Luis Custódio | Tiago Moreno
    PLATAFORMA : ESP32 (ESP-IDF v5.x)
-
-   CORRECÇÕES v5.0 → v5.1:
-   - display_manager_set_hw_status() → display_manager_set_hardware()
-   - wifi_manager_set_ip_callback() removido (não existe)
-     UDP iniciado por polling em _monitor_task (padrão original)
-   - Bloco #else USE_RADAR removido (só radar real)
-
-   CORRECÇÕES v5.1 → v5.2:
-   - CORRIGIDO: s_timeout_ms[] usa defines do header (DISPLAY era 500ms, devia ser 2000ms).
-   - REMOVIDO: dali_set_brightness(LIGHT_MIN) redundante após dali_init().
-   - (header v2.1: tabela cores, is_alive removida, define WDT comentado removido)
 ============================================================ */
 #include "system_monitor.h"
 #include "state_machine.h"
@@ -151,6 +139,7 @@ static void _monitor_task(void *arg)
                          s_nome[i], (unsigned long long)delta);
         }
 
+        wifi_manager_tick();
         _supervisao(agora);
 
         if (wifi_manager_is_connected()) {

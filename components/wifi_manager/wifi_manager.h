@@ -144,10 +144,34 @@ void wifi_manager_enable(void);
 
 /**
  * @brief Verifica se WiFi está activo.
- * 
+ *
  * @return true se WiFi ligado, false se desligado (safe mode)
  */
 bool wifi_manager_is_enabled(void);
+
+
+/* ============================================================
+   FAILOVER DE AP
+============================================================ */
+
+/**
+ * @brief Motor de failover — deve ser chamado periodicamente (~200ms).
+ *
+ * Gere a promoção STA→AP e a demoção AP→STA de forma autónoma:
+ * - Se STA offline há POST_POSITION × WIFI_AP_PROMOTE_BASE_MS → promove a AP.
+ * - Se AP promovido → tenta periodicamente voltar a STA (quando AP original regressa).
+ * - POST_POSITION=0 é imune: nunca promovido, nunca demovido.
+ *
+ * Chamado por: system_monitor (_monitor_task, Core 1, Prio 7).
+ */
+void wifi_manager_tick(void);
+
+/**
+ * @brief Indica se este poste está em modo AP por failover (não é o AP original).
+ *
+ * @return true se é AP promovido, false se é AP original (pos=0) ou STA
+ */
+bool wifi_manager_is_promoted_ap(void);
 
 
 #endif /* WIFI_MANAGER_H */

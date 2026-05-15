@@ -1,55 +1,9 @@
 /* ============================================================
-   RADAR MANAGER — TASK DE LEITURA
-   @file      radar_manager_task.c
-   @version   5.0  |  2026-04-29
+   MÓDULO     : radar_manager_task
+   FICHEIRO   : radar_manager_task.c — Task de leitura UART do HLK-LD2450
    PROJECTO   : Poste Inteligente v8
    AUTORES    : Luis Custódio | Tiago Moreno
    PLATAFORMA : ESP32 (ESP-IDF v5.x)
-
-   RESPONSABILIDADE:
-   ─────────────────
-   Lê o sensor HLK-LD2450 via UART a cada 100ms,
-   alimenta o tracking_manager com o frame bruto,
-   e notifica a fsm_task sobre a saúde do radar via atomic_bool.
-
-   CICLO DE EXECUÇÃO:
-   ───────────────────
-     1. Lê frame UART → radar_read_data() (parse HLK-LD2450)
-     2. Alimenta tracking_manager_update() com o frame
-     3. Notifica fsm_task: tracking_manager_task_notify_frame(ok)
-     4. Heartbeat ao system_monitor
-     5. Aguarda 100ms
-
-   SINCRONIZAÇÃO ENTRE TASKS:
-   ────────────────────────────
-     radar_task (Core 0, Prio 5):
-       radar_read_data()                   → actualiza cache interna (spinlock)
-       tracking_manager_update()           → exclusivo desta task
-       tracking_manager_task_notify_frame() → escreve atomic_bool
-
-     fsm_task (Core 1, Prio 6):
-       atomic_exchange(&s_radar_teve_frame) → lê e repõe a false
-
-   NOTA — tracking_manager_update() com count=0:
-   ───────────────────────────────────────────────
-     Chamar SEMPRE, mesmo quando ok=false ou count=0.
-     O tracking avança os lost_frames dos slots em COASTING,
-     garantindo que veículos que saíram são declarados EXITED
-     mesmo quando o sensor não retorna frame válido nesse ciclo.
-
-   NOTA — extern removido:
-   ────────────────────────
-     tracking_manager_task_notify_frame() era declarado com extern
-     directamente no .c (acoplamento silencioso). Em v5.0 é incluído
-     via tracking_manager.h — compilador valida a assinatura.
-
-   MUDANÇAS v4.0 → v5.0:
-   ──────────────────────
-     - REMOVIDO: bloco #if USE_RADAR / #else (modo simulado)
-     - REMOVIDO: extern void tracking_manager_task_notify_frame()
-     - ADICIONADO: #include "tracking_manager.h" (declaração correcta)
-     - SIMPLIFICADO: radar_task() sem ramificação condicional
-     - MANTIDO: heartbeat, período 100ms, Core 0 Prio 5
 ============================================================ */
 
 #include "radar_manager.h"

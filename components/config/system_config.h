@@ -34,6 +34,16 @@
 #define WIFI_RETRY_ATTEMPTS   5
 #define WIFI_RECONNECT_MS     30000
 
+/* ── Failover de AP (eleição dinâmica quando poste 0 cai) ─ */
+#if MODO_LABORATORIO
+  #define WIFI_AP_PROMOTE_BASE_MS   20000ULL  /* 20s × POST_POSITION em lab */
+  #define WIFI_AP_SCAN_INTERVAL_MS  30000ULL  /* cada 30s tenta demoção    */
+#else
+  #define WIFI_AP_PROMOTE_BASE_MS   60000ULL  /* 60s × POST_POSITION em prod */
+  #define WIFI_AP_SCAN_INTERVAL_MS 120000ULL  /* cada 2min tenta demoção    */
+#endif
+#define WIFI_DEMOTE_RETRIES  2   /* tentativas rápidas de demoção (minimiza disrupção) */
+
 #define WIFI_AP_IP_1        192
 #define WIFI_AP_IP_2        168
 #define WIFI_AP_IP_3          4
@@ -211,8 +221,8 @@
   #error "POSTE_ID deve estar entre 1 e 255"
 #endif
 
-#if POST_POSITION < 0 || POST_POSITION > 15
-  #error "POST_POSITION deve estar entre 0 e 15"
+#if POST_POSITION < 0 || POST_POSITION > 252
+  #error "POST_POSITION deve estar entre 0 e 252 (IP = POST_POSITION+1, max .253)"
 #endif
 
 #if RADAR_MAX_M < 1 || RADAR_MAX_M > 30

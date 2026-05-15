@@ -1,5 +1,10 @@
-/* fsm_network.c — v3.1 | 2026-05-08 | Poste Inteligente v8
-   Gestão de vizinhos, eleição de master, AUTONOMO, SAFE_MODE. */
+/* ============================================================
+   MÓDULO     : fsm_network
+   FICHEIRO   : fsm_network.c — Gestão de vizinhos, eleição de master, AUTONOMO, SAFE_MODE
+   PROJECTO   : Poste Inteligente v8
+   AUTORES    : Luis Custódio | Tiago Moreno
+   PLATAFORMA : ESP32 (ESP-IDF v5.x)
+============================================================ */
 
 #include "fsm_network.h"
 #include "fsm_core.h"
