@@ -31,16 +31,24 @@
 #define WIFI_SSID             "wifi"
 #define WIFI_PASS             "password"
 #define WIFI_AP_CHANNEL        1
-#define WIFI_RETRY_ATTEMPTS   5
-#define WIFI_RECONNECT_MS     30000
+
+/* Tentativas e pausa entre rondas de ligação STA
+   Anti-colisão AP: 2×PROMOTE_BASE > ATTEMPTS×1s + RECONNECT_MS         */
+#if MODO_LABORATORIO
+  #define WIFI_RETRY_ATTEMPTS   3       /* 3×~500ms ≈ 1.5s antes de pausa  */
+  #define WIFI_RECONNECT_MS     5000    /* 5s — maior ganho na recuperação  */
+#else
+  #define WIFI_RETRY_ATTEMPTS   5
+  #define WIFI_RECONNECT_MS     10000   /* 10s entre rondas em produção     */
+#endif
 
 /* ── Failover de AP (eleição dinâmica quando poste 0 cai) ─ */
 #if MODO_LABORATORIO
-  #define WIFI_AP_PROMOTE_BASE_MS   20000ULL  /* 20s × POST_POSITION em lab */
-  #define WIFI_AP_SCAN_INTERVAL_MS  30000ULL  /* cada 30s tenta demoção    */
+  #define WIFI_AP_PROMOTE_BASE_MS   10000ULL  /* 10s × POST_POSITION em lab */
+  #define WIFI_AP_SCAN_INTERVAL_MS  15000ULL  /* cada 15s tenta demoção    */
 #else
-  #define WIFI_AP_PROMOTE_BASE_MS   60000ULL  /* 60s × POST_POSITION em prod */
-  #define WIFI_AP_SCAN_INTERVAL_MS 120000ULL  /* cada 2min tenta demoção    */
+  #define WIFI_AP_PROMOTE_BASE_MS   30000ULL  /* 30s × POST_POSITION em prod */
+  #define WIFI_AP_SCAN_INTERVAL_MS  60000ULL  /* cada 60s tenta demoção    */
 #endif
 #define WIFI_DEMOTE_RETRIES  2   /* tentativas rápidas de demoção (minimiza disrupção) */
 
@@ -212,6 +220,12 @@
 
 #if !MODO_LABORATORIO && TC_TIMEOUT_MS < 5000ULL
   #warning "TC_TIMEOUT_MS muito curto para veículos reais!"
+#endif
+
+/* Anti-colisão AP: garante que P(n) encontra AP de P(n-1) antes de se promover.
+   Condição: 2×PROMOTE_BASE > ATTEMPTS×1000 + RECONNECT_MS               */
+#if (2 * WIFI_AP_PROMOTE_BASE_MS) <= (WIFI_RETRY_ATTEMPTS * 1000ULL + WIFI_RECONNECT_MS)
+  #error "Anti-colisão WiFi violada: aumentar PROMOTE_BASE ou reduzir RECONNECT_MS/RETRY_ATTEMPTS"
 #endif
 
 

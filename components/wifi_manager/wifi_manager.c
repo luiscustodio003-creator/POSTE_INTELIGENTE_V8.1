@@ -224,13 +224,13 @@ static void wifi_event_handler(void *arg,
         }
 
     } else if (id == WIFI_EVENT_STA_DISCONNECTED) {
-        if (s_promoted) {
-            /* Sondagem de demoção — re-tentar (tick() aborta se retries esgotados). */
+        if (s_promoted && s_demoting) {
+            /* Sondagem de demoção em APSTA — re-tentar (tick() aborta se esgotado). */
             if (s_retries < WIFI_DEMOTE_RETRIES) {
                 s_retries++;
                 esp_wifi_connect();
             }
-        } else {
+        } else if (!s_promoted) {
             /* STA normal — registar 1.ª desconexão para timer de promoção. */
             if (s_disconnect_since_us == 0)
                 s_disconnect_since_us = esp_timer_get_time();
