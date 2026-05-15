@@ -401,6 +401,8 @@ void wifi_manager_disable(void)
     s_wifi_enabled        = false;
     s_conectado           = false;
     s_disconnect_since_us = 0;  /* reset: não promover enquanto radar offline */
+    s_demoting            = false;
+    s_demote_ok           = false; /* anula resultado de sondagem pendente */
 
     taskENTER_CRITICAL(&s_ip_mux);
     strncpy(s_ip, "OFFLINE", sizeof(s_ip));
@@ -430,6 +432,10 @@ void wifi_manager_enable(void)
         s_conectado = true;
         snprintf(s_ip, sizeof(s_ip), "192.168.4.1");
         display_manager_set_wifi(true, s_ip);
+        if (s_promoted) {
+            /* Força sondagem imediata: AP original pode ter regressado durante SAFE_MODE. */
+            s_last_scan_us = 0;
+        }
     }
     /* STA: STA_START → connect() → se falhar, s_disconnect_since_us regista */
 
