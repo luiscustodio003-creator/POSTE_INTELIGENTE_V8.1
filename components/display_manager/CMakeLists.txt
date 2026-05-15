@@ -7,7 +7,10 @@ idf_component_register(
         display_driver
         state_machine
         radar_manager
-       
         config
         esp_lcd
+        log
+        esp_timer
+        freertos
+        system_monitor
 )

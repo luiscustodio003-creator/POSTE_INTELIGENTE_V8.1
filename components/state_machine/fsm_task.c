@@ -1,12 +1,5 @@
-/* ============================================================
-   MÁQUINA DE ESTADOS — TASK PRINCIPAL
-   @file      fsm_task.c
-   @version   5.1  |  2026-04-30
-   PROJECTO   : Poste Inteligente v8
-   AUTORES    : Luis Custódio | Tiago Moreno
-   
-   PLATAFORMA : ESP32 (ESP-IDF v5.x)
-============================================================ */
+/* fsm_task.c — v5.1 | 2026-04-30 | Poste Inteligente v8
+   Task principal da FSM — Core 1, Prio 6, Stack 6144B, ciclo 100ms. */
 
 #include "fsm_core.h"
 #include "fsm_events.h"
@@ -21,30 +14,18 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_log.h"
-#include <stdatomic.h>
 #include <string.h>
 
 static const char *TAG = "FSM_TASK";
 
 
-/* ============================================================
-   VARIÁVEL ATÓMICA PARTILHADA ENTRE TASKS
-============================================================ */
-static _Atomic bool s_radar_teve_frame = false;
-
-
-
-
-/* ============================================================
-   _atualiza_radar_display
-============================================================ */
+/* ── _atualiza_radar_display ──────────────────────────────── */
 static void _atualiza_radar_display(void)
 {
     tracked_vehicle_t veiculos[TRK_MAX_VEHICLES];
     uint8_t count = 0;
 
     if (!tracking_manager_get_vehicles(veiculos, &count) || count == 0) {
-        /* Sem veículos activos — limpa display */
         display_manager_set_radar(NULL, 0);
         return;
     }
@@ -56,12 +37,10 @@ static void _atualiza_radar_display(void)
     for (uint8_t i = 0; i < count && n_alvos < RADAR_MAX_OBJ; i++) {
         tracked_vehicle_t *v = &veiculos[i];
 
-        /* Keepalive: mantém obstáculo vivo enquanto radar o detecta */
         if (em_obstaculo && v->obstaculo_frames >= OBSTACULO_MIN_FRAMES) {
             fsm_obstaculo_keepalive();
         }
 
-        /* Só estados com detecção física confirmada */
         if (v->state != TRK_STATE_CONFIRMED &&
             v->state != TRK_STATE_APPROACHING) {
             continue;
@@ -69,7 +48,7 @@ static void _atualiza_radar_display(void)
 
         alvos[n_alvos].x_mm      = (int)v->x_mm;
         alvos[n_alvos].y_mm      = (int)v->y_mm;
-        /* Em modo obstáculo: velocidade=0 → posição fixa no display */
+        /* Velocidade=0 em modo obstáculo: posição fixa no display. */
         alvos[n_alvos].speed_kmh = em_obstaculo ? 0.0f : v->speed_kmh;
         n_alvos++;
     }
@@ -78,9 +57,7 @@ static void _atualiza_radar_display(void)
 }
 
 
-/* ============================================================
-   _processa_eventos_tracking
-============================================================ */
+/* ── _processa_eventos_tracking ───────────────────────────── */
 static void _processa_eventos_tracking(void)
 {
     tracked_vehicle_t veiculos[TRK_MAX_VEHICLES];
@@ -93,7 +70,6 @@ static void _processa_eventos_tracking(void)
     for (uint8_t i = 0; i < count; i++) {
         tracked_vehicle_t *v = &veiculos[i];
 
-        /* Nenhum evento pendente — passa para o próximo */
         if (!v->event_detected_pending   &&
             !v->event_approach_pending   &&
             !v->event_local_pending      &&
@@ -102,82 +78,61 @@ static void _processa_eventos_tracking(void)
             continue;
         }
 
-        /* 1. Primeiro avistamento — prepara ETA, sem alterar T */
-        if (v->event_detected_pending) {
+        if (v->event_detected_pending)
             sm_process_event(SM_EVT_VEHICLE_DETECTED,
                              v->id, v->speed_kmh, v->eta_ms, (int16_t)v->x_mm);
-        }
 
-        /* 2. Veículo a aproximar-se — só agenda ETA, SEM T++ SEM TC_INC
-              O veículo ainda não chegou à zona local do radar.          */
-        if (v->event_approach_pending) {
+        if (v->event_approach_pending)
             sm_process_event(SM_EVT_VEHICLE_APPROACHING,
                              v->id, v->speed_kmh, v->eta_ms, (int16_t)v->x_mm);
-        }
 
-        /* 3. Veículo confirmado NA ZONA LOCAL — T++, TC_INC, PASSED
-              distance_m ≤ RADAR_DETECT_M confirmado pelo tracking.      */
-        if (v->event_local_pending) {
+        if (v->event_local_pending)
             sm_process_event(SM_EVT_VEHICLE_LOCAL,
                              v->id, v->speed_kmh, v->eta_ms, (int16_t)v->x_mm);
-        }
 
-        /* 4. Veículo saiu do radar — T-- ou aguarda confirmação de B */
-        if (v->event_passed_pending) {
+        if (v->event_passed_pending)
             sm_process_event(SM_EVT_VEHICLE_PASSED,
                              v->id, v->speed_kmh, 0, (int16_t)v->x_mm);
-        }
 
-        /* 5. Veículo parado — entra em STATE_OBSTACULO */
-        if (v->event_obstaculo_pending) {
+        if (v->event_obstaculo_pending)
             sm_process_event(SM_EVT_VEHICLE_OBSTACULO,
                              v->id, v->speed_kmh, 0, (int16_t)v->x_mm);
-        }
 
-        /* Limpa flags APÓS consumir todos os eventos deste veículo */
         tracking_manager_clear_events(v->id);
     }
 }
 
 
-/* ============================================================
-   fsm_aplicar_luz
-   ──────────────────────────────────────────────────────────
-   PRIVADA — não exposta no .h. Uso exclusivo da fsm_task.
-============================================================ */
+/* ── fsm_aplicar_luz — ponto único de controlo DALI ─────────
+   Só actua em transições de estado. */
 static system_state_t s_ultimo_estado = STATE_IDLE;
 
 static void fsm_aplicar_luz(void)
 {
     system_state_t estado_actual = g_fsm_state;
 
-    /* Só actua em mudanças de estado */
     if (estado_actual == s_ultimo_estado) return;
 
     switch (estado_actual) {
-
         case STATE_LIGHT_ON:
-            /* Veículo em movimento — fade suave proporcional à velocidade */
-            dali_fade_up(g_fsm_last_speed);
+            if (g_fsm_acender_instantaneo) {
+                g_fsm_acender_instantaneo = false;
+                dali_set_brightness(LIGHT_MAX);
+            } else {
+                dali_fade_up(g_fsm_last_speed);
+            }
             break;
-
         case STATE_OBSTACULO:
-            /* Obstáculo parado — luz máxima instantânea, sem fade */
             dali_set_brightness(LIGHT_MAX);
             break;
-
         case STATE_SAFE_MODE:
-            /* Radar em falha — luz fixa a LIGHT_SAFE_MODE (50%) */
             dali_safe_mode();
             break;
-
         case STATE_IDLE:
         case STATE_MASTER:
         case STATE_AUTONOMO:
-            /* Sem tráfego — fade down suave para LIGHT_MIN */
             dali_fade_down();
             break;
-
         default:
             break;
     }
@@ -186,105 +141,66 @@ static void fsm_aplicar_luz(void)
 
     const char *descricao = "";
     switch (estado_actual) {
-        case STATE_LIGHT_ON:  descricao = "→ LUZ ON (objecto detectado)";  break;
+        case STATE_LIGHT_ON:  descricao = "→ LUZ ON (fade/instant por ETA)";  break;
         case STATE_OBSTACULO: descricao = "→ LUZ MÁXIMA (obstáculo parado)"; break;
-        case STATE_SAFE_MODE: descricao = "→ LUZ 50% (radar em falha)";    break;
-        case STATE_AUTONOMO:  descricao = "→ LUZ OFF (modo autónomo)";     break;
-        case STATE_MASTER:    descricao = "→ LUZ OFF (master, aguarda)";   break;
-        case STATE_IDLE:      descricao = "→ LUZ OFF (repouso)";           break;
+        case STATE_SAFE_MODE: descricao = "→ LUZ 50% (radar em falha)";      break;
+        case STATE_AUTONOMO:  descricao = "→ LUZ OFF (modo autónomo)";       break;
+        case STATE_MASTER:    descricao = "→ LUZ OFF (master, aguarda)";     break;
+        case STATE_IDLE:      descricao = "→ LUZ OFF (repouso)";             break;
         default: break;
     }
     ESP_LOGI(TAG, "[DALI] %s", descricao);
 }
 
 
-/* ============================================================
-   fsm_task — Core 1, Prioridade 6, Stack 6144B
-   ──────────────────────────────────────────────
-   Loop principal a 100ms.
-
-   CICLO:
-     1. Lê atomic_bool do radar (escrito pela radar_task)
-     2. Chama state_machine_update() — timeouts e transições de estado
-     3. Processa eventos do tracking_manager → FSM
-     3.5 Aplica brilho DALI com base no novo estado
-     4. Actualiza display com alvos confirmados
-     5. Envia heartbeat ao system_monitor
-     6. Aguarda 100ms
-============================================================ */
+/* ── fsm_task — Core 1, Prio 6 ───────────────────────────── */
 static void fsm_task(void *arg)
 {
     ESP_LOGI(TAG, "fsm_task | Core %d | Prio 6 | a aguardar radar (6s)...",
              xPortGetCoreID());
 
-    /* ── Arranque: aguarda estabilização do HLK-LD2450 ──────────
-       O sensor demora até 5s a inicializar a comunicação UART.
-       Dividido em 30 blocos de 200ms com heartbeat contínuo para
-       evitar falsos alarmes "FSM sem heartbeat" no system_monitor. */
+    /* Aguarda estabilização do HLK-LD2450 (~5s).
+       Dividido em blocos de 200ms para manter heartbeat contínuo. */
     for (int i = 0; i < 30; i++) {
         system_monitor_heartbeat(MOD_FSM);
         vTaskDelay(pdMS_TO_TICKS(200));
     }
 
-    /* Limpa backlog UART acumulado durante o arranque */
     radar_flush_rx();
     g_fsm_radar_fail_cnt = 0;
     g_fsm_radar_ok_cnt   = 0;
-    g_fsm_radar_ok       = true;   /* presume OK até prova em contrário */
+    g_fsm_radar_ok       = true;
     if (g_fsm_state == STATE_SAFE_MODE)
         g_fsm_state = STATE_IDLE;
-    
+
     ESP_LOGI(TAG, "[SISTEMA] FSM activa — modo hardware real");
 
     while (1) {
+        bool radar_frame = tracking_manager_get_radar_status();
 
-        /* ── 1. Lê estado de saúde do radar ───────────────────── */
-        /* atomic_exchange repõe a false — detecção de ausência
-           de frames no próximo ciclo (→ SAFE_MODE após RADAR_FAIL_COUNT) */
-        bool radar_frame = atomic_exchange(&s_radar_teve_frame, false);
-
-        /* ── 2. Ciclo de manutenção da FSM ────────────────────── */
-        /* Gere timeouts, transições de estado, MASTER_CLAIM, etc. */
         bool comm_ok   = comm_status_ok();
         bool is_master = comm_is_master();
         state_machine_update(comm_ok, is_master, radar_frame);
 
-        /* ── 3. Eventos do tracking → FSM ─────────────────────── */
         _processa_eventos_tracking();
 
-        /* ── 3.5 Aplica brilho com base no novo estado ────────── */
-        /* Ponto único de controlo DALI — só actua em transições. */
         fsm_aplicar_luz();
 
-        /* ── 4. Actualiza display com dados reais do radar ───────*/
         _atualiza_radar_display();
+        display_manager_set_speed((int)state_machine_get_last_speed());
 
-        /* ── 5. Heartbeat ao system_monitor ───────────────────── */
         system_monitor_heartbeat(MOD_FSM);
 
-        /* ── 6. Aguarda próximo ciclo de 100ms ────────────────── */
         vTaskDelay(pdMS_TO_TICKS(100));
     }
 }
 
 
-/* ============================================================
-   state_machine_task_start
-   ─────────────────────────
-   @brief Inicializa o tracking_manager e cria a fsm_task.
-
-   Ordem obrigatória:
-     1. tracking_manager_init() — antes da radar_task arrancar
-     2. xTaskCreatePinnedToCore() — Core 1, Prio 6
-
-   NOTA: tracking_manager_init() é chamado AQUI e não no
-   system_monitor para garantir que o tracking está pronto
-   antes do primeiro frame da radar_task. A radar_task é
-   criada depois em system_monitor_start().
-============================================================ */
+/* ── state_machine_task_start ────────────────────────────────
+   Inicializa tracking_manager antes de arrancar a fsm_task.
+   Ordem crítica: tracking pronto antes do primeiro frame do radar. */
 void state_machine_task_start(void)
 {
-    /* Inicializa o tracking antes de qualquer frame do radar */
     tracking_manager_init();
     ESP_LOGI(TAG, "tracking_manager inicializado");
 
@@ -295,7 +211,7 @@ void state_machine_task_start(void)
         NULL,
         6,
         NULL,
-        1   /* Core 1 — APP_CPU */
+        1
     );
 
     ESP_LOGI(TAG, "fsm_task v5.1 | Core 1 | Prio 6 | Stack 6144B");

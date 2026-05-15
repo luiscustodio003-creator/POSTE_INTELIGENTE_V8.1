@@ -1,28 +1,21 @@
 /* ============================================================
    UDP MANAGER — DECLARAÇÃO CORRIGIDA
    @file      udp_manager.h
-   @version   5.3  |  2026-05-12
+   @version   5.4  |  2026-05-14
    PROJECTO   : Poste Inteligente v8
    AUTORES    : Luis Custódio | Tiago Moreno
    PLATAFORMA : ESP32 (ESP-IDF v5.x)
 
-   ALTERAÇÕES v5.2 → v5.3 (CORRECÇÃO UDP OBSTÁCULO):
-   ───────────────────────────────────────────────────────────
-   🔴 BUG UDP CORRIGIDO — Falta comunicação de obstáculo
+   ALTERAÇÕES v5.3 → v5.4:
+   ─────────────────────────
+   - REMOVIDAS: udp_manager_get_all_neighbors(), udp_manager_reset_neighbor()
+   - REMOVIDA declaração de udp_task_run (função agora static)
 
-   PROBLEMA:
-   Quando Poste A detecta obstáculo, Poste B não é notificado.
-   B assume TC_TIMEOUT e apaga luz prematuramente mesmo que
-   veículo ainda esteja parado em A.
-
-   SOLUÇÃO:
-   - ADICIONADO: udp_manager_send_obstaculo(ip, vehicle_id, speed, x_mm)
-     Envia notificação específica quando veículo para.
-   
-   - ADICIONADO: on_obstaculo_received(vehicle_id, speed, x_mm)
-     Callback weak que cancela TC_TIMEOUT e mantém Tc.
-   
-   FORMATO UDP: "OBSTACULO:<from_id>:<vehicle_id>:<speed>:<x_mm>"
+   ALTERAÇÕES v5.2 → v5.3:
+   ─────────────────────────
+   - ADICIONADO: udp_manager_send_obstaculo()
+   - ADICIONADO: on_obstaculo_received() callback weak
+   - FORMATO UDP: "OBSTACULO:<from_id>:<vehicle_id>:<speed>:<x_mm>"
 ============================================================ */
 #ifndef UDP_MANAGER_H
 #define UDP_MANAGER_H
@@ -121,8 +114,6 @@ bool udp_manager_send_obstaculo(const char *ip, uint16_t vehicle_id,
 ============================================================ */
 void        udp_manager_get_neighbors(char *nebL, char *nebR);
 neighbor_t *udp_manager_get_neighbor_by_pos(int position);
-size_t      udp_manager_get_all_neighbors(neighbor_t *list, size_t max);
-void        udp_manager_reset_neighbor(int position);
 void        udp_manager_get_stats(udp_stats_t *out);
 
 
@@ -157,9 +148,8 @@ void on_obstaculo_received(uint16_t vehicle_id, float speed, int16_t x_mm);
 
 
 /* ============================================================
-   TASK E SOCKET
+   SOCKET
 ============================================================ */
-void udp_task_run(void *arg);
 int  udp_manager_get_socket(void);
 
 

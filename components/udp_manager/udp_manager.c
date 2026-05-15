@@ -1,24 +1,25 @@
 /* ============================================================
    UDP MANAGER — IMPLEMENTAÇÃO CORRIGIDA
    @file      udp_manager.c
-   @version   5.3  |  2026-05-12
+   @version   5.4  |  2026-05-14
    PROJECTO   : Poste Inteligente v8
    AUTORES    : Luis Custódio | Tiago Moreno
    PLATAFORMA : ESP32 (ESP-IDF v5.x)
 
+   ALTERAÇÕES v5.3 → v5.4:
+   ─────────────────────────
+   - REMOVIDO: s_iniciado — variável nunca lida (comm_manager tem a sua).
+   - REMOVIDO: udp_manager_get_all_neighbors() — nunca chamada.
+   - REMOVIDO: udp_manager_reset_neighbor() — nunca chamada.
+   - REMOVIDO: branch "FAIL" em _str_para_status() — nunca enviado.
+   - ALTERADO: udp_task_run() → static (só usada internamente).
+
    ALTERAÇÕES v5.2 → v5.3 (CORRECÇÃO UDP OBSTÁCULO):
    ───────────────────────────────────────────────────────────
-   🔴 BUG UDP CORRIGIDO — Falta comunicação de obstáculo
-
-   ADICIONADO:
    - Parser "OBSTACULO:<from_id>:<vehicle_id>:<speed>:<x_mm>"
    - udp_manager_send_obstaculo() para envio
    - on_obstaculo_received() callback weak
    - Estatísticas obstaculo_enviados/recebidos
-
-   FLUXO:
-   A detecta obstáculo → envia OBSTACULO → B
-   B recebe → cancela TC_TIMEOUT → mantém luz acesa
 ============================================================ */
 #include "udp_manager.h"
 #include "state_machine.h"
@@ -38,8 +39,7 @@
 static const char *TAG = "UDP_MGR";
 
 /* ── Estado interno ────────────────────────────────────────── */
-static int         s_socket      = -1;
-static bool        s_iniciado    = false;
+static int         s_socket   = -1;
 static neighbor_t  s_vizinhos[MAX_NEIGHBORS];
 static uint32_t    s_ultimo_disc = 0;
 static udp_stats_t s_stats       = {0};
@@ -71,7 +71,6 @@ static neighbor_status_t _str_para_status(const char *s)
     if (!s)                    return NEIGHBOR_OFFLINE;
     if (!strcmp(s, "OK"))      return NEIGHBOR_OK;
     if (!strcmp(s, "SAFE"))    return NEIGHBOR_SAFE;
-    if (!strcmp(s, "FAIL"))    return NEIGHBOR_SAFE;
     if (!strcmp(s, "AUTO"))    return NEIGHBOR_AUTO;
     if (!strcmp(s, "OBST"))    return NEIGHBOR_OBSTACULO;
     return NEIGHBOR_OFFLINE;
@@ -338,7 +337,7 @@ static void _verificar_timeouts(uint32_t agora)
 /* ============================================================
    udp_task_run — Core 0, Prio 5
 ============================================================ */
-void udp_task_run(void *arg)
+static void udp_task_run(void *arg)
 {
     (void)arg;
     char               rx_buf[160];
@@ -411,7 +410,6 @@ bool udp_manager_init(void)
 
     memset(s_vizinhos, 0, sizeof(s_vizinhos));
     memset(&s_stats,   0, sizeof(s_stats));
-    s_iniciado = true;
 
     ESP_LOGI(TAG, "UDP socket OK | Porto %d", UDP_PORT);
     return true;
@@ -556,25 +554,6 @@ neighbor_t *udp_manager_get_neighbor_by_pos(int position)
         if (s_vizinhos[i].active && s_vizinhos[i].position == position)
             return &s_vizinhos[i];
     return NULL;
-}
-
-size_t udp_manager_get_all_neighbors(neighbor_t *list, size_t max)
-{
-    size_t n = 0;
-    for (int i = 0; i < MAX_NEIGHBORS && n < max; i++)
-        if (s_vizinhos[i].active) list[n++] = s_vizinhos[i];
-    return n;
-}
-
-void udp_manager_reset_neighbor(int position)
-{
-    neighbor_t *v = udp_manager_get_neighbor_by_pos(position);
-    if (v) {
-        v->last_seen   = 0;
-        v->discover_ok = false;
-        v->status      = NEIGHBOR_OFFLINE;
-        ESP_LOGI(TAG, "Vizinho pos=%d marcado para redescoberta", position);
-    }
 }
 
 void udp_manager_get_stats(udp_stats_t *out)

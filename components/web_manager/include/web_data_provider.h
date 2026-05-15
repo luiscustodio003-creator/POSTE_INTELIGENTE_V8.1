@@ -255,10 +255,68 @@ uint8_t web_data_get_neighbors(neighbor_info_t* neighbors, uint8_t max_neighbors
 
 /**
  * @brief Reset de estatísticas acumuladas (útil para testes)
- * 
+ *
  * Zera contadores de tempo e energia, mantendo estado actual.
  */
 void web_data_reset_stats(void);
+
+
+// ============================================================================
+// ESTATÍSTICAS NOCTURNAS (20h - 7h)
+// ============================================================================
+
+/** Número de horas no período nocturno (20h, 21h, 22h, 23h, 0h, 1h, 2h, 3h, 4h, 5h, 6h) */
+#define NIGHT_BUCKETS  11
+
+/**
+ * @brief Dados acumulados numa hora do período nocturno
+ */
+typedef struct {
+    uint8_t  hour;        ///< Hora real 0-23
+    char     label[5];    ///< "20h", "0h", etc.
+    uint32_t vehicles;    ///< Veículos detectados nesta hora
+    float    energy_wh;   ///< Energia consumida (Wh), incluindo fade
+} night_bucket_t;
+
+/**
+ * @brief Obtém JSON com estatísticas nocturnas horárias
+ *
+ * Período: 20:00 → 07:00. Reinicia automaticamente ao início de cada noite.
+ * A energia inclui períodos de fade-up e fade-down (amostrado a 10s).
+ *
+ * FORMATO:
+ * {
+ *   "synced": true,
+ *   "hour": 22,
+ *   "buckets": [{"h":20,"l":"20h","v":12,"e":18.5}, ...],
+ *   "veh": 45,
+ *   "wh": 120.3
+ * }
+ *
+ * @return cJSON* (chamar cJSON_Delete após uso). NULL se erro.
+ */
+cJSON *web_data_get_night_stats(void);
+
+/**
+ * @brief Obtém JSON com estado actual do poste (tempo real)
+ *
+ * FORMATO:
+ * {
+ *   "name": "POSTE 03",
+ *   "state": "IDLE",
+ *   "duty": 5,
+ *   "T": 0, "Tc": 0,
+ *   "radar": "REAL",
+ *   "ip": "192.168.4.3",
+ *   "role": "SLAVE",
+ *   "neb_l_ip": "192.168.4.2", "neb_l_ok": true,
+ *   "neb_r_ip": "---",         "neb_r_ok": false,
+ *   "uptime_s": 3600
+ * }
+ *
+ * @return cJSON* (chamar cJSON_Delete após uso). NULL se erro.
+ */
+cJSON *web_data_get_status(void);
 
 #ifdef __cplusplus
 }

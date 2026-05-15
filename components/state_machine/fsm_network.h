@@ -22,7 +22,6 @@
    ALTERAÇÕES v1.0 → v3.0:
    ─────────────────────────
    - ADICIONADO: fsm_network_master_claim_relay() — relay de MASTER_CLAIM
-   - ADICIONADO: fsm_network_get_master_id()      — getter do MASTER actual
 ============================================================ */
 
 #ifndef FSM_NETWORK_H
@@ -54,9 +53,5 @@ void fsm_network_estados_degradados(bool comm_ok, bool is_master);
  */
 void fsm_network_master_claim_relay(int from_id, int master_id);
 
-/**
- * @brief Retorna o ID do MASTER actual conhecido.
- */
-int fsm_network_get_master_id(void);
 
 #endif /* FSM_NETWORK_H */

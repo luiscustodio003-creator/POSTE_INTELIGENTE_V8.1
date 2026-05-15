@@ -15,5 +15,6 @@ idf_component_register(
         freertos
         esp_timer
         esp_system
+        lwip
         log
 )

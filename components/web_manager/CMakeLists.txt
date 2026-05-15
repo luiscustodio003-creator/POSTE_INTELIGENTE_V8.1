@@ -14,15 +14,19 @@ idf_component_register(
     INCLUDE_DIRS 
         "include"
     
-    REQUIRES 
+    REQUIRES
         esp_http_server
         json
         nvs_flash
         esp_wifi
         esp_timer
-        state_machine      
-        comm_manager      
-        config             
+        state_machine
+        comm_manager
+        dali_manager
+        wifi_manager
+        udp_manager
+        radar_manager
+        config
 )
  
 # Optimizações de compilação

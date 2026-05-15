@@ -1,7 +1,7 @@
 /* ============================================================
    SUPERVISOR DO SISTEMA
    @file      system_monitor.c
-   @version   5.1  |  2026-04-29
+   @version   5.2  |  2026-05-14
    PROJECTO   : Poste Inteligente v8
    AUTORES    : Luis Custódio | Tiago Moreno
    PLATAFORMA : ESP32 (ESP-IDF v5.x)
@@ -11,6 +11,11 @@
    - wifi_manager_set_ip_callback() removido (não existe)
      UDP iniciado por polling em _monitor_task (padrão original)
    - Bloco #else USE_RADAR removido (só radar real)
+
+   CORRECÇÕES v5.1 → v5.2:
+   - CORRIGIDO: s_timeout_ms[] usa defines do header (DISPLAY era 500ms, devia ser 2000ms).
+   - REMOVIDO: dali_set_brightness(LIGHT_MIN) redundante após dali_init().
+   - (header v2.1: tabela cores, is_alive removida, define WDT comentado removido)
 ============================================================ */
 #include "system_monitor.h"
 #include "state_machine.h"
@@ -27,23 +32,102 @@
 #include "esp_task_wdt.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "esp_netif_sntp.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include <string.h>
+#include <time.h>
 
 static const char *TAG = "SYS_MON";
 
 static uint64_t s_hb_ms[MOD_COUNT] = {0};
 static bool     s_comm_ok          = false;
 
+/* timestamps do supervisor de estados (0 = inactivo) */
+static uint64_t s_sup_autonomo_ms = 0;
+static uint64_t s_sup_safe_ms     = 0;
+static uint64_t s_sup_wifi_ms     = 0;
+
 static const char    *s_nome[MOD_COUNT] = { "FSM","RADAR","DISPLAY","UDP" };
-static const uint64_t s_timeout_ms[MOD_COUNT] = { 1000, 1000, 500, 1000 };
+static const uint64_t s_timeout_ms[MOD_COUNT] = {
+    MOD_FSM_TIMEOUT_MS,
+    MOD_RADAR_TIMEOUT_MS,
+    MOD_DISPLAY_TIMEOUT_MS,
+    MOD_UDP_TIMEOUT_MS,
+};
 
 void system_monitor_heartbeat(monitor_module_t mod)
 {
     if (mod < MOD_COUNT)
         s_hb_ms[mod] = (uint64_t)(esp_timer_get_time() / 1000ULL);
 }
+
+/* ── _supervisao ─────────────────────────────────────────────
+   Supervisor passivo: emite alertas e tenta re-init comm quando seguro.
+   NUNCA altera estado da FSM. Nunca actua com tráfego em curso. */
+static void _supervisao(uint64_t agora)
+{
+    system_state_t estado = state_machine_get_state();
+
+    /* Guarda de tráfego — não actuar com veículos em curso */
+    bool em_trafego = (estado == STATE_LIGHT_ON  ||
+                       estado == STATE_OBSTACULO  ||
+                       state_machine_get_T()  > 0 ||
+                       state_machine_get_Tc() > 0);
+    if (em_trafego) {
+        s_sup_autonomo_ms = 0;
+        s_sup_safe_ms     = 0;
+        s_sup_wifi_ms     = 0;
+        return;
+    }
+
+    bool wifi_on      = wifi_manager_is_connected();
+    bool wifi_enabled = wifi_manager_is_enabled();
+
+    /* 1. AUTONOMO com WiFi ligado há muito tempo
+       Pode indicar falha de socket UDP sem que o FSM saiba.
+       Acção: tenta re-init comm (idempotente se já OK). */
+    if (estado == STATE_AUTONOMO && wifi_on && wifi_enabled) {
+        if (s_sup_autonomo_ms == 0) s_sup_autonomo_ms = agora;
+        if ((agora - s_sup_autonomo_ms) > SUP_AUTONOMO_MS) {
+            ESP_LOGW(TAG, "[SUP] AUTONOMO há %llus com WiFi OK — re-init comm",
+                     (unsigned long long)((agora - s_sup_autonomo_ms) / 1000ULL));
+            if (!s_comm_ok)
+                s_comm_ok = comm_init();
+            s_sup_autonomo_ms = agora;  /* reset: novo ciclo de 30s */
+        }
+    } else {
+        s_sup_autonomo_ms = 0;
+    }
+
+    /* 2. SAFE_MODE prolongado — alerta de radar em falha longa
+       Sem acção: radar é hardware, só técnico pode resolver. */
+    if (estado == STATE_SAFE_MODE) {
+        if (s_sup_safe_ms == 0) s_sup_safe_ms = agora;
+        if ((agora - s_sup_safe_ms) > SUP_SAFE_MS) {
+            ESP_LOGE(TAG, "[SUP] SAFE_MODE há %llus — radar em falha prolongada",
+                     (unsigned long long)((agora - s_sup_safe_ms) / 1000ULL));
+            s_sup_safe_ms = agora;  /* reset: repete a cada 60s */
+        }
+    } else {
+        s_sup_safe_ms = 0;
+    }
+
+    /* 3. WiFi desligado sem ser SAFE_MODE — alerta periódico
+       A reconexão automática (WIFI_RECONNECT_MS) já está activa no wifi_manager.
+       Apenas registamos para diagnóstico. */
+    if (!wifi_on && wifi_enabled) {
+        if (s_sup_wifi_ms == 0) s_sup_wifi_ms = agora;
+        if ((agora - s_sup_wifi_ms) > SUP_WIFI_MS) {
+            ESP_LOGW(TAG, "[SUP] WiFi offline há %llus — reconexão automática activa",
+                     (unsigned long long)((agora - s_sup_wifi_ms) / 1000ULL));
+            s_sup_wifi_ms = agora;
+        }
+    } else {
+        s_sup_wifi_ms = 0;
+    }
+}
+
 
 static void _monitor_task(void *arg)
 {
@@ -59,10 +143,15 @@ static void _monitor_task(void *arg)
         agora = (uint64_t)(esp_timer_get_time() / 1000ULL);
         for (int i = 0; i < MOD_COUNT; i++) {
             uint64_t delta = agora - s_hb_ms[i];
-            if (delta > (uint64_t)s_timeout_ms[i])
-                ESP_LOGW(TAG, "%s sem heartbeat %llums",
+            if (delta > (uint64_t)s_timeout_ms[i] * MOD_HEARTBEAT_CRITICAL_MULT)
+                ESP_LOGE(TAG, "[WDT] %s CRÍTICO sem heartbeat %llums",
+                         s_nome[i], (unsigned long long)delta);
+            else if (delta > (uint64_t)s_timeout_ms[i])
+                ESP_LOGW(TAG, "[WDT] %s sem heartbeat %llums",
                          s_nome[i], (unsigned long long)delta);
         }
+
+        _supervisao(agora);
 
         if (wifi_manager_is_connected()) {
             if (!s_comm_ok) {
@@ -118,7 +207,6 @@ void system_monitor_start(void)
 
     /* ── [2] Hardware ── */
     dali_init();
-    dali_set_brightness(LIGHT_MIN);
     radar_init(RADAR_MODE_UART);
     int baud = radar_auto_detect_baud();
     printf("┌───────────────────────────────────────┐\n");
@@ -160,6 +248,13 @@ void system_monitor_start(void)
     }
     
     if (wifi_manager_is_connected()) {
+        /* SNTP — sincroniza relógio real (necessário para estatísticas nocturnas) */
+        setenv("TZ", POSTE_TIMEZONE, 1);
+        tzset();
+        esp_sntp_config_t sntp_cfg = ESP_NETIF_SNTP_DEFAULT_CONFIG("pool.ntp.org");
+        esp_netif_sntp_init(&sntp_cfg);
+        ESP_LOGI(TAG, "SNTP iniciado | TZ=%s", POSTE_TIMEZONE);
+
         /* Inicializar agregador de dados */
         web_data_provider_init();
         

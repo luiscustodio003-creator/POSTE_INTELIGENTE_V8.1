@@ -1,29 +1,5 @@
-/* ============================================================
-   MÓDULO     : fsm_core
-   FICHEIRO   : fsm_core.c — Núcleo da FSM (Versão Produção)
-   VERSÃO     : 2.8  |  2026-05-04
-   PROJECTO   : Poste Inteligente v8
-   AUTORES    : Luis Custódio | Tiago Moreno
-   PLATAFORMA : ESP32 (ESP-IDF v5.x)
-
-   RESPONSABILIDADE:
-   ─────────────────
-   - Declaração e inicialização de todas as variáveis de estado.
-   - Monitorização da saúde do radar real com debounce.
-   - Ponto de entrada state_machine_update() (Sem Simulação).
-
-   ALTERAÇÕES v2.7 → v2.8:
-   ─────────────────────────
-   - ADICIONADO: g_fsm_tc_last_vehicle_id (inicializado a 0)
-     Regista o ID do último veículo que gerou TC_INC, para que
-     EVT_LOCAL do mesmo veículo não produza TC_INC duplicado.
-     Ver comentário detalhado em fsm_core.h e fsm_events.c.
-
-   ALTERAÇÕES v2.6 → v2.7:
-   ─────────────────────────
-   - ADICIONADO: g_fsm_enviados_dir
-     Conta TC_INC enviados ao vizinho direito que aguardam PASSED.
-============================================================ */
+/* fsm_core.c — v2.8 | 2026-05-04 | Poste Inteligente v8
+   Variáveis de estado, saúde do radar, state_machine_update(). */
 
 #include "fsm_core.h"
 #include "fsm_timer.h"
@@ -38,9 +14,7 @@
 
 static const char *TAG = "FSM_CORE";
 
-/* ============================================================
-   VARIÁVEIS DE ESTADO
-============================================================ */
+/* ── Variáveis de estado ──────────────────────────────────── */
 system_state_t g_fsm_state          = STATE_IDLE;
 int            g_fsm_T              = 0;
 int            g_fsm_Tc             = 0;
@@ -51,7 +25,6 @@ bool           g_fsm_radar_ok       = true;
 int            g_fsm_radar_fail_cnt = 0;
 int            g_fsm_radar_ok_cnt   = 0;
 bool           g_fsm_right_online   = true;
-bool           g_fsm_era_autonomo   = false;
 
 uint64_t g_fsm_last_detect_ms    = 0;
 uint64_t g_fsm_left_offline_ms   = 0;
@@ -62,17 +35,13 @@ uint64_t g_fsm_master_claim_ms   = 0;
 uint64_t g_fsm_sem_vizinho_ms    = 0;
 uint64_t g_fsm_obstaculo_last_ms = 0;
 
-/* ── NOVO v2.8 ────────────────────────────────────────────────
-   ID do último objecto físico que gerou um TC_INC.
-   0 = nenhum veículo anunciado ainda (valor de reset seguro,
-   pois o tracking_manager começa os IDs em 1).
-──────────────────────────────────────────────────────────── */
+/* ID do último veículo que gerou TC_INC — evita duplicados por re-entrada. */
 uint16_t g_fsm_tc_last_vehicle_id = 0;
 
+bool g_fsm_acender_instantaneo = false;
 
-/* ============================================================
-   UTILITÁRIOS INTERNOS
-============================================================ */
+
+/* ── Utilitários internos ─────────────────────────────────── */
 
 uint64_t fsm_agora_ms(void)
 {
@@ -94,13 +63,8 @@ void fsm_obstaculo_keepalive(void)
 }
 
 
-/* ============================================================
-   fsm_verificar_radar
-   ──────────────────────────────────────────────────────────
-   Usa radar_is_connected() como fonte de verdade.
-   Debounce bidirecional: exige N frames consecutivos para
-   mudar de estado (evita flapping em falhas transitórias).
-============================================================ */
+/* ── fsm_verificar_radar ──────────────────────────────────────
+   Debounce bidirecional: exige N frames consecutivos para mudar estado. */
 void fsm_verificar_radar(bool teve_frame, bool comm_ok)
 {
     (void)comm_ok;
@@ -123,11 +87,15 @@ void fsm_verificar_radar(bool teve_frame, bool comm_ok)
         g_fsm_radar_fail_cnt = 0;
 
         if (!g_fsm_radar_ok) {
-            g_fsm_radar_ok     = true;
-            g_fsm_radar_ok_cnt = 0;
-            ESP_LOGI(TAG, "[RADAR] UART activa — saída de SAFE MODE.");
-            if (g_fsm_state == STATE_SAFE_MODE)
-                g_fsm_state = STATE_IDLE;
+            g_fsm_radar_ok_cnt++;
+            if (g_fsm_radar_ok_cnt >= RADAR_OK_COUNT) {
+                g_fsm_radar_ok     = true;
+                g_fsm_radar_ok_cnt = 0;
+                ESP_LOGI(TAG, "[RADAR] UART activa (%d frames OK) — saída de SAFE MODE.",
+                         RADAR_OK_COUNT);
+                if (g_fsm_state == STATE_SAFE_MODE)
+                    g_fsm_state = STATE_IDLE;
+            }
         }
     }
 
@@ -135,24 +103,22 @@ void fsm_verificar_radar(bool teve_frame, bool comm_ok)
 }
 
 
-/* ============================================================
-   state_machine_init
-============================================================ */
+/* ── state_machine_init ───────────────────────────────────── */
 void state_machine_init(void)
 {
     g_fsm_state                = STATE_IDLE;
     g_fsm_T                    = 0;
     g_fsm_Tc                   = 0;
     g_fsm_enviados_dir         = 0;
-    g_fsm_tc_last_vehicle_id   = 0;   /* NOVO v2.8 — reset do ID de controlo */
+    g_fsm_tc_last_vehicle_id   = 0;
     g_fsm_last_speed           = 0.0f;
     g_fsm_apagar_pend          = false;
     g_fsm_radar_ok             = true;
     g_fsm_radar_fail_cnt       = 0;
     g_fsm_radar_ok_cnt         = 0;
     g_fsm_right_online         = true;
-    g_fsm_era_autonomo         = false;
     g_fsm_acender_em_ms        = 0;
+    g_fsm_acender_instantaneo  = false;
     g_fsm_master_claim_ms      = 0;
     g_fsm_sem_vizinho_ms       = 0;
     g_fsm_obstaculo_last_ms    = 0;
@@ -165,9 +131,7 @@ void state_machine_init(void)
 }
 
 
-/* ============================================================
-   state_machine_update — Ciclo a 100ms
-============================================================ */
+/* ── state_machine_update — ciclo a 100ms ─────────────────── */
 void state_machine_update(bool comm_ok, bool is_master, bool radar_teve_frame)
 {
     fsm_verificar_radar(radar_teve_frame, comm_ok);
@@ -178,9 +142,7 @@ void state_machine_update(bool comm_ok, bool is_master, bool radar_teve_frame)
 }
 
 
-/* ============================================================
-   GETTERS PÚBLICOS
-============================================================ */
+/* ── Getters públicos ─────────────────────────────────────── */
 system_state_t state_machine_get_state(void) { return g_fsm_state; }
 int   state_machine_get_T(void)         { return g_fsm_T; }
 int   state_machine_get_Tc(void)        { return g_fsm_Tc; }
@@ -206,20 +168,13 @@ uint8_t fsm_core_get_duty_cycle(void) {
         case STATE_IDLE:
         case STATE_MASTER:
         case STATE_AUTONOMO:
-            return LIGHT_MIN;  // 2%
-        
+            return LIGHT_MIN;
         case STATE_LIGHT_ON:
         case STATE_OBSTACULO:
-            return LIGHT_MAX;  // 100%
-        
+            return LIGHT_MAX;
         case STATE_SAFE_MODE:
-            return LIGHT_SAFE_MODE;  // 50%
-        
+            return LIGHT_SAFE_MODE;
         default:
             return LIGHT_MIN;
     }
-}
-
-uint16_t fsm_core_get_last_vehicle_id(void) {
-    return g_fsm_tc_last_vehicle_id;
 }

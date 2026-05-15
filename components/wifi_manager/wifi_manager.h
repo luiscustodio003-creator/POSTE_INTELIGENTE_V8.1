@@ -6,12 +6,16 @@
    AUTORES    : Luis Custódio | Tiago Moreno
    PLATAFORMA : ESP32 (ESP-IDF v5.x)
 
+   ALTERAÇÕES v2.0 → v2.1:
+   ─────────────────────────
+   • REMOVIDAS: wifi_manager_assume_ap(), wifi_manager_reset_retry(),
+     wifi_manager_is_ap_mode() — nunca chamadas.
+   • CORRIGIDO: duplo esp_wifi_connect() em wifi_manager_enable().
+
    ALTERAÇÕES v1.5 → v2.0:
    ─────────────────────────
    • REMOVIDA lógica de mudança STA↔AP em runtime
    • ADICIONADA wifi_manager_init_ap() para pos=0
-   • ADICIONADA wifi_manager_is_ap_mode() getter
-   • wifi_manager_assume_ap() OBSOLETA (mantida por compatibilidade)
    
    MODELO v2.0:
    • POST_POSITION == 0 → AP permanente (192.168.4.1)
@@ -103,54 +107,6 @@ bool wifi_manager_is_connected(void);
  * @return Ponteiro para string interna (não libertar!)
  */
 const char *wifi_manager_get_ip(void);
-
-/**
- * @brief Verifica se está em modo AP.
- * 
- * Usado por comm_manager para saber se deve enviar broadcast
- * ou unicast (embora v2.0 sempre use broadcast para MASTER_CLAIM).
- * 
- * @return TRUE se modo AP, FALSE se modo STA
- */
-bool wifi_manager_is_ap_mode(void);
-
-
-/* ============================================================
-   CONTROLO DE RECONEXÃO
-============================================================ */
-
-/**
- * @brief Reinicia contador de tentativas de reconexão.
- * 
- * Usado para forçar nova série de tentativas imediatas
- * após pausa de WIFI_RECONNECT_MS.
- */
-void wifi_manager_reset_retry(void);
-
-
-/* ============================================================
-   FUNÇÕES OBSOLETAS (compatibilidade v1.x)
-============================================================ */
-
-/**
- * @brief OBSOLETA — Não faz nada em v2.0!
- * 
- * PROBLEMA v1.x: Mudava STA→AP em runtime quando assumia master,
- * causando perda de IP e split-brain.
- * 
- * SOLUÇÃO v2.0: Modo WiFi é FIXO no arranque.
- * - pos=0 sempre AP
- * - pos>0 sempre STA
- * - Papel master/slave é LÓGICO (gerido por fsm_network)
- * 
- * Esta função APENAS loga warning e não faz nada.
- * Mantida por compatibilidade com código existente que
- * ainda possa chamar assume_ap() ao promover-se a master.
- * 
- * @deprecated Use wifi_manager_init_auto() no arranque.
- */
-void wifi_manager_assume_ap(void);
-
 
 /* ============================================================
    CONTROLO DE ACTIVAÇÃO/DESACTIVAÇÃO (SAFE MODE)

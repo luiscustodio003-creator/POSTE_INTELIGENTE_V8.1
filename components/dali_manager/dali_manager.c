@@ -222,9 +222,6 @@ void dali_set_brightness(uint8_t brightness)
 }
 
 
-/* Atalhos de controlo directo */
-void dali_turn_on(void)   { dali_set_brightness(LIGHT_MAX); }
-void dali_turn_off(void)  { dali_set_brightness(LIGHT_MIN); }
 void dali_safe_mode(void) { dali_set_brightness(LIGHT_SAFE_MODE); }
 
 
@@ -284,29 +281,6 @@ void dali_fade_down(void)
 
 
 /* ============================================================
-   dali_fade_stop — para fade no nível actual
-   ──────────────────────────────────────────────────────────
-   Lê o duty corrente do LEDC e congela nesse ponto.
-============================================================ */
-void dali_fade_stop(void)
-{
-    if (!s_fade_installed) return;
-
-    uint32_t duty_now = ledc_get_duty(DALI_LEDC_MODE, LEDC_CHANNEL);
-    ledc_set_fade_with_time(DALI_LEDC_MODE, LEDC_CHANNEL, duty_now, 1);
-    ledc_fade_start(DALI_LEDC_MODE, LEDC_CHANNEL, LEDC_FADE_NO_WAIT);
-
-    /* Converte duty → pct usando tabela inversa */
-    uint8_t pct = (uint8_t)((duty_now * 100U) / 254U);
-    if (pct < LIGHT_MIN) pct = LIGHT_MIN;
-
-    portENTER_CRITICAL(&s_mux);
-    s_brightness = pct;
-    portEXIT_CRITICAL(&s_mux);
-}
-
-
-/* ============================================================
    dali_get_brightness — thread-safe
    ──────────────────────────────────────────────────────────
    Retorna brilho actual protegido por spinlock.
@@ -322,74 +296,3 @@ uint8_t dali_get_brightness(void)
 }
 
 
-/* ============================================================
-   dali_get_brightness_real — valor real do hardware LEDC
-   ──────────────────────────────────────────────────────────
-   Lê o duty cycle actual do periférico LEDC e converte para
-   percentagem. Reflecte o valor instantâneo durante o fade —
-   não o valor de destino optimista de s_brightness.
-
-   Usar no system_monitor para actualizar a barra DALI no
-   display em tempo real durante fade up e fade down:
-     t=0ms    barra: 10%   (início do fade)
-     t=200ms  barra: 32%   (a subir)
-     t=400ms  barra: 58%
-     t=800ms  barra: 100%  (fim do fade)
-============================================================ */
-uint8_t dali_get_brightness_real(void)
-{
-    if (!s_fade_installed) return s_brightness;
-
-    uint32_t duty = ledc_get_duty(DALI_LEDC_MODE, LEDC_CHANNEL);
-    uint8_t  pct  = (uint8_t)((duty * 100U + 127U) / 254U);
-
-    if (pct < LIGHT_MIN) pct = LIGHT_MIN;
-    if (pct > LIGHT_MAX) pct = LIGHT_MAX;
-
-    return pct;
-}
-
-
-/* ============================================================
-   dali_test_curve — FUNÇÃO DE TESTE v3.1
-   ──────────────────────────────────────────────────────────
-   Valida a curva DALI completa imprimindo todos os valores.
-   Chamar via monitor serial ou GDB para diagnóstico.
-   
-   Output esperado:
-   ════════════════════════════════════════════════════════
-   ═══ TESTE CURVA DALI IEC 62386 v3.1 ═══
-   pct=  0% → duty=  0 → real=0.0%
-   pct= 10% → duty= 23 → real=9.1%
-   pct= 20% → duty= 45 → real=17.7%
-   pct= 30% → duty= 68 → real=26.8%
-   pct= 40% → duty= 91 → real=35.8%
-   pct= 50% → duty=114 → real=44.9%
-   pct= 60% → duty=137 → real=53.9%
-   pct= 70% → duty=160 → real=63.0%
-   pct= 80% → duty=183 → real=72.0%
-   pct= 90% → duty=206 → real=81.1%
-   pct=100% → duty=254 → real=100.0%
-   ════════════════════════════════════════════════════════
-============================================================ */
-void dali_test_curve(void)
-{
-    ESP_LOGI(TAG, "════════════════════════════════════════════════════════");
-    ESP_LOGI(TAG, "═══ TESTE CURVA DALI IEC 62386 v3.1 ═══");
-    ESP_LOGI(TAG, "════════════════════════════════════════════════════════");
-    
-    for (uint8_t pct = 0; pct <= 100; pct += 10) {
-        uint32_t duty = _pct_to_duty(pct);
-        float real_pct = (float)duty * 100.0f / 254.0f;
-        
-        ESP_LOGI(TAG, "pct=%3d%% → duty=%3lu → real=%.1f%%",
-                 pct, (unsigned long)duty, real_pct);
-    }
-    
-    ESP_LOGI(TAG, "════════════════════════════════════════════════════════");
-    ESP_LOGI(TAG, "Validação:");
-    ESP_LOGI(TAG, "  10%% → 9.1%%  real ✅ (tolerância ±1%%)");
-    ESP_LOGI(TAG, "  50%% → 44.9%% real ✅ (tolerância ±5%%)");
-    ESP_LOGI(TAG, " 100%% → 100%%  real ✅");
-    ESP_LOGI(TAG, "════════════════════════════════════════════════════════");
-}

@@ -3,7 +3,6 @@ idf_component_register(
     INCLUDE_DIRS "."
     REQUIRES
         udp_manager
-        wifi_manager
         config
         esp_timer
         log

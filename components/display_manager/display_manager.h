@@ -18,7 +18,7 @@
 
    Dependências directas:
    ----------------------
-     radar_manager.h : radar_obj_t, RADAR_MAX_OBJ, RADAR_TRAIL_MAX
+     radar_manager.h : radar_obj_t, RADAR_MAX_OBJ
      system_config.h : LCD_H_RES, LCD_V_RES, LIGHT_MIN
      hw_config.h     : LCD_PIN_*
      post_config.h   : post_get_name(), post_get_id()
@@ -29,17 +29,14 @@
    display_manager_set_radar() recebe radar_obj_t com os campos:
      x_mm       → posição lateral (consumido pelo interpolador)
      y_mm       → distância frontal (consumido pelo interpolador)
-     speed_kmh  → velocidade para label no canvas
-   Os campos trail_x[] / trail_y[] do radar_obj_t são IGNORADOS.
+     speed_kmh  → velocidade para canvas
    O display tem interpolador próprio (s_interp[]) que gera o
    rasto internamente a 50Hz com movimento preditivo.
-   O tracking_manager não precisa de preencher trail_x/trail_y.
 
    MUDANÇAS v5.1 → v5.2:
    ─────────────────────────
    - REMOVIDO: #include <inttypes.h> desnecessário.
    - ADICIONADO: nota sobre campos de radar_obj_t consumidos.
-   - ADICIONADO: display_manager_reset_radar() na secção correcta.
 ============================================================ */
 
 #ifndef DISPLAY_MANAGER_H
@@ -79,13 +76,6 @@ void display_manager_task(void);
  */
 void display_manager_task_start(void);
 
-/**
- * @brief Limpa estado do interpolador radar.
- *        Chamar quando radar reinicia ou perde tracking total.
- */
-void display_manager_reset_radar(void);
-
-
 /* ============================================================
    ACTUALIZAÇÃO DE ESTADO
    ────────────────────────
@@ -98,9 +88,6 @@ void display_manager_reset_radar(void);
  *        Estados: "IDLE", "LIGHT ON", "SAFE MODE", "MASTER", "AUTONOMO".
  */
 void display_manager_set_status(const char *status);
-
-/** @brief Atalho: true → "MASTER" verde; false → "IDLE". */
-void display_manager_set_leader(bool is_leader);
 
 /**
  * @brief Actualiza estado Wi-Fi e IP.
@@ -143,16 +130,12 @@ void display_manager_set_neighbors(const char *nebL, const char *nebR,
  *        Campos consumidos de radar_obj_t: x_mm, y_mm, speed_kmh.
  *        Campos ignorados: trail_x[], trail_y[], trail_len.
  *
- * @param objs  Array radar_obj_t (tracking_manager ou simulador).
- *              Apenas x_mm, y_mm e speed_kmh precisam de ser preenchidos.
+ * @param objs  Array radar_obj_t (tracking_manager). Campos: x_mm, y_mm, speed_kmh.
  * @param count Número de objectos (0..RADAR_MAX_OBJ).
  */
 void display_manager_set_radar(const radar_obj_t *objs, uint8_t count);
 /**
  * @brief Actualiza card de velocidade km/h.
- *        NOTA v5.2: NÃO actualiza mais o interpolador s_interp[].
- *        A velocidade do interpolador vem de radar_obj_t.speed_kmh
- *        fornecido por display_manager_set_radar() — mais precisa.
  * @param speed Velocidade em km/h (0-300).
  */
 void display_manager_set_speed(int speed);

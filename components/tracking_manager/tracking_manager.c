@@ -1,36 +1,8 @@
-/* ============================================================
-   MÓDULO     : tracking_manager
-   FICHEIRO   : tracking_manager.c — Implementação CORRIGIDA
-   VERSÃO     : 1.2  |  2026-05-12
-   PROJECTO   : Poste Inteligente v8
-   AUTORES    : Luis Custódio | Tiago Moreno
-   PLATAFORMA : ESP32 (ESP-IDF v5.x)
-
-   ALTERAÇÕES v1.1 → v1.2 (CORRECÇÕES DE BUGS):
-   ─────────────────────────────────────────────────────────
-   🔴 BUG #2 CORRIGIDO — EVENT_LOCAL bloqueado por obstáculo
-      Removida condição `!sl->pub.event_obstaculo_pending` que
-      impedia LOCAL quando veículo entrava já parado.
-      Agora: LOCAL tem PRIORIDADE sobre OBSTACULO.
-
-   🔴 BUG #3 CORRIGIDO — Posição instável não verificada
-      Adicionada verificação de drift de posição.
-      Veículo que "deriva" > OBSTACULO_DIST_TOL_MM não é
-      classificado como obstáculo.
-
-   🔴 BUG #4 CORRIGIDO — Keepalive não era chamado
-      Adicionado fsm_obstaculo_keepalive() quando obstáculo
-      está activo — evita remoção prematura após 8s.
-
-   🔴 BUG #5 CORRIGIDO — Código duplicado
-      Criada função _verificar_obstaculo() única — elimina
-      duplicação entre estados CONFIRMED e APPROACHING.
-============================================================ */
+/* tracking_manager.c — v1.2 | 2026-05-12 | Poste Inteligente v8 */
 
 #include "tracking_manager.h"
-#include "fsm_core.h"  /* ← NOVO: para fsm_obstaculo_keepalive() */
+#include "fsm_core.h"
 #include "system_config.h"
-#include "display_manager.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
@@ -41,21 +13,17 @@
 
 static atomic_bool s_radar_frame_ok = false;
 
-/* Função que o radar_manager_task chama e o Linker não encontrava */
 void tracking_manager_task_notify_frame(bool ok) {
     atomic_store(&s_radar_frame_ok, ok);
 }
 
-/* Função para a FSM ler a saúde do radar */
 bool tracking_manager_get_radar_status(void) {
     return atomic_load(&s_radar_frame_ok);
 }
 
 static const char *TAG = "TRK";
 
-/* ── Slot interno — estende tracked_vehicle_t com campos privados ──
-   CORRIGIDO v1.2: Adicionados campos obstaculo_x_initial e obstaculo_y_initial
-   para verificação de posição estável (Bug #3). */
+/* Slot interno — estende tracked_vehicle_t com campos privados. */
 typedef struct {
     tracked_vehicle_t pub;
     float    speed_window[TRK_SPEED_WINDOW];
@@ -63,15 +31,11 @@ typedef struct {
     uint8_t  speed_win_filled;
     bool     occupied;
     uint64_t last_seen_ms;
-    bool     local_disparado;  /* LOCAL só dispara UMA VEZ por veículo */
-    
-    /* NOVO v1.2: Posição inicial do obstáculo para verificar drift */
+    bool     local_disparado;   /* LOCAL dispara apenas uma vez por veículo */
     float    obstaculo_x_initial;
     float    obstaculo_y_initial;
-    
 } trk_slot_t;
 
-/* ── Estado interno do módulo ─────────────────────────────── */
 static trk_slot_t        s_slots[TRK_MAX_VEHICLES];
 static tracked_vehicle_t s_pub[TRK_MAX_VEHICLES];
 static uint8_t           s_pub_count = 0;
@@ -80,9 +44,7 @@ static uint16_t          s_next_id   = 1;
 static trk_stats_t       s_stats     = {0};
 
 
-/* ============================================================
-   UTILITÁRIOS PRIVADOS
-============================================================ */
+/* ── Utilitários privados ─────────────────────────────────── */
 
 static uint64_t _agora_ms(void)
 {
@@ -102,10 +64,6 @@ static float _calcular_velocidade_suavizada(trk_slot_t *slot, float vel_raw)
     slot->speed_win_idx = (slot->speed_win_idx + 1) % TRK_SPEED_WINDOW;
     if (slot->speed_win_filled < TRK_SPEED_WINDOW)
         slot->speed_win_filled++;
-
-    /* Guarda contra divisão por zero — não deve acontecer mas protege */
-    if (slot->speed_win_filled == 0)
-        return vel_raw;
 
     float soma = 0.0f;
     for (uint8_t i = 0; i < slot->speed_win_filled; i++)
@@ -140,69 +98,42 @@ static void _copiar_para_publico(void)
 }
 
 
-/* ============================================================
-   NOVO v1.2 — FUNÇÃO UNIFICADA DE DETECÇÃO DE OBSTÁCULO
-   ──────────────────────────────────────────────────────────
-   Corrige BUG #3, #4, #5:
-   - Verifica posição estável (drift)
-   - Chama keepalive quando obstáculo activo
-   - Elimina código duplicado entre estados
-   
-   LÓGICA:
-   1. Só detecta obstáculo se LOCAL já disparou (garante T++)
-   2. Guarda posição inicial quando começa a contar frames
-   3. Calcula drift de posição desde o início
-   4. Se drift > tolerância → reset (não é obstáculo fixo)
-   5. Se obstáculo já detectado → chama keepalive FSM
-   6. Se frames >= threshold → dispara evento
-============================================================ */
+/* ── _verificar_obstaculo ─────────────────────────────────────
+   Condições: vel≤max, dist≤detect, teve movimento, LOCAL feito.
+   Verifica drift de posição — veículo a derivar não é obstáculo.
+   Chama keepalive na FSM enquanto obstáculo activo. */
 static void _verificar_obstaculo(trk_slot_t *sl)
 {
-    /* Só verifica obstáculo se:
-       - Velocidade muito baixa (parado)
-       - Dentro da zona de detecção
-       - Já teve movimento antes (não é objecto fixo)
-       - LOCAL já foi processado (garante que T++ aconteceu) */
     if (sl->pub.speed_kmh <= OBSTACULO_SPEED_MAX_KMH &&
         sl->pub.distance_m <= (float)RADAR_DETECT_M  &&
         sl->pub.speed_kmh_max > MIN_DETECT_KMH       &&
         sl->local_disparado) {
-        
-        /* ── Guarda posição inicial quando começa a contar ──── */
+
         if (sl->pub.obstaculo_frames == 0) {
             sl->obstaculo_x_initial = sl->pub.x_mm;
             sl->obstaculo_y_initial = sl->pub.y_mm;
             ESP_LOGD(TAG, "[ID %u] Início contagem obstáculo @ (%.0f,%.0f)",
                      sl->pub.id, sl->pub.x_mm, sl->pub.y_mm);
         }
-        
-        /* ── Calcula drift de posição desde início ─────────── */
+
         float dx = fabsf(sl->pub.x_mm - sl->obstaculo_x_initial);
         float dy = fabsf(sl->pub.y_mm - sl->obstaculo_y_initial);
         float drift_total = sqrtf(dx*dx + dy*dy);
-        
-        /* ── Verifica se posição é estável ─────────────────── */
+
         if (drift_total > OBSTACULO_DIST_TOL_MM) {
-            /* Posição instável — veículo a "derivar" lentamente.
-               Reset contador — não é obstáculo fixo. */
             sl->pub.obstaculo_frames = 0;
             sl->obstaculo_x_initial  = sl->pub.x_mm;
             sl->obstaculo_y_initial  = sl->pub.y_mm;
             ESP_LOGD(TAG, "[ID %u] Posição instável (drift=%.0fmm) — reset contador",
                      sl->pub.id, drift_total);
         } else {
-            /* Posição estável — incrementa contador */
             sl->pub.obstaculo_frames++;
         }
-        
-        /* ── Keepalive: mantém obstáculo "vivo" na FSM ──────── */
+
         if (sl->pub.event_obstaculo_pending) {
-            /* Obstáculo já detectado — actualiza timestamp na FSM
-               para evitar remoção prematura (8s timeout). */
             fsm_obstaculo_keepalive();
         }
-        
-        /* ── Dispara evento quando threshold atingido ────────── */
+
         if (sl->pub.obstaculo_frames >= OBSTACULO_MIN_FRAMES &&
             !sl->pub.event_obstaculo_pending) {
             sl->pub.event_obstaculo_pending = true;
@@ -214,9 +145,8 @@ static void _verificar_obstaculo(trk_slot_t *sl)
             ESP_LOGW(TAG, "  Distância: %.2fm", sl->pub.distance_m);
             ESP_LOGW(TAG, "═══════════════════════════════════════");
         }
-        
+
     } else {
-        /* Condições não cumpridas — limpa contador */
         if (sl->pub.obstaculo_frames > 0) {
             ESP_LOGD(TAG, "[ID %u] Condições obstáculo perdidas — reset (vel=%.1f dist=%.1f)",
                      sl->pub.id, sl->pub.speed_kmh, sl->pub.distance_m);
@@ -226,9 +156,7 @@ static void _verificar_obstaculo(trk_slot_t *sl)
 }
 
 
-/* ============================================================
-   tracking_manager_init
-============================================================ */
+/* ── tracking_manager_init ───────────────────────────────── */
 void tracking_manager_init(void)
 {
     if (!s_mutex)
@@ -244,13 +172,11 @@ void tracking_manager_init(void)
     memset(&s_stats, 0, sizeof(s_stats));
     s_next_id = 1;
 
-    ESP_LOGI(TAG, "tracking_manager v1.2 inicializado (obstáculo corrigido)");
+    ESP_LOGI(TAG, "tracking_manager v1.2 inicializado");
 }
 
 
-/* ============================================================
-   tracking_manager_update — pipeline principal a 100ms
-============================================================ */
+/* ── tracking_manager_update — pipeline a 100ms ─────────── */
 void tracking_manager_update(const radar_data_t *data)
 {
     if (!data) return;
@@ -261,7 +187,7 @@ void tracking_manager_update(const radar_data_t *data)
     uint64_t agora = _agora_ms();
 
 
-    /* ── PASSO 1: Associação nearest-neighbour ────────────── */
+    /* ── Passo 1: Associação nearest-neighbour ───────────── */
 
     for (int t = 0; t < data->count; t++) {
         const radar_vehicle_t *alvo = &data->targets[t];
@@ -297,7 +223,6 @@ void tracking_manager_update(const radar_data_t *data)
             s_slots[melhor_slot].pub.total_frames++;
             s_slots[melhor_slot].pub.active              = true;
 
-            /* Actualiza velocidade máxima registada */
             if (s_slots[melhor_slot].pub.speed_kmh >
                 s_slots[melhor_slot].pub.speed_kmh_max)
                 s_slots[melhor_slot].pub.speed_kmh_max =
@@ -343,7 +268,7 @@ void tracking_manager_update(const radar_data_t *data)
     }
 
 
-    /* ── PASSO 2: Slots não associados → COASTING ─────────── */
+    /* ── Passo 2: Slots não associados → COASTING ─────────── */
 
     for (int s = 0; s < TRK_MAX_VEHICLES; s++) {
         if (!s_slots[s].occupied)                      continue;
@@ -361,7 +286,7 @@ void tracking_manager_update(const radar_data_t *data)
     }
 
 
-    /* ── PASSO 3: Progressão de estados e eventos ─────────── */
+    /* ── Passo 3: Progressão de estados e eventos ─────────── */
 
     for (int s = 0; s < TRK_MAX_VEHICLES; s++) {
         if (!s_slots[s].occupied) continue;
@@ -386,15 +311,13 @@ void tracking_manager_update(const radar_data_t *data)
                 break;
 
             case TRK_STATE_CONFIRMED:
-                /* CORRIGIDO v1.2: Usa função unificada (Bug #5) */
                 _verificar_obstaculo(sl);
 
-                /* Transita para APPROACHING se a aproximar-se */
                 if (sl->pub.speed_signed <= AFASTAR_THRESHOLD_KMH) {
                     sl->pub.state = TRK_STATE_APPROACHING;
                     sl->pub.event_approach_pending = true;
                     sl->pub.eta_ms = _calcular_eta(sl->pub.distance_m, sl->pub.speed_kmh);
-                    
+
                     ESP_LOGI(TAG, "[ID %u] APPROACHING vel=%.1f km/h dist=%.1fm ETA=%lums",
                              sl->pub.id, sl->pub.speed_kmh,
                              sl->pub.distance_m, (unsigned long)sl->pub.eta_ms);
@@ -402,16 +325,9 @@ void tracking_manager_update(const radar_data_t *data)
                 break;
 
             case TRK_STATE_APPROACHING:
-                /* CORRIGIDO v1.2: Usa função unificada (Bug #5) */
                 _verificar_obstaculo(sl);
 
-                /* ── event_local_pending — UMA VEZ por veículo ──────────
-                   CORRIGIDO v1.2 (Bug #2): Removida condição que bloqueava
-                   LOCAL quando obstáculo pendente. Agora LOCAL sempre tem
-                   prioridade — obstáculo só dispara DEPOIS de LOCAL.
-                   
-                   Garante que T++ acontece exactamente uma vez por veículo,
-                   independentemente de quantos frames o veículo passa na zona. */
+                /* LOCAL dispara uma única vez — garante T++ exactamente uma vez. */
                 if (sl->pub.distance_m <= (float)RADAR_DETECT_M &&
                     !sl->local_disparado) {
                     sl->pub.event_local_pending = true;
@@ -420,7 +336,6 @@ void tracking_manager_update(const radar_data_t *data)
                              sl->pub.id, sl->pub.distance_m);
                 }
 
-                /* Actualiza ETA ou volta a CONFIRMED se inverteu */
                 if (sl->pub.speed_signed <= AFASTAR_THRESHOLD_KMH) {
                     sl->pub.eta_ms = _calcular_eta(sl->pub.distance_m,
                                                    sl->pub.speed_kmh);
@@ -446,6 +361,7 @@ void tracking_manager_update(const radar_data_t *data)
                 ESP_LOGD(TAG, "[ID %u] EXITED check — event_passed=%d occupied=%d agora=%llu last=%llu",
                          sl->pub.id, sl->pub.event_passed_pending,
                          sl->occupied, agora, sl->last_seen_ms);
+                /* Liberta slot quando PASSED consumido ou após 5s (safety valve). */
                 if (!sl->pub.event_passed_pending ||
                     (agora - sl->last_seen_ms) > 5000ULL) {
                     if (sl->pub.event_passed_pending)
@@ -457,7 +373,7 @@ void tracking_manager_update(const radar_data_t *data)
     }
 
 
-    /* ── PASSO 4: Estatísticas ────────────────────────────── */
+    /* ── Passo 4: Estatísticas ───────────────────────────── */
 
     uint8_t activos = 0;
     for (int s = 0; s < TRK_MAX_VEHICLES; s++) {
@@ -468,42 +384,15 @@ void tracking_manager_update(const radar_data_t *data)
     s_stats.current_active = activos;
 
 
-    /* ── PASSO 5: Cópia thread-safe para buffer público ───── */
+    /* ── Passo 5: Cópia thread-safe para buffer público ───── */
 
     _copiar_para_publico();
-
- 
-
-/* ── PASSO 6: Sincronização com o Display ─────────────────── */
-    tracked_vehicle_t vehicles[TRK_MAX_VEHICLES];
-    uint8_t count = 0;
-    if (tracking_manager_get_vehicles(vehicles, &count)) {
-        // 1. Converter para o formato que o display_manager.h espera
-        radar_obj_t display_objs[RADAR_MAX_OBJ];
-        float top_speed = 0;
-        
-        for (int i = 0; i < count && i < RADAR_MAX_OBJ; i++) {
-            display_objs[i].x_mm = (int)vehicles[i].x_mm;
-            display_objs[i].y_mm = (int)vehicles[i].y_mm;
-            display_objs[i].speed_kmh = vehicles[i].speed_kmh;
-            
-            if (vehicles[i].speed_kmh > top_speed) top_speed = vehicles[i].speed_kmh;
-        }
-        
-        // 2. Enviar para a fila do display (Thread-safe)
-        display_manager_set_radar(display_objs, count);
-        display_manager_set_speed((int)top_speed);
-    } else {
-        // Se não há veículos, garante que o display limpa o valor
-        display_manager_set_radar(NULL, 0);
-        display_manager_set_speed(0);
-    }
+    /* Display actualizado pela fsm_task (_atualiza_radar_display) — não aqui.
+       Actualizar em Core 0 causava conflito com fsm_task em Core 1. */
 }
 
 
-/* ============================================================
-   tracking_manager_get_vehicles
-============================================================ */
+/* ── tracking_manager_get_vehicles ──────────────────────── */
 bool tracking_manager_get_vehicles(tracked_vehicle_t *out,
                                    uint8_t *out_count)
 {
@@ -521,9 +410,7 @@ bool tracking_manager_get_vehicles(tracked_vehicle_t *out,
 }
 
 
-/* ============================================================
-   tracking_manager_clear_events
-============================================================ */
+/* ── tracking_manager_clear_events ──────────────────────── */
 void tracking_manager_clear_events(uint16_t vehicle_id)
 {
     if (!s_mutex) return;
@@ -554,9 +441,7 @@ void tracking_manager_clear_events(uint16_t vehicle_id)
 }
 
 
-/* ============================================================
-   tracking_manager_get_stats
-============================================================ */
+/* ── tracking_manager_get_stats ─────────────────────────── */
 void tracking_manager_get_stats(trk_stats_t *out)
 {
     if (!out) return;
@@ -564,9 +449,7 @@ void tracking_manager_get_stats(trk_stats_t *out)
 }
 
 
-/* ============================================================
-   tracking_manager_reset
-============================================================ */
+/* ── tracking_manager_reset ─────────────────────────────── */
 void tracking_manager_reset(void)
 {
     memset(s_slots, 0, sizeof(s_slots));
@@ -583,9 +466,6 @@ void tracking_manager_reset(void)
 }
 
 
-/* ============================================================
-   tracking_state_name
-============================================================ */
 const char *tracking_state_name(trk_state_t state)
 {
     switch (state) {
@@ -595,37 +475,5 @@ const char *tracking_state_name(trk_state_t state)
         case TRK_STATE_COASTING:    return "COASTING";
         case TRK_STATE_EXITED:      return "EXITED";
         default:                    return "---";
-    }
-}
-
-static void _sync_to_display(void) 
-{
-    tracked_vehicle_t vehicles[TRK_MAX_VEHICLES];
-    uint8_t count = 0;
-    
-    // Obtém os veículos já processados e suavizados
-    if (tracking_manager_get_vehicles(vehicles, &count)) {
-        radar_obj_t display_objs[RADAR_MAX_OBJ];
-        float top_speed = 0;
-        uint8_t target_count = (count > RADAR_MAX_OBJ) ? RADAR_MAX_OBJ : count;
-
-        for (int i = 0; i < target_count; i++) {
-            display_objs[i].x_mm = (int)vehicles[i].x_mm;
-            display_objs[i].y_mm = (int)vehicles[i].y_mm;
-            display_objs[i].speed_kmh = vehicles[i].speed_kmh;
-
-            // Lógica para o card: mostra a maior velocidade actual
-            if (vehicles[i].speed_kmh > top_speed) {
-                top_speed = vehicles[i].speed_kmh;
-            }
-        }
-        
-        // Envia para a fila do display manager (Thread-safe)
-        display_manager_set_radar(display_objs, target_count);
-        display_manager_set_speed((int)top_speed);
-    } else {
-        // Sem alvos: limpa os elementos visuais
-        display_manager_set_radar(NULL, 0);
-        display_manager_set_speed(0);
     }
 }

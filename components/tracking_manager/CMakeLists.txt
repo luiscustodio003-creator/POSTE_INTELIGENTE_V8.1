@@ -3,9 +3,7 @@ idf_component_register(
     INCLUDE_DIRS "."
     REQUIRES
         radar_manager
-        system_monitor
-        display_manager
-        wifi_manager
+        state_machine
         config
         freertos
         esp_timer

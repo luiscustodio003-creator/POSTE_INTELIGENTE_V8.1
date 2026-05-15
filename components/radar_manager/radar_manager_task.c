@@ -135,5 +135,5 @@ void radar_manager_task_start(void)
         0               /* Core 0 — PRO_CPU */
     );
 
-    ESP_LOGI(TAG, "radar_task v5.1 | Core 0 | Prio 6 | Stack 4096B");
+    ESP_LOGI(TAG, "radar_task v5.0 | Core 0 | Prio 6 | Stack 4096B");
 }

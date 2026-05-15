@@ -77,7 +77,7 @@ static QueueHandle_t s_fila = NULL;
 #define COR_VERDE       0x22C55E
 #define COR_VERMELHO    0xFF3333
 #define COR_AMARELO     0xFF8C00
-#define COR_LARANJA     0xFF8C00
+#define COR_LARANJA     0xF97316
 #define COR_CIANO       0x00D4FF
 #define COR_VIOLETA     0xA855F7
 #define COR_SEPARADOR   0x374151
@@ -266,7 +266,7 @@ static void _radar_mm_to_px(int x_mm, int y_mm,
 
 
 /* ============================================================
-   FONTE BITMAP 4×6 — dígitos 0-9 + 'k','m','/','h'
+   FONTE BITMAP 4×6 — dígitos 0-9
    Cada glifo: 6 bytes, bit7=coluna esquerda
 ============================================================ */
 static const uint8_t _font4x6[][6] = {
@@ -280,15 +280,7 @@ static const uint8_t _font4x6[][6] = {
     /* 7 */ {0xF1, 0x12, 0x24, 0x00, 0x00, 0x00},
     /* 8 */ {0x69, 0x96, 0x96, 0x00, 0x00, 0x00},
     /* 9 */ {0x69, 0x71, 0x16, 0x00, 0x00, 0x00},
-    /* k */ {0x89, 0xAC, 0xA9, 0x00, 0x00, 0x00},
-    /* m */ {0x00, 0x6A, 0xA9, 0x00, 0x00, 0x00},
-    /* / */ {0x12, 0x24, 0x48, 0x00, 0x00, 0x00},
-    /* h */ {0x88, 0xE8, 0x89, 0x00, 0x00, 0x00},
 };
-#define FC_K  10
-#define FC_M  11
-#define FC_SL 12
-#define FC_H  13
 
 /* Desenha um glifo da fonte bitmap na posição (x0, y0) */
 static void _glifo_px(int x0, int y0, int idx, lv_color_t cor)
@@ -300,21 +292,6 @@ static void _glifo_px(int x0, int y0, int idx, lv_color_t cor)
                 _px_blend(x0 + col, y0 + row, cor, 220u);
         }
     }
-}
-
-/* Desenha "XXXkm/h" a partir de (x0, y0) */
-static void _vel_label_px(int x0, int y0, float speed_kmh, lv_color_t cor)
-{
-    if (fabsf(speed_kmh) < 1.0f) return;
-    int v  = (int)(fabsf(speed_kmh) + 0.5f);
-    int cx = x0;
-    if (v >= 100) { _glifo_px(cx, y0, v / 100,       cor); cx += 5; }
-    if (v >= 10)  { _glifo_px(cx, y0, (v / 10) % 10, cor); cx += 5; }
-    _glifo_px(cx, y0, v % 10, cor); cx += 5;
-    _glifo_px(cx, y0, FC_K,   cor); cx += 5;
-    _glifo_px(cx, y0, FC_M,   cor); cx += 5;
-    _glifo_px(cx, y0, FC_SL,  cor); cx += 5;
-    _glifo_px(cx, y0, FC_H,   cor);
 }
 
 
@@ -393,15 +370,6 @@ static void _radar_aplicar_frame(const radar_obj_t *objs, uint8_t count)
         }
     }
 
-    /* Apaga alvos sem frame real há mais de ALVO_HOLD_MS */
-    for (int s = 0; s < RADAR_MAX_OBJ; s++) {
-        if (!s_alvos[s].activo) continue;
-        if ((agora - s_alvos[s].ultimo_ms) > ALVO_HOLD_MS) {
-            s_alvos[s].activo    = false;
-            s_alvos[s].trail_len = 0;
-            s_alvos[s].trail_head = 0;
-        }
-    }
 }
 
 
@@ -416,6 +384,19 @@ static void _radar_aplicar_frame(const radar_obj_t *objs, uint8_t count)
 static void _radar_redraw(void)
 {
     if (!canvas_radar) return;
+
+    /* Expira alvos sem frame real há mais de ALVO_HOLD_MS.
+       Corre a 50Hz (unconditional) — garante limpeza mesmo se
+       mensagens count=0 forem descartadas por fila cheia. */
+    uint32_t agora_rd = (uint32_t)(esp_timer_get_time() / 1000ULL);
+    for (int s = 0; s < RADAR_MAX_OBJ; s++) {
+        if (!s_alvos[s].activo) continue;
+        if ((agora_rd - s_alvos[s].ultimo_ms) > ALVO_HOLD_MS) {
+            s_alvos[s].activo    = false;
+            s_alvos[s].trail_len  = 0;
+            s_alvos[s].trail_head = 0;
+        }
+    }
 
     /* Cores do canvas */
     lv_color_t C_FUNDO  = lv_color_hex(0x010601);
@@ -562,22 +543,6 @@ static void _radar_redraw(void)
         _px_blend((int)px,     (int)py - 1, C_ALV_HL, 160u);
         _px_blend((int)px - 1, (int)py,     C_ALV_HL, 110u);
 
-        /* 6d. Label de velocidade junto ao ponto */
-        if (fabsf(alvo->speed_kmh) > 0.5f) {
-            int v     = (int)(fabsf(alvo->speed_kmh) + 0.5f);
-            int n_dig = (v >= 100) ? 3 : (v >= 10 ? 2 : 1);
-            int lbl_w = (n_dig + 4) * 5;
-            int lx    = (int)px + 12;
-            int ly    = (int)py - 10;
-
-            /* Clamp para não sair do canvas */
-            if (lx + lbl_w > RADAR_W - 2) lx = (int)px - lbl_w - 4;
-            if (lx < 1)                   lx = 1;
-            if (ly < 1)                   ly = 1;
-            if (ly > RADAR_H - 8)         ly = RADAR_H - 8;
-
-            _vel_label_px(lx, ly, alvo->speed_kmh, lv_color_hex(COR_ALVO[i]));
-        }
     }
 
     /* 7. Ponto do sensor — centro verde da base */
@@ -706,19 +671,10 @@ static void ui_create(void)
 
     /* ── ZONA HARDWARE (y: 37..92) ──────────────────────────── */
     /* WiFi, estado radar, vizinhos, barra DALI */
-    //label_wifi     = _label_novo(scr,   8, 39, COR_CINZENTO, "WiFi: ---");
     label_wifi = _label_novo(scr, 8, 39, COR_CINZENTO, LV_SYMBOL_WIFI " ---");
-
-    //label_radar_st = _label_novo(scr, 130, 39, COR_CINZENTO, "Radar: ---");
     label_radar_st = _label_novo(scr, 130, 39, COR_CINZENTO, LV_SYMBOL_EYE_OPEN " ---");
 
     /* Linha de vizinhos */
-    lv_obj_t *div_neb = lv_obj_create(scr);
-    lv_obj_set_size(div_neb, LCD_H_RES - 16, 16);
-    lv_obj_set_pos(div_neb, 8, 55);
-    lv_obj_set_style_bg_opa(div_neb, LV_OPA_TRANSP, 0);
-    lv_obj_set_style_border_width(div_neb, 0, 0);
-    lv_obj_set_style_pad_all(div_neb, 0, 0);
 
     
 
@@ -727,9 +683,6 @@ static void ui_create(void)
     label_dali = _label_novo(scr, 8, 76, COR_CINZENTO, LV_SYMBOL_TINT "  0%");
 
     
-    /*label_neb_esq = _label_novo(scr,   8, 57, COR_CINZ_CLARO, "E: ---");
-    label_neb_dir = _label_novo(scr, LCD_H_RES/2+4, 57, COR_CINZ_CLARO, "D: ---");
-    label_dali    = _label_novo(scr,   8, 76, COR_CINZENTO,   "DALI:  0%");*/
   
 
     /* Barra de brilho DALI */
@@ -873,20 +826,6 @@ void display_manager_tick(uint32_t ms)
 
 
 /* ============================================================
-   display_manager_reset_radar — limpa estado dos alvos
-   Chamar quando radar reinicia ou perde tracking total.
-   Thread-safe: s_alvos é lido/escrito apenas na display_task.
-============================================================ */
-void display_manager_reset_radar(void)
-{
-    memset(s_alvos, 0, sizeof(s_alvos));
-    s_T_actual  = 0;
-    s_Tc_actual = 0;
-    ESP_LOGI(TAG, "Estado radar limpo");
-}
-
-
-/* ============================================================
    display_manager_task — loop de render (20ms / 50Hz)
    ──────────────────────────────────────────────────────────
    ÚNICA função que toca em objectos LVGL.
@@ -925,6 +864,8 @@ void display_manager_task(void)
                         cor_txt = COR_VERDE;   cor_bg = 0x001A08; cor_brd = 0x003A10;
                     } else if (strcmp(s, "AUTONOMO")  == 0) {
                         cor_txt = COR_VERMELHO; cor_bg = 0x1A0000; cor_brd = 0x3A0000;
+                    } else if (strcmp(s, "OBSTACULO") == 0) {
+                        cor_txt = COR_LARANJA;  cor_bg = 0x1A0800; cor_brd = 0x3A1500;
                     }
                     lv_obj_set_style_text_color(label_badge, lv_color_hex(cor_txt), 0);
                     lv_obj_set_style_bg_color(label_badge, lv_color_hex(cor_bg), 0);
@@ -935,9 +876,6 @@ void display_manager_task(void)
             case DM_MSG_WIFI:
                 if (!label_wifi) break;
                 if (msg.wifi.connected) {
-                    char buf[36];
-                    snprintf(buf, sizeof(buf), "WiFi: %s",msg.wifi.ip[0] ? msg.wifi.ip : "---");
-                    //lv_label_set_text(label_wifi, buf);
                     lv_label_set_text_fmt(label_wifi, LV_SYMBOL_WIFI " %s", msg.wifi.ip);
                     lv_obj_set_style_text_color(label_wifi,lv_color_hex(COR_VERDE), 0);
                 } else {
@@ -1049,9 +987,6 @@ void display_manager_task(void)
 
     /* Processa motor gráfico LVGL */
     lv_timer_handler();
-
-    /* Cede tempo ao CPU — evita watchdog */
-    vTaskDelay(pdMS_TO_TICKS(10));
 }
 
 
@@ -1065,11 +1000,6 @@ void display_manager_set_status(const char *status)
     dm_msg_t msg = { .tipo = DM_MSG_STATUS };
     strncpy(msg.st.status, status, sizeof(msg.st.status) - 1);
     xQueueSend(s_fila, &msg, 0);
-}
-
-void display_manager_set_leader(bool is_leader)
-{
-    display_manager_set_status(is_leader ? "MASTER" : "IDLE");
 }
 
 void display_manager_set_wifi(bool connected, const char *ip)

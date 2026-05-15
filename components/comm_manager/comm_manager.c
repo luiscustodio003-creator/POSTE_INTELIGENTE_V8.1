@@ -87,7 +87,10 @@ static uint32_t _calcular_eta_ms(float speed_kmh)
     if (speed_kmh < 1.0f) speed_kmh = 1.0f;
     float dist_m   = (float)(POSTE_DIST_M - RADAR_DETECT_M);
     float speed_ms = speed_kmh / 3.6f;
-    return (uint32_t)((dist_m / speed_ms) * 1000.0f);
+    uint32_t eta   = (uint32_t)((dist_m / speed_ms) * 1000.0f);
+    /* Antecipa MARGEM_ACENDER_MS para que P(i+1) acenda ANTES da chegada.
+       Protege contra underflow: se velocidade for muito alta, eta mínimo = 0. */
+    return (eta > MARGEM_ACENDER_MS) ? (eta - MARGEM_ACENDER_MS) : 0;
 }
 
 

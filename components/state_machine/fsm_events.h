@@ -59,14 +59,6 @@ void on_master_claim_received(int from_id);
  */
 void on_master_claim_received_ext(int from_id, int master_id);
 
-/* ── Compatibilidade e injecção de teste ─────────────────── */
-
-/** Shim v3.x → delega para SM_EVT_VEHICLE_LOCAL */
-void sm_on_radar_detect(float vel);
-
-/** Injeta carro de teste via debugger (JTAG/GDB) */
-void sm_inject_test_car(float vel);
-
 /* ── Gestão de vizinhos (chamadas pela fsm_network) ──────── */
 void sm_on_right_neighbor_offline(void);
 void sm_on_right_neighbor_online(void);

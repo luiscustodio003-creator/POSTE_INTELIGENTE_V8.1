@@ -1,93 +1,193 @@
 /**
  * @file web_html_pages.c
- * @brief Páginas HTML Embebidas (Minificadas)
- * 
- * NOTA: HTML minificado para economizar Flash/RAM
- * Tamanho total: ~8KB comprimido
- * 
- * @author Luis Custodio | Tiago Moreno
- * @date 2026-05-09
+ * @brief Páginas HTML Embebidas
+ * @version 2.0  |  2026-05-14
+ *
+ * Dashboard v2.0:
+ *  - Auto-refresh a cada 5s com contador
+ *  - Estado actual: modo FSM, iluminação, T/Tc, radar
+ *  - Rede: IP local, vizinho esquerdo/direito com estado
+ *  - Gráficos de barras: veículos/hora e energia/hora (período 20h-7h)
+ *  - Totais nocturnos acumulados
  */
 
 #include <stddef.h>
 
-// ============================================================================
-// DASHBOARD PRINCIPAL (Vista de Linha)
-// ============================================================================
-
-static const char html_dashboard[] = 
+/* ════════════════════════════════════════════════════════════
+   DASHBOARD PRINCIPAL
+   Serve via GET /dashboard (e GET / redireciona para aqui).
+   Chama /api/status (estado real-time) e /api/night (gráficos).
+════════════════════════════════════════════════════════════ */
+static const char html_dashboard[] =
 "<!DOCTYPE html>"
 "<html lang=pt>"
 "<head>"
 "<meta charset=UTF-8>"
 "<meta name=viewport content='width=device-width,initial-scale=1'>"
-"<title>Poste v8 - Dashboard</title>"
+"<title>Poste Inteligente v8</title>"
 "<style>"
 "*{margin:0;padding:0;box-sizing:border-box}"
-"body{font:14px/1.5 Arial,sans-serif;background:#1a1a2e;color:#eee;padding:10px}"
-".hdr{background:linear-gradient(135deg,#667eea,#764ba2);padding:20px;border-radius:8px;margin-bottom:16px}"
-".hdr h1{font-size:22px;margin-bottom:6px}"
-".card{background:#16213e;padding:14px;margin:10px 0;border-radius:6px;border-left:3px solid #667eea}"
-".metric{display:flex;justify-content:space-between;padding:5px 0;border-bottom:1px solid #0f3460}"
-".metric:last-child{border-bottom:none}"
-".val{color:#667eea;font-weight:bold}"
-".badge{display:inline-block;padding:3px 8px;border-radius:10px;font-size:11px;margin-left:6px}"
-".ok{background:#27ae60;color:#fff}"
-".err{background:#e74c3c;color:#fff}"
-".mst{background:#f39c12;color:#000}"
-"button{background:#667eea;color:#fff;border:none;padding:10px 16px;border-radius:5px;cursor:pointer;margin:4px;font-size:13px}"
-".poste{background:#0f3460;padding:12px;margin:6px 0;border-radius:6px;cursor:pointer}"
-".poste:hover{background:#1a4d7a}"
+"body{font:13px/1.4 Arial,sans-serif;background:#111827;color:#e5e7eb;padding:8px}"
+"header{background:linear-gradient(135deg,#4f46e5,#7c3aed);padding:14px 16px;border-radius:8px;margin-bottom:10px;display:flex;justify-content:space-between;align-items:center}"
+"header h1{font-size:18px;font-weight:700}"
+"header .sub{font-size:11px;opacity:.85;margin-top:2px}"
+"#timer{font-size:11px;color:#c4b5fd;white-space:nowrap}"
+".grid{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:8px}"
+"@media(max-width:480px){.grid{grid-template-columns:1fr}}"
+".card{background:#1f2937;border-radius:8px;padding:12px;border:1px solid #374151}"
+".card h2{font-size:13px;font-weight:600;color:#a78bfa;margin-bottom:8px;text-transform:uppercase;letter-spacing:.05em}"
+".row{display:flex;justify-content:space-between;align-items:center;padding:4px 0;border-bottom:1px solid #374151}"
+".row:last-child{border-bottom:none}"
+".row label{color:#9ca3af;font-size:12px}"
+".val{font-weight:600;font-size:13px}"
+".badge{display:inline-block;padding:2px 8px;border-radius:12px;font-size:11px;font-weight:600}"
+".b-ok{background:#065f46;color:#6ee7b7}"
+".b-err{background:#7f1d1d;color:#fca5a5}"
+".b-warn{background:#78350f;color:#fcd34d}"
+".b-mst{background:#1e3a5f;color:#93c5fd}"
+".b-off{background:#374151;color:#9ca3af}"
+".dot-on{color:#10b981}"
+".dot-off{color:#6b7280}"
+/* Charts */
+".chart-wrap{margin-top:8px}"
+".chart-wrap h3{font-size:11px;color:#9ca3af;margin-bottom:4px;text-transform:uppercase;letter-spacing:.05em}"
+".chart{display:flex;align-items:flex-end;height:80px;gap:2px;background:#111827;border-radius:4px;padding:4px 2px 0}"
+".col{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:flex-end;height:100%}"
+".bar{width:100%;min-height:2px;border-radius:2px 2px 0 0;transition:height .4s}"
+".lbl{font-size:8px;color:#6b7280;margin-top:2px;text-align:center;line-height:1}"
+".totals{display:flex;gap:16px;margin-top:8px;padding-top:8px;border-top:1px solid #374151}"
+".totals span{font-size:12px;color:#9ca3af}"
+".totals b{color:#e5e7eb}"
+".no-data{text-align:center;color:#4b5563;font-size:12px;padding:20px 0}"
 "</style>"
 "</head>"
 "<body>"
-"<div class=hdr>"
-"<h1>🚦 Poste Inteligente v8</h1>"
-"<div style='font-size:12px;opacity:0.9'>Sistema de Iluminação Adaptativa</div>"
+"<header>"
+  "<div>"
+    "<h1>Poste Inteligente v8</h1>"
+    "<div class=sub id=hdr-sub>a carregar...</div>"
+  "</div>"
+  "<div id=timer>5s</div>"
+"</header>"
+
+"<div class=grid>"
+  /* Card Estado */
+  "<div class=card>"
+    "<h2>Estado</h2>"
+    "<div class=row><label>Modo FSM</label><span id=st class=val>-</span></div>"
+    "<div class=row><label>Iluminação</label><span id=duty class=val>-%</span></div>"
+    "<div class=row><label>Veíc. local / em caminho</label><span class=val><span id=T>0</span>/<span id=Tc>0</span></span></div>"
+    "<div class=row><label>Radar</label><span id=rad class=val>-</span></div>"
+    "<div class=row><label>Papel</label><span id=role class=val>-</span></div>"
+  "</div>"
+  /* Card Rede */
+  "<div class=card>"
+    "<h2>Rede</h2>"
+    "<div class=row><label>IP local</label><span id=ip class=val>-</span></div>"
+    "<div class=row><label>WiFi</label><span id=wifi class=val>-</span></div>"
+    "<div class=row><label>Vizinho esq.</label><span class=val><span id=nl-ip>---</span> <span id=nl-st></span></span></div>"
+    "<div class=row><label>Vizinho dir.</label><span class=val><span id=nr-ip>---</span> <span id=nr-st></span></span></div>"
+    "<div class=row><label>Uptime</label><span id=up class=val>-</span></div>"
+  "</div>"
 "</div>"
 
+/* Card Estatísticas Nocturnas */
 "<div class=card>"
-"<h3 style='margin-bottom:10px;color:#667eea'>📊 Estatísticas Globais</h3>"
-"<div class=metric><span>Total Veículos</span><span class=val id=tv>0</span></div>"
-"<div class=metric><span>Consumo Hoje</span><span class=val id=ec>0.0 kWh</span></div>"
-"<div class=metric><span>Economia</span><span class=val id=sv style='color:#27ae60'>0%</span></div>"
+  "<h2>Estatísticas Nocturnas &mdash; <span id=night-hdr>20h &rarr; 7h</span></h2>"
+  "<div id=night-nodata class=no-data>A aguardar sincronização de hora (SNTP)...</div>"
+  "<div id=night-data style=display:none>"
+    "<div class=chart-wrap>"
+      "<h3>Veículos por hora</h3>"
+      "<div id=c-veh class=chart></div>"
+    "</div>"
+    "<div class=chart-wrap style=margin-top:10px>"
+      "<h3>Energia por hora (Wh)</h3>"
+      "<div id=c-eng class=chart></div>"
+    "</div>"
+    "<div class=totals>"
+      "<span>Total veículos: <b id=tot-v>0</b></span>"
+      "<span>Total energia: <b id=tot-e>0 Wh</b></span>"
+      "<span>Hora actual: <b id=cur-h>-</b></span>"
+    "</div>"
+  "</div>"
 "</div>"
-
-"<div class=card>"
-"<h3 style='margin-bottom:10px;color:#667eea'>📍 Postes Activos</h3>"
-"<div id=lista></div>"
-"</div>"
-
-"<button onclick=load()>🔄 Actualizar</button>"
-"<button onclick='location.reload()'>🏠 Reset</button>"
 
 "<script>"
-"async function load(){"
-"try{"
-"const r=await fetch('/api/line');"
-"const d=await r.json();"
-"document.getElementById('tv').textContent=d.stats.total_vehicles;"
-"document.getElementById('ec').textContent=d.stats.total_energy.toFixed(2)+' kWh';"
-"document.getElementById('sv').textContent=d.stats.energy_saved_percent.toFixed(1)+'%';"
-"let html='';"
-"d.postes.forEach(p=>{"
-"const st=p.is_online?'ok':'err';"
-"const role=p.role=='MASTER'?'<span class=\"badge mst\">MASTER</span>':'';"
-"html+=`<div class=poste onclick=\"location.href='/poste/${p.position}'\"><div style='display:flex;justify-content:space-between'><div><strong>Poste #${p.position}</strong> ${role}</div><div><span class=\"badge ${st}\">${p.is_online?'🟢 ON':'🔴 OFF'}</span></div></div><div style='font-size:12px;color:#aaa;margin-top:4px'>${p.ip} • ${p.state} • ${p.duty_cycle}%</div></div>`;"
-"});"
-"document.getElementById('lista').innerHTML=html;"
-"}catch(e){alert('Erro: '+e)}"
+/* Estado e cores */
+"const STATE_COLOR={'IDLE':'#6b7280','LIGHT_ON':'#f59e0b','SAFE_MODE':'#ef4444','MASTER':'#3b82f6','AUTONOMO':'#8b5cf6','OBSTACULO':'#f97316'};"
+"function sBadge(s){const c=STATE_COLOR[s]||'#6b7280';return`<span class=badge style='background:${c}22;color:${c}'>${s}</span>`;}"
+"function dBadge(ok,t,f){return`<span class=badge ${ok?'class=b-ok':'class=b-err'}>${ok?t:f}</span>`;}"
+"function upFmt(s){const h=Math.floor(s/3600),m=Math.floor(s%3600/60);return`${h}h${String(m).padStart(2,'0')}m`;}"
+
+/* Gráficos de barras */
+"function barChart(id,data,color){"
+  "const max=Math.max(...data.map(d=>d.v),0.001);"
+  "document.getElementById(id).innerHTML=data.map(d=>{"
+    "const pct=Math.round(d.v/max*100);"
+    "return`<div class=col><div class=bar style='height:${pct}%;background:${color}'></div><div class=lbl>${d.l}</div></div>`;"
+  "}).join('');"
 "}"
-"load();"
+
+/* Carregar estado */
+"async function loadStatus(){"
+  "try{"
+    "const d=await(await fetch('/api/status')).json();"
+    "document.getElementById('hdr-sub').textContent=`${d.name} | ${d.ip} | ${d.state}`;"
+    "document.getElementById('st').innerHTML=sBadge(d.state);"
+    "document.getElementById('duty').textContent=d.duty+'%';"
+    "document.getElementById('T').textContent=d.T;"
+    "document.getElementById('Tc').textContent=d.Tc;"
+    "document.getElementById('rad').innerHTML=dBadge(d.radar_ok,`${d.radar} OK`,`${d.radar} FAIL`);"
+    "document.getElementById('role').innerHTML=d.role==='MASTER'?`<span class=badge class=b-mst>MASTER</span>`:`<span class=badge class=b-off>SLAVE</span>`;"
+    "document.getElementById('ip').textContent=d.ip;"
+    "document.getElementById('wifi').innerHTML=dBadge(d.wifi_ok,'Ligado','Desligado');"
+    "const lo=d.neb_l_ok,ro=d.neb_r_ok;"
+    "document.getElementById('nl-ip').textContent=d.neb_l_ip;"
+    "document.getElementById('nl-st').innerHTML=`<span class='${lo?\"dot-on\":\"dot-off\"}'>${lo?'●':'○'}</span>`;"
+    "document.getElementById('nr-ip').textContent=d.neb_r_ip;"
+    "document.getElementById('nr-st').innerHTML=`<span class='${ro?\"dot-on\":\"dot-off\"}'>${ro?'●':'○'}</span>`;"
+    "document.getElementById('up').textContent=upFmt(d.uptime_s);"
+  "}catch(e){}"
+"}"
+
+/* Carregar estatísticas nocturnas */
+"async function loadNight(){"
+  "try{"
+    "const d=await(await fetch('/api/night')).json();"
+    "if(!d.synced){"
+      "document.getElementById('night-nodata').style.display='';"
+      "document.getElementById('night-data').style.display='none';"
+      "return;"
+    "}"
+    "document.getElementById('night-nodata').style.display='none';"
+    "document.getElementById('night-data').style.display='';"
+    "const hh=d.hour>=0?`${d.hour}h (actual)`:'---';"
+    "document.getElementById('cur-h').textContent=hh;"
+    "barChart('c-veh',d.buckets.map(b=>({l:b.l,v:b.v})),'#818cf8');"
+    "barChart('c-eng',d.buckets.map(b=>({l:b.l,v:b.e})),'#f59e0b');"
+    "document.getElementById('tot-v').textContent=d.veh;"
+    "document.getElementById('tot-e').textContent=d.wh.toFixed(1)+' Wh';"
+  "}catch(e){}"
+"}"
+
+/* Contador de actualização */
+"let cd=5;"
+"function tick(){"
+  "cd--;"
+  "document.getElementById('timer').textContent=cd+'s';"
+  "if(cd<=0){cd=5;loadStatus();loadNight();}"
+"}"
+"loadStatus();loadNight();"
+"setInterval(tick,1000);"
 "</script>"
 "</body>"
 "</html>";
 
-// ============================================================================
-// PÁGINA DE DETALHES DE POSTE
-// ============================================================================
 
-static const char html_poste_detail[] = 
+/* ════════════════════════════════════════════════════════════
+   PÁGINA DE DETALHES DE POSTE (mantida para compatibilidade)
+════════════════════════════════════════════════════════════ */
+static const char html_poste_detail[] =
 "<!DOCTYPE html>"
 "<html lang=pt>"
 "<head>"
@@ -96,109 +196,72 @@ static const char html_poste_detail[] =
 "<title>Poste - Detalhes</title>"
 "<style>"
 "*{margin:0;padding:0;box-sizing:border-box}"
-"body{font:14px/1.5 Arial,sans-serif;background:#1a1a2e;color:#eee;padding:10px}"
-".hdr{background:linear-gradient(135deg,#667eea,#764ba2);padding:20px;border-radius:8px;margin-bottom:16px}"
-".hdr h1{font-size:22px}"
-".card{background:#16213e;padding:14px;margin:10px 0;border-radius:6px;border-left:3px solid #667eea}"
-".metric{display:flex;justify-content:space-between;padding:5px 0;border-bottom:1px solid #0f3460}"
+"body{font:14px/1.5 Arial,sans-serif;background:#111827;color:#e5e7eb;padding:10px}"
+".hdr{background:linear-gradient(135deg,#4f46e5,#7c3aed);padding:16px;border-radius:8px;margin-bottom:12px}"
+".hdr h1{font-size:20px}"
+".card{background:#1f2937;padding:12px;margin:8px 0;border-radius:8px;border:1px solid #374151}"
+".metric{display:flex;justify-content:space-between;padding:5px 0;border-bottom:1px solid #374151}"
 ".metric:last-child{border-bottom:none}"
-".val{color:#667eea;font-weight:bold}"
-"button{background:#667eea;color:#fff;border:none;padding:10px 16px;border-radius:5px;cursor:pointer;margin:4px}"
-".gauge{width:100px;height:100px;margin:10px auto;position:relative}"
-".gauge svg{transform:rotate(-90deg)}"
-".gauge-txt{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);font-size:20px;font-weight:bold}"
+".val{color:#a78bfa;font-weight:bold}"
+"button{background:#4f46e5;color:#fff;border:none;padding:8px 14px;border-radius:5px;cursor:pointer;margin:4px;font-size:13px}"
 "</style>"
 "</head>"
 "<body>"
 "<div class=hdr>"
-"<a href='/dashboard' style='color:#fff;text-decoration:none'>← Voltar</a>"
-"<h1>🚦 Poste #<span id=pos>?</span></h1>"
-"<div style='font-size:12px;margin-top:4px'>IP: <span id=ip>-.-.-.-</span></div>"
+"<a href='/dashboard' style='color:#c4b5fd;text-decoration:none;font-size:13px'>← Voltar</a>"
+"<h1>Poste #<span id=pos>?</span></h1>"
+"<div style='font-size:12px;margin-top:4px;color:#c4b5fd'>IP: <span id=ip>-.-.-.-</span></div>"
 "</div>"
-
 "<div class=card>"
-"<h3 style='margin-bottom:8px;color:#667eea'>📡 Estado</h3>"
 "<div class=metric><span>Modo</span><span class=val id=st>-</span></div>"
 "<div class=metric><span>T / Tc</span><span class=val><span id=T>0</span>/<span id=Tc>0</span></span></div>"
 "<div class=metric><span>Duty</span><span class=val id=duty>0%</span></div>"
 "<div class=metric><span>Papel</span><span class=val id=role>-</span></div>"
 "</div>"
-
-"<div class=card style='text-align:center'>"
-"<h3 style='margin-bottom:10px;color:#f39c12'>💡 Intensidade</h3>"
-"<div class=gauge>"
-"<svg viewBox='0 0 100 100' width=100 height=100>"
-"<circle cx=50 cy=50 r=40 fill=none stroke=#0f3460 stroke-width=8/>"
-"<circle id=circ cx=50 cy=50 r=40 fill=none stroke=#f39c12 stroke-width=8 stroke-dasharray=251 stroke-dashoffset=251/>"
-"</svg>"
-"<div class=gauge-txt id=gtxt>0%</div>"
-"</div>"
-"</div>"
-
 "<div class=card>"
-"<h3 style='margin-bottom:8px;color:#27ae60'>⏱️ Tempo (hoje)</h3>"
 "<div class=metric><span>SAVE (10%)</span><span class=val id=ts>0h</span></div>"
 "<div class=metric><span>MIN (50%)</span><span class=val id=tm>0h</span></div>"
 "<div class=metric><span>ON (100%)</span><span class=val id=to>0h</span></div>"
 "</div>"
-
 "<div class=card>"
-"<h3 style='margin-bottom:8px;color:#3498db'>⚡ Energia</h3>"
 "<div class=metric><span>Consumo</span><span class=val id=ekwh>0.0 kWh</span></div>"
-"<div class=metric><span>Poupança</span><span class=val id=esv style='color:#27ae60'>0%</span></div>"
+"<div class=metric><span>Poupança</span><span class=val id=esv>0%</span></div>"
 "</div>"
-
-"<div class=card>"
-"<h3 style='margin-bottom:8px;color:#9b59b6'>🔗 Vizinhos</h3>"
-"<div id=nb>-</div>"
-"</div>"
-
-"<button onclick=load()>🔄 Actualizar</button>"
-"<button onclick=\"location.href='/dashboard'\">🏠 Dashboard</button>"
-
+"<div class=card><div id=nb style='color:#9ca3af;font-size:13px'>-</div></div>"
+"<button onclick=load()>Actualizar</button>"
+"<button onclick=\"location.href='/dashboard'\">Dashboard</button>"
 "<script>"
-"const pos=location.hash.slice(1)||location.pathname.split('/').pop()||'0';"
-"const API='/api/poste/'+pos;"
-"function fmt(s){const h=Math.floor(s/3600);const m=Math.floor(s%3600/60);return h+'h'+m+'m'}"
+"const pos=location.pathname.split('/').pop()||'0';"
+"function fmt(s){return Math.floor(s/3600)+'h'+Math.floor(s%3600/60)+'m'}"
 "async function load(){"
-"try{"
-"const r=await fetch(API);"
-"const d=await r.json();"
-"document.getElementById('pos').textContent=d.position;"
-"document.getElementById('ip').textContent=d.ip;"
-"document.getElementById('st').textContent=d.state;"
-"document.getElementById('role').textContent=d.role;"
-"document.getElementById('T').textContent=d.T;"
-"document.getElementById('Tc').textContent=d.Tc;"
-"document.getElementById('duty').textContent=d.duty_cycle+'%';"
-"const circ=document.getElementById('circ');"
-"const off=251-(d.duty_cycle/100*251);"
-"circ.style.strokeDashoffset=off;"
-"document.getElementById('gtxt').textContent=d.duty_cycle+'%';"
-"const ts=d.time_stats;"
-"document.getElementById('ts').textContent=fmt(ts.save_seconds);"
-"document.getElementById('tm').textContent=fmt(ts.min_seconds);"
-"document.getElementById('to').textContent=fmt(ts.on_seconds);"
-"const e=d.energy;"
-"document.getElementById('ekwh').textContent=e.consumed_kwh.toFixed(2)+' kWh';"
-"document.getElementById('esv').textContent=e.saved_percent.toFixed(1)+'%';"
-"const nb=d.neighbors.map(n=>`#${n.position} ${n.ip} ${n.is_alive?'🟢':'🔴'}`).join('<br>');"
-"document.getElementById('nb').innerHTML=nb||'Nenhum';"
-"}catch(e){alert('Erro: '+e)}"
+  "try{"
+    "const d=await(await fetch('/api/poste/'+pos)).json();"
+    "document.getElementById('pos').textContent=d.position;"
+    "document.getElementById('ip').textContent=d.ip;"
+    "document.getElementById('st').textContent=d.state;"
+    "document.getElementById('role').textContent=d.role;"
+    "document.getElementById('T').textContent=d.T;"
+    "document.getElementById('Tc').textContent=d.Tc;"
+    "document.getElementById('duty').textContent=d.duty_cycle+'%';"
+    "const ts=d.time_stats;"
+    "document.getElementById('ts').textContent=fmt(ts.save_seconds);"
+    "document.getElementById('tm').textContent=fmt(ts.min_seconds);"
+    "document.getElementById('to').textContent=fmt(ts.on_seconds);"
+    "document.getElementById('ekwh').textContent=d.energy.consumed_kwh.toFixed(3)+' kWh';"
+    "document.getElementById('esv').textContent=d.energy.saved_percent.toFixed(1)+'%';"
+    "document.getElementById('nb').innerHTML=d.neighbors.length?"
+      "d.neighbors.map(n=>`${n.side==='left'?'Esq.':'Dir.'}: ${n.ip} ${n.is_alive?'●':''}`).join('<br>'):"
+      "'Sem vizinhos';"
+  "}catch(e){}"
 "}"
-"load();"
+"load();setInterval(load,5000);"
 "</script>"
 "</body>"
 "</html>";
 
-// ============================================================================
-// FUNÇÕES EXPORTADAS
-// ============================================================================
 
-const char* get_dashboard_html(void) {
-    return html_dashboard;
-}
-
-const char* get_poste_detail_html(void) {
-    return html_poste_detail;
-}
+/* ════════════════════════════════════════════════════════════
+   FUNÇÕES EXPORTADAS
+════════════════════════════════════════════════════════════ */
+const char *get_dashboard_html(void)    { return html_dashboard;    }
+const char *get_poste_detail_html(void) { return html_poste_detail; }

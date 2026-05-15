@@ -152,6 +152,54 @@ static esp_err_t handler_api_line(httpd_req_t *req) {
 }
 
 /**
+ * @brief Handler para GET /api/status
+ * Retorna JSON plano com estado actual do poste (tempo real)
+ */
+static esp_err_t handler_api_status(httpd_req_t *req) {
+    stats.total_requests++;
+
+    cJSON *json = web_data_get_status();
+    if (!json) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Erro");
+        stats.failed_requests++;
+        return ESP_FAIL;
+    }
+
+    char *js = cJSON_PrintUnformatted(json);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    httpd_resp_send(req, js, strlen(js));
+    free(js);
+    cJSON_Delete(json);
+    return ESP_OK;
+}
+
+/**
+ * @brief Handler para GET /api/night
+ * Retorna JSON com estatísticas horárias nocturnas (20h-7h)
+ */
+static esp_err_t handler_api_night(httpd_req_t *req) {
+    stats.total_requests++;
+
+    cJSON *json = web_data_get_night_stats();
+    if (!json) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Erro");
+        stats.failed_requests++;
+        return ESP_FAIL;
+    }
+
+    char *js = cJSON_PrintUnformatted(json);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    httpd_resp_send(req, js, strlen(js));
+    free(js);
+    cJSON_Delete(json);
+    return ESP_OK;
+}
+
+/**
  * @brief Handler para GET /api/poste/{position}
  * Retorna JSON com dados de um poste específico
  */
@@ -236,6 +284,20 @@ static const httpd_uri_t uri_api_poste = {
     .user_ctx  = NULL
 };
 
+static const httpd_uri_t uri_api_status = {
+    .uri       = "/api/status",
+    .method    = HTTP_GET,
+    .handler   = handler_api_status,
+    .user_ctx  = NULL
+};
+
+static const httpd_uri_t uri_api_night = {
+    .uri       = "/api/night",
+    .method    = HTTP_GET,
+    .handler   = handler_api_night,
+    .user_ctx  = NULL
+};
+
 // ============================================================================
 // IMPLEMENTAÇÃO DA API PÚBLICA
 // ============================================================================
@@ -250,9 +312,10 @@ esp_err_t web_manager_init(void) {
     
     // Configuração do servidor
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-    config.server_port = WEB_SERVER_PORT;
-    config.max_open_sockets = WEB_MAX_CONNECTIONS + 1; // +1 para margem
-    config.lru_purge_enable = true;
+    config.server_port       = WEB_SERVER_PORT;
+    config.max_open_sockets  = WEB_MAX_CONNECTIONS + 1;
+    config.max_uri_handlers  = 10;  /* 7 rotas + margem */
+    config.lru_purge_enable  = true;
     config.recv_wait_timeout = WEB_SOCKET_TIMEOUT_MS / 1000;
     config.send_wait_timeout = WEB_SOCKET_TIMEOUT_MS / 1000;
     
@@ -269,6 +332,8 @@ esp_err_t web_manager_init(void) {
     httpd_register_uri_handler(server, &uri_poste_detail);
     httpd_register_uri_handler(server, &uri_api_line);
     httpd_register_uri_handler(server, &uri_api_poste);
+    httpd_register_uri_handler(server, &uri_api_status);
+    httpd_register_uri_handler(server, &uri_api_night);
     
     // Guardar timestamp de arranque
     init_timestamp = esp_timer_get_time() / 1000000;
