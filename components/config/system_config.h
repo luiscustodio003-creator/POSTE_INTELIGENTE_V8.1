@@ -18,9 +18,9 @@
 
 
 /* ── Identidade do poste ──────────────────────────────────── */
-#define POSTE_ID              1
-#define POSTE_NAME            "POSTE 01"
-#define POST_POSITION         0
+#define POSTE_ID              3
+#define POSTE_NAME            "POSTE 03"
+#define POST_POSITION         2
 
 
 /* ── Display ──────────────────────────────────────────────── */
@@ -124,7 +124,7 @@
 /* ── Hardware do radar ────────────────────────────────────── */
 #define USE_RADAR             1
 #define NO_FRAME_LIMIT        20
-#define MAX_RADAR_TARGETS     3
+#define MAX_RADAR_TARGETS     100
 #define RADAR_MAX_OBJ         MAX_RADAR_TARGETS
 #define RADAR_TRAIL_MAX       8
 
@@ -202,6 +202,19 @@
 #define NIGHT_START_HOUR  20
 #define NIGHT_END_HOUR     7
 #define POSTE_TIMEZONE    "WET0WEST,M3.5.0/1,M10.5.0"
+
+
+/* ── Ajustes de laboratório ───────────────────────────────── */
+/* A sondagem de demoção WiFi (wifi_manager._try_demote_to_sta) pára
+   o Wi-Fi ~4s. Com NEIGHBOR_TIMEOUT_MS=3s (BALANCEADO) esse corte
+   dispara falsos OFFLINE → AUTONOMO_DELAY → promoção espúria de master.
+   Em lab, aumentamos os dois valores para absorver o corte de 4s.    */
+#if MODO_LABORATORIO && TIMEOUT_PROFILE == PROFILE_BALANCEADO
+  #undef  NEIGHBOR_TIMEOUT_MS
+  #define NEIGHBOR_TIMEOUT_MS   6000     /* > 4s do probe de demoção  */
+  #undef  AUTONOMO_DELAY_MS
+  #define AUTONOMO_DELAY_MS     8000ULL  /* NEIGHBOR_TIMEOUT(6s) + 2s */
+#endif
 
 
 /* ── Validação de timeouts em tempo de compilação ─────────── */

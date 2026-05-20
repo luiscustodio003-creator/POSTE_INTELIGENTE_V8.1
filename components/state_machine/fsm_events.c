@@ -76,12 +76,12 @@ void on_spd_received(float speed, uint32_t eta_ms, int16_t x_mm)
     if (eta_ms == 0 || eta_ms < fade_ms) {
         /* Sem margem para fade gradual — acender instantâneo ao atingir ETA. */
         g_fsm_acender_instantaneo = true;
-        g_fsm_acender_em_ms       = fsm_agora_ms() + eta_ms;
+        fsm_acender_em_ms_set(fsm_agora_ms() + eta_ms);
         ESP_LOGD(TAG, "[UDP] SPD | vel=%.0f ETA=%" PRIu32 "ms fade=%" PRIu32 "ms → INSTANTÂNEO",
                  speed, eta_ms, fade_ms);
     } else {
         g_fsm_acender_instantaneo = false;
-        g_fsm_acender_em_ms       = fsm_agora_ms() + eta_ms;
+        fsm_acender_em_ms_set(fsm_agora_ms() + eta_ms);
         ESP_LOGD(TAG, "[UDP] SPD | vel=%.0f ETA=%" PRIu32 "ms fade=%" PRIu32 "ms → FADE GRADUAL",
                  speed, eta_ms, fade_ms);
     }
@@ -132,7 +132,7 @@ void sm_on_right_neighbor_offline(void)
 {
     if (!g_fsm_right_online) return;
     g_fsm_right_online        = false;
-    g_fsm_acender_em_ms       = 0;
+    fsm_acender_em_ms_set(0);
     g_fsm_acender_instantaneo = false;
 
     if (g_fsm_Tc > 0) {
@@ -188,7 +188,7 @@ void sm_process_event(sm_event_type_t type, uint16_t vehicle_id,
             ESP_LOGI(TAG, "[LUZ ON] ID=%u | %.1f km/h | T=%d Tc=%d",
                     vehicle_id, vel, g_fsm_T + 1, g_fsm_Tc);
 
-            g_fsm_acender_em_ms       = 0;
+            fsm_acender_em_ms_set(0);
             g_fsm_acender_instantaneo = false;  /* carro físico presente — fade normal */
             g_fsm_apagar_pend         = false;
             g_fsm_last_speed     = vel;
@@ -232,7 +232,7 @@ void sm_process_event(sm_event_type_t type, uint16_t vehicle_id,
                     vehicle_id, g_fsm_T, g_fsm_Tc, g_fsm_enviados_dir);
 
             g_fsm_last_detect_ms = fsm_agora_ms();
-            g_fsm_acender_em_ms  = 0;
+            fsm_acender_em_ms_set(0);
 
             if (vehicle_id == g_fsm_tc_last_vehicle_id) {
                 g_fsm_tc_last_vehicle_id = 0;

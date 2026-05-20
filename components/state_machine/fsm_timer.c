@@ -30,8 +30,9 @@ static void _passo5_verificar_t_estagnado(uint64_t agora)
 /* ── Passo 6: Pré-acendimento por ETA ─────────────────────── */
 static void _passo6_processar_eta(uint64_t agora)
 {
-    if (g_fsm_acender_em_ms > 0 && agora >= g_fsm_acender_em_ms) {
-        g_fsm_acender_em_ms = 0;
+    uint64_t acender_em = fsm_acender_em_ms_get();
+    if (acender_em > 0 && agora >= acender_em) {
+        fsm_acender_em_ms_set(0);
 
         if (g_fsm_Tc > 0) {
             if (g_fsm_state == STATE_IDLE   ||

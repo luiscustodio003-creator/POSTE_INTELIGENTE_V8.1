@@ -10,12 +10,11 @@
 #include "fsm_timer.h"
 #include "fsm_network.h"
 #include "comm_manager.h"
-#include "radar_manager.h"
 #include "system_config.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
-#include "freertos/semphr.h"
+#include "freertos/portmacro.h"
 
 static const char *TAG = "FSM_CORE";
 
@@ -35,10 +34,29 @@ uint64_t g_fsm_last_detect_ms    = 0;
 uint64_t g_fsm_left_offline_ms   = 0;
 uint64_t g_fsm_tc_timeout_ms     = 0;
 bool     g_fsm_left_was_offline  = false;
-uint64_t g_fsm_acender_em_ms     = 0;
 uint64_t g_fsm_master_claim_ms   = 0;
 uint64_t g_fsm_sem_vizinho_ms    = 0;
 uint64_t g_fsm_obstaculo_last_ms = 0;
+
+/* g_fsm_acender_em_ms: escrito de Core 0 (UDP task) e lido de Core 1 (FSM task).
+   uint64_t não é atómico em Xtensa LX6 (32-bit) — protegido por spinlock. */
+static portMUX_TYPE   s_acender_mux  = portMUX_INITIALIZER_UNLOCKED;
+static uint64_t       s_acender_em_ms = 0;
+
+uint64_t fsm_acender_em_ms_get(void)
+{
+    portENTER_CRITICAL(&s_acender_mux);
+    uint64_t v = s_acender_em_ms;
+    portEXIT_CRITICAL(&s_acender_mux);
+    return v;
+}
+
+void fsm_acender_em_ms_set(uint64_t v)
+{
+    portENTER_CRITICAL(&s_acender_mux);
+    s_acender_em_ms = v;
+    portEXIT_CRITICAL(&s_acender_mux);
+}
 
 /* ID do último veículo que gerou TC_INC — evita duplicados por re-entrada. */
 uint16_t g_fsm_tc_last_vehicle_id = 0;
@@ -57,7 +75,7 @@ void fsm_agendar_apagar(void)
 {
     g_fsm_apagar_pend    = true;
     g_fsm_last_detect_ms = fsm_agora_ms();
-    g_fsm_acender_em_ms  = 0;
+    fsm_acender_em_ms_set(0);
 }
 
 void fsm_obstaculo_keepalive(void)
@@ -69,21 +87,21 @@ void fsm_obstaculo_keepalive(void)
 
 
 /* ── fsm_verificar_radar ──────────────────────────────────────
-   Debounce bidirecional: exige N frames consecutivos para mudar estado. */
+   Debounce bidirecional: exige N frames consecutivos para mudar estado.
+   teve_frame: true se tracking_manager recebeu frame válido neste ciclo.
+   RADAR_FAIL_COUNT=80 ciclos × 100ms = 8s antes de SAFE MODE. */
 void fsm_verificar_radar(bool teve_frame, bool comm_ok)
 {
     (void)comm_ok;
 
-    bool uart_ok = radar_is_connected();
-
-    if (!uart_ok) {
+    if (!teve_frame) {
         g_fsm_radar_ok_cnt = 0;
         g_fsm_radar_fail_cnt++;
 
-        if (g_fsm_radar_fail_cnt >= RADAR_FAIL_COUNT &&
-            g_fsm_radar_ok) {
+        if (g_fsm_radar_fail_cnt >= RADAR_FAIL_COUNT && g_fsm_radar_ok) {
             g_fsm_radar_ok = false;
-            ESP_LOGW(TAG, "[RADAR] Falha detectada — SAFE MODE activado.");
+            ESP_LOGW(TAG, "[RADAR] %d ciclos sem frame — SAFE MODE activado.",
+                     RADAR_FAIL_COUNT);
             if (g_fsm_state != STATE_OBSTACULO)
                 g_fsm_state = STATE_SAFE_MODE;
         }
@@ -96,15 +114,13 @@ void fsm_verificar_radar(bool teve_frame, bool comm_ok)
             if (g_fsm_radar_ok_cnt >= RADAR_OK_COUNT) {
                 g_fsm_radar_ok     = true;
                 g_fsm_radar_ok_cnt = 0;
-                ESP_LOGI(TAG, "[RADAR] UART activa (%d frames OK) — saída de SAFE MODE.",
+                ESP_LOGI(TAG, "[RADAR] %d frames OK consecutivos — saída de SAFE MODE.",
                          RADAR_OK_COUNT);
                 if (g_fsm_state == STATE_SAFE_MODE)
                     g_fsm_state = STATE_IDLE;
             }
         }
     }
-
-    (void)teve_frame;
 }
 
 
@@ -122,7 +138,7 @@ void state_machine_init(void)
     g_fsm_radar_fail_cnt       = 0;
     g_fsm_radar_ok_cnt         = 0;
     g_fsm_right_online         = true;
-    g_fsm_acender_em_ms        = 0;
+    fsm_acender_em_ms_set(0);
     g_fsm_acender_instantaneo  = false;
     g_fsm_master_claim_ms      = 0;
     g_fsm_sem_vizinho_ms       = 0;

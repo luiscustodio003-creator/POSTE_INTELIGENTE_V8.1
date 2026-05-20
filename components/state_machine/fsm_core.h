@@ -24,10 +24,14 @@ extern uint64_t  g_fsm_last_detect_ms;
 extern uint64_t  g_fsm_left_offline_ms;
 extern uint64_t  g_fsm_tc_timeout_ms;
 extern bool      g_fsm_left_was_offline;
-extern uint64_t  g_fsm_acender_em_ms;
 extern uint64_t  g_fsm_master_claim_ms;
 extern uint64_t  g_fsm_sem_vizinho_ms;
 extern uint64_t  g_fsm_obstaculo_last_ms;
+
+/* g_fsm_acender_em_ms é privado — aceder exclusivamente via accessors.
+   Spinlock interno protege escrita de Core 0 vs leitura de Core 1. */
+uint64_t fsm_acender_em_ms_get(void);
+void     fsm_acender_em_ms_set(uint64_t v);
 
 /* ID do último veículo que gerou TC_INC — guarda contra TC_INC duplicado. */
 extern uint16_t g_fsm_tc_last_vehicle_id;
