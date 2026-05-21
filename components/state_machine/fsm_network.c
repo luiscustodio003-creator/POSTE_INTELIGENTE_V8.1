@@ -168,7 +168,11 @@ void fsm_network_estados_degradados(bool comm_ok, bool is_master)
        Os vizinhos vêem este poste como OFFLINE → linha divide-se correctamente
        em dois clusters independentes. Pi+1 promove a MASTER por não ter vizinho esq. */
     if (!g_fsm_radar_ok) {
-        if (g_fsm_state != STATE_SAFE_MODE) {
+        /* OBSTACULO tem prioridade — manter até ser resolvido pelo fsm_timer.
+           Quando OBSTACULO for limpo (fsm_timer.c), o próximo ciclo entra aqui
+           com o novo estado e transita para SAFE_MODE. */
+        if (g_fsm_state != STATE_SAFE_MODE &&
+            g_fsm_state != STATE_OBSTACULO) {
             g_fsm_state = STATE_SAFE_MODE;
             ESP_LOGW(TAG, "[REDE] → SAFE_MODE (radar offline → WiFi off)");
 

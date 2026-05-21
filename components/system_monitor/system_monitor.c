@@ -117,6 +117,29 @@ static void _supervisao(uint64_t agora)
 }
 
 
+/* ── _watermark_check — stack headroom a cada ~30s ───────────
+   Emite WARN se < 256 words livres, LOGE se < 64 words.
+   xTaskGetHandle exige INCLUDE_xTaskGetHandle=1 (activado por defeito no ESP-IDF v5). */
+static void _watermark_check(void)
+{
+    static const char *const task_names[] = {
+        "fsm_task", "radar_task", "display_task", "udp_task", "monitor_task"
+    };
+    for (int i = 0; i < (int)(sizeof(task_names) / sizeof(task_names[0])); i++) {
+        TaskHandle_t h = xTaskGetHandle(task_names[i]);
+        if (!h) continue;
+        UBaseType_t wm = uxTaskGetStackHighWaterMark(h);
+        if (wm < 64)
+            ESP_LOGE(TAG, "[STK] %s: %u words — STACK OVERFLOW iminente!",
+                     task_names[i], (unsigned)wm);
+        else if (wm < 256)
+            ESP_LOGW(TAG, "[STK] %s: %u words livres — margem baixa",
+                     task_names[i], (unsigned)wm);
+        else
+            ESP_LOGD(TAG, "[STK] %s: %u words livres", task_names[i], (unsigned)wm);
+    }
+}
+
 static void _monitor_task(void *arg)
 {
     ESP_LOGI(TAG, "monitor_task | Core %d | Prio 7", xPortGetCoreID());
@@ -124,6 +147,8 @@ static void _monitor_task(void *arg)
 
     uint64_t agora = (uint64_t)(esp_timer_get_time() / 1000ULL);
     for (int i = 0; i < MOD_COUNT; i++) s_hb_ms[i] = agora;
+
+    uint32_t watermark_counter = 0;
 
     while (1) {
         esp_task_wdt_reset();
@@ -137,6 +162,11 @@ static void _monitor_task(void *arg)
             else if (delta > (uint64_t)s_timeout_ms[i])
                 ESP_LOGW(TAG, "[WDT] %s sem heartbeat %llums",
                          s_nome[i], (unsigned long long)delta);
+        }
+
+        if (++watermark_counter >= 150) {   /* 150 × 200ms = 30s */
+            watermark_counter = 0;
+            _watermark_check();
         }
 
         wifi_manager_tick();

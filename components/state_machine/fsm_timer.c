@@ -99,8 +99,9 @@ static void _passo8_limpeza_obstaculo(uint64_t agora, bool is_master)
    NÃO toca em T — veículo está na estrada, não desapareceu. */
 static void _passo9_timeout_seguranca_tc(uint64_t agora)
 {
-    if (g_fsm_tc_timeout_ms == 0) return;
-    if (agora <= g_fsm_tc_timeout_ms) return;
+    uint64_t tc_deadline = fsm_tc_timeout_ms_get();
+    if (tc_deadline == 0) return;
+    if (agora <= tc_deadline) return;
 
     bool algo_resetado = false;
 
@@ -119,7 +120,7 @@ static void _passo9_timeout_seguranca_tc(uint64_t agora)
     }
 
     if (algo_resetado) {
-        g_fsm_tc_timeout_ms = 0;
+        fsm_tc_timeout_ms_set(0);
         ESP_LOGI(TAG, "[TMR] Após limpeza UDP: T=%d Tc=%d env_dir=%d",
                  g_fsm_T, g_fsm_Tc, g_fsm_enviados_dir);
     }

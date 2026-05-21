@@ -23,7 +23,7 @@ void on_tc_inc_received(float speed, int16_t x_mm)
     g_fsm_apagar_pend    = false;
     g_fsm_last_speed     = speed;
     g_fsm_last_detect_ms = fsm_agora_ms();
-    g_fsm_tc_timeout_ms  = fsm_agora_ms() + TC_TIMEOUT_MS;
+    fsm_tc_timeout_ms_set(fsm_agora_ms() + TC_TIMEOUT_MS);
 
     if (g_fsm_Tc < MAX_RADAR_TARGETS) {
         g_fsm_Tc++;
@@ -48,7 +48,7 @@ void on_prev_passed_received(float speed)
     if (g_fsm_T > 0)            g_fsm_T--;
 
     if (g_fsm_enviados_dir == 0) {
-        g_fsm_tc_timeout_ms = 0;
+        fsm_tc_timeout_ms_set(0);
     }
 
     ESP_LOGI(TAG, "[UDP] PASSED confirmado | T=%d Tc=%d env_dir=%d",
@@ -113,9 +113,9 @@ void on_obstaculo_received(uint16_t vehicle_id, float speed, int16_t x_mm)
     g_fsm_last_speed     = speed;
     g_fsm_last_detect_ms = fsm_agora_ms();
 
-    if (g_fsm_tc_timeout_ms > 0) {
+    if (fsm_tc_timeout_ms_get() > 0) {
         ESP_LOGW(TAG, "  TC_TIMEOUT cancelado (veículo parado em A)");
-        g_fsm_tc_timeout_ms = 0;
+        fsm_tc_timeout_ms_set(0);
     } else {
         ESP_LOGD(TAG, "  TC_TIMEOUT já estava inactivo");
     }
@@ -216,7 +216,7 @@ void sm_process_event(sm_event_type_t type, uint16_t vehicle_id,
                     comm_send_spd(vel, x_mm);
                     g_fsm_enviados_dir++;
                     g_fsm_tc_last_vehicle_id = vehicle_id;
-                    g_fsm_tc_timeout_ms      = fsm_agora_ms() + TC_TIMEOUT_MS;
+                    fsm_tc_timeout_ms_set(fsm_agora_ms() + TC_TIMEOUT_MS);
                     ESP_LOGI(TAG, "[T/Tc] TC_INC → B | ID=%u env_dir=%d",
                             vehicle_id, g_fsm_enviados_dir);
                 } else {
@@ -285,7 +285,7 @@ void sm_process_event(sm_event_type_t type, uint16_t vehicle_id,
                 if (is_new_vehicle || g_fsm_enviados_dir == 0) {
                     comm_send_tc_inc(vel, x_mm);
                     g_fsm_enviados_dir++;
-                    g_fsm_tc_timeout_ms = fsm_agora_ms() + TC_TIMEOUT_MS;
+                    fsm_tc_timeout_ms_set(fsm_agora_ms() + TC_TIMEOUT_MS);
                     ESP_LOGW(TAG, "  TC_INC enviado → B (env_dir=%d)", g_fsm_enviados_dir);
 
                     comm_send_obstaculo(vehicle_id, vel, x_mm);

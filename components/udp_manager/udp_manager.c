@@ -415,6 +415,7 @@ bool udp_manager_init(void)
 
     memset(s_vizinhos, 0, sizeof(s_vizinhos));
     memset(&s_stats,   0, sizeof(s_stats));
+    s_ultimo_disc = 0;  /* força DISCOVER imediato na próxima iteração do task */
 
     ESP_LOGI(TAG, "UDP socket OK | Porto %d", UDP_PORT);
     return true;

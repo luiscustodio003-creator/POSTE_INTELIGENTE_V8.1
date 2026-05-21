@@ -32,16 +32,18 @@ bool           g_fsm_right_online   = true;
 
 uint64_t g_fsm_last_detect_ms    = 0;
 uint64_t g_fsm_left_offline_ms   = 0;
-uint64_t g_fsm_tc_timeout_ms     = 0;
 bool     g_fsm_left_was_offline  = false;
 uint64_t g_fsm_master_claim_ms   = 0;
 uint64_t g_fsm_sem_vizinho_ms    = 0;
 uint64_t g_fsm_obstaculo_last_ms = 0;
 
-/* g_fsm_acender_em_ms: escrito de Core 0 (UDP task) e lido de Core 1 (FSM task).
-   uint64_t não é atómico em Xtensa LX6 (32-bit) — protegido por spinlock. */
-static portMUX_TYPE   s_acender_mux  = portMUX_INITIALIZER_UNLOCKED;
+/* g_fsm_acender_em_ms e g_fsm_tc_timeout_ms: escritos de Core 0 (UDP task) e
+   lidos de Core 1 (FSM task). uint64_t não é atómico em Xtensa LX6 (32-bit). */
+static portMUX_TYPE   s_acender_mux   = portMUX_INITIALIZER_UNLOCKED;
 static uint64_t       s_acender_em_ms = 0;
+
+static portMUX_TYPE   s_tc_mux         = portMUX_INITIALIZER_UNLOCKED;
+static uint64_t       s_tc_timeout_ms  = 0;
 
 uint64_t fsm_acender_em_ms_get(void)
 {
@@ -56,6 +58,21 @@ void fsm_acender_em_ms_set(uint64_t v)
     portENTER_CRITICAL(&s_acender_mux);
     s_acender_em_ms = v;
     portEXIT_CRITICAL(&s_acender_mux);
+}
+
+uint64_t fsm_tc_timeout_ms_get(void)
+{
+    portENTER_CRITICAL(&s_tc_mux);
+    uint64_t v = s_tc_timeout_ms;
+    portEXIT_CRITICAL(&s_tc_mux);
+    return v;
+}
+
+void fsm_tc_timeout_ms_set(uint64_t v)
+{
+    portENTER_CRITICAL(&s_tc_mux);
+    s_tc_timeout_ms = v;
+    portEXIT_CRITICAL(&s_tc_mux);
 }
 
 /* ID do último veículo que gerou TC_INC — evita duplicados por re-entrada. */
@@ -102,8 +119,8 @@ void fsm_verificar_radar(bool teve_frame, bool comm_ok)
             g_fsm_radar_ok = false;
             ESP_LOGW(TAG, "[RADAR] %d ciclos sem frame — SAFE MODE activado.",
                      RADAR_FAIL_COUNT);
-            if (g_fsm_state != STATE_OBSTACULO)
-                g_fsm_state = STATE_SAFE_MODE;
+            /* Estado e WiFi geridos por fsm_network_estados_degradados no
+               mesmo ciclo — separação de responsabilidades. */
         }
 
     } else {
@@ -116,8 +133,8 @@ void fsm_verificar_radar(bool teve_frame, bool comm_ok)
                 g_fsm_radar_ok_cnt = 0;
                 ESP_LOGI(TAG, "[RADAR] %d frames OK consecutivos — saída de SAFE MODE.",
                          RADAR_OK_COUNT);
-                if (g_fsm_state == STATE_SAFE_MODE)
-                    g_fsm_state = STATE_IDLE;
+                /* Estado e WiFi geridos por fsm_network_estados_degradados no
+                   mesmo ciclo — separação de responsabilidades. */
             }
         }
     }
@@ -139,13 +156,13 @@ void state_machine_init(void)
     g_fsm_radar_ok_cnt         = 0;
     g_fsm_right_online         = true;
     fsm_acender_em_ms_set(0);
+    fsm_tc_timeout_ms_set(0);
     g_fsm_acender_instantaneo  = false;
     g_fsm_master_claim_ms      = 0;
     g_fsm_sem_vizinho_ms       = 0;
     g_fsm_obstaculo_last_ms    = 0;
     g_fsm_left_was_offline     = false;
     g_fsm_left_offline_ms      = 0;
-    g_fsm_tc_timeout_ms        = 0;
     g_fsm_last_detect_ms       = 0;
 
     ESP_LOGI(TAG, "FSM Produção inicializada — Modo Hardware Real");
