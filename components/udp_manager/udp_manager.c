@@ -30,6 +30,21 @@ static neighbor_t  s_vizinhos[MAX_NEIGHBORS];
 static uint32_t    s_ultimo_disc = 0;
 static udp_stats_t s_stats       = {0};
 
+/* ── MASTER_CLAIM: anti-loop (TTL) e deduplicação ──────────── */
+#define MASTER_CLAIM_MAX_HOPS  20u
+
+/* Valores do último MASTER_CLAIM recebido — usados pelo relay em fsm_network.c. */
+static uint16_t s_relay_seq            = 0;
+static uint8_t  s_relay_hop            = 0;
+
+/* Contador de sequence number para claims originados neste poste. */
+static uint16_t s_claim_seq_local      = 0;
+
+/* Tabela de deduplicação: último seq processado por master_id (índice 0-255).
+   Evita falsos positivos quando dois masters diferentes usam o mesmo seq.
+   512 bytes de RAM — aceitável para ESP32. */
+static uint16_t s_last_seq_por_master[256] = {0};
+
 
 /* ============================================================
    UTILITÁRIOS INTERNOS
@@ -288,18 +303,46 @@ static void _processar_mensagem(const char *msg, const char *ip)
            → relay completo com ID do MASTER real preservado
     ─────────────────────────────────────────────────────────── */
     if (strncmp(msg, "MASTER_CLAIM:", 13) == 0) {
-        int from_id   = 0;
-        int master_id = 0;
+        int      from_id   = 0;
+        int      master_id = 0;
+        unsigned seq       = 0;
+        unsigned hop       = 0;
 
-        int n = sscanf(msg + 13, "%d:%d", &from_id, &master_id);
-        if (n < 2) master_id = from_id;
+        int n = sscanf(msg + 13, "%d:%d:%u:%u", &from_id, &master_id, &seq, &hop);
+        if (n < 2) { master_id = from_id; }
+        /* seq e hop ficam em 0 se ausentes — compatibilidade com formato v5.1/v5.2 */
 
         if (from_id == POSTE_ID) return;
+
+        /* TTL: bloqueia mensagem se hop count exceder o máximo.
+           Protege contra broadcast storm em topologias com loop físico. */
+        if (hop >= MASTER_CLAIM_MAX_HOPS) {
+            ESP_LOGE(TAG, "[RX] MASTER_CLAIM hop=%u >= %u — loop detectado, descartado",
+                     hop, MASTER_CLAIM_MAX_HOPS);
+            return;
+        }
+
+        /* Deduplicação por (master_id, seq): descarta cópias do mesmo claim.
+           Rastreia por master_id para evitar falsos positivos entre masters diferentes.
+           seq=0 indica formato legacy — sem deduplicação para compatibilidade. */
+        if (seq != 0u && (unsigned)master_id < 256u) {
+            if (seq == (unsigned)s_last_seq_por_master[master_id]) {
+                ESP_LOGD(TAG, "[RX] MASTER_CLAIM master=%d seq=%u duplicado — descartado",
+                         master_id, seq);
+                return;
+            }
+            s_last_seq_por_master[master_id] = (uint16_t)seq;
+        }
+
+        /* Guarda seq e hop+1 para o relay em fsm_network_master_claim_relay(). */
+        s_relay_seq = (uint16_t)seq;
+        s_relay_hop = (uint8_t)((hop + 1u < MASTER_CLAIM_MAX_HOPS) ? hop + 1u : MASTER_CLAIM_MAX_HOPS);
 
         neighbor_t *v = _encontrar_ou_criar_vizinho(ip, from_id, -1);
         if (v) v->last_seen = _agora_ms();
 
-        ESP_LOGI(TAG, "[RX] MASTER_CLAIM from=%d master=%d", from_id, master_id);
+        ESP_LOGI(TAG, "[RX] MASTER_CLAIM from=%d master=%d seq=%u hop=%u",
+                 from_id, master_id, seq, hop);
         on_master_claim_received_ext(from_id, master_id);
         return;
     }
@@ -487,20 +530,49 @@ bool udp_manager_send_status(const char *ip, neighbor_status_t status)
 
 bool udp_manager_send_master_claim(const char *ip)
 {
-    char msg[32];
-    snprintf(msg, sizeof(msg), "MASTER_CLAIM:%d", POSTE_ID);
-    return _enviar_para(ip, msg);
+    /* Alias para compatibilidade — usa o formato v5.3 com seq. */
+    return udp_manager_send_master_claim_id(ip, POSTE_ID);
 }
 
 bool udp_manager_send_master_claim_id(const char *ip, int master_id)
 {
-    char msg[40];
-    snprintf(msg, sizeof(msg), "MASTER_CLAIM:%d:%d", POSTE_ID, master_id);
-    bool ok = _enviar_para(ip, msg);
-    ESP_LOGD(TAG, "[TX] MASTER_CLAIM from=%d master=%d → %s",
-             POSTE_ID, master_id, ip);
+    /* Gera novo seq para claim original; salta 0 (reservado para formato legacy). */
+    if (++s_claim_seq_local == 0u) s_claim_seq_local = 1u;
+
+    char msg[56];
+    snprintf(msg, sizeof(msg), "MASTER_CLAIM:%d:%d:%u:0",
+             POSTE_ID, master_id, (unsigned)s_claim_seq_local);
+
+    /* Triple-send: melhora entrega no primeiro hop sem ACK explícito.
+       Com 5% de packet loss: P(todos perdidos) = 0.05³ ≈ 0.01%.
+       Deduplicação no receptor garante processamento único. */
+    bool ok = false;
+    for (int i = 0; i < 3; i++) ok |= _enviar_para(ip, msg);
+
+    ESP_LOGD(TAG, "[TX] MASTER_CLAIM from=%d master=%d seq=%u hop=0 x3 → %s",
+             POSTE_ID, master_id, (unsigned)s_claim_seq_local, ip);
     return ok;
 }
+
+bool udp_manager_send_master_claim_relay(const char *ip, int master_id,
+                                         uint16_t seq, uint8_t hop)
+{
+    char msg[56];
+    snprintf(msg, sizeof(msg), "MASTER_CLAIM:%d:%d:%u:%u",
+             POSTE_ID, master_id, (unsigned)seq, (unsigned)hop);
+
+    /* Triple-send no relay: cada nó amplifica fiabilidade da cadeia.
+       9 hops × 99.99% = 99.9% fim-a-fim (vs 63% sem retry). */
+    bool ok = false;
+    for (int i = 0; i < 3; i++) ok |= _enviar_para(ip, msg);
+
+    ESP_LOGD(TAG, "[TX] MASTER_CLAIM relay from=%d master=%d seq=%u hop=%u x3 → %s",
+             POSTE_ID, master_id, (unsigned)seq, (unsigned)hop, ip);
+    return ok;
+}
+
+uint16_t udp_manager_get_relay_seq(void) { return s_relay_seq; }
+uint8_t  udp_manager_get_relay_hop(void) { return s_relay_hop; }
 
 /* ============================================================
    udp_manager_send_obstaculo  (NOVO v5.3)

@@ -39,6 +39,14 @@ void comm_send_master_claim(void);
 void comm_send_master_claim_id(int master_id);
 
 /**
+ * @brief Relay de MASTER_CLAIM preservando seq e hop existentes (v3.3)
+ *
+ * Chamado por fsm_network_master_claim_relay() com os valores lidos via
+ * udp_manager_get_relay_seq/hop(). Envia triple-send internamente.
+ */
+void comm_send_master_claim_relay(int master_id, uint16_t seq, uint8_t hop);
+
+/**
  * @brief Envia notificação de obstáculo ao vizinho direito (NOVO v3.2)
  *
  * QUANDO USAR:

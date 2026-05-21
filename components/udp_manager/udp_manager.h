@@ -82,8 +82,21 @@ bool udp_manager_send_passed(const char *ip, float speed);
 bool udp_manager_send_spd(const char *ip, float speed,
                            uint32_t eta_ms, uint32_t dist_m, int16_t x_mm);
 bool udp_manager_send_status(const char *ip, neighbor_status_t status);
-bool udp_manager_send_master_claim(const char *ip);
-bool udp_manager_send_master_claim_id(const char *ip, int master_id);
+bool     udp_manager_send_master_claim(const char *ip);
+bool     udp_manager_send_master_claim_id(const char *ip, int master_id);
+
+/**
+ * @brief Relay de MASTER_CLAIM preservando seq e hop (v5.3)
+ *
+ * Chamado por comm_send_master_claim_relay() em fsm_network.c.
+ * Envia 3× com mesmo seq para melhorar entrega; o receptor deduplica.
+ */
+bool     udp_manager_send_master_claim_relay(const char *ip, int master_id,
+                                             uint16_t seq, uint8_t hop);
+
+/** @brief Seq e hop do último MASTER_CLAIM recebido — para uso no relay. */
+uint16_t udp_manager_get_relay_seq(void);
+uint8_t  udp_manager_get_relay_hop(void);
 
 /**
  * @brief Envia notificação de obstáculo ao vizinho direito (NOVO v5.3)

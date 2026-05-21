@@ -268,6 +268,23 @@ void comm_send_master_claim_id(int master_id)
 
 
 /* ============================================================
+   comm_send_master_claim_relay  (NOVO v3.3)
+   ──────────────────────────────────────────────────────────
+   Relay de MASTER_CLAIM preservando seq e hop vindos do receptor UDP.
+   Distingue-se de comm_send_master_claim_id() que origina um novo claim
+   com seq novo; esta função propaga um claim já existente na cadeia.
+============================================================ */
+void comm_send_master_claim_relay(int master_id, uint16_t seq, uint8_t hop)
+{
+    const char *ip = _ip_vizinho_direito_qualquer();
+    if (!ip) return;
+    udp_manager_send_master_claim_relay(ip, master_id, seq, hop);
+    ESP_LOGD(TAG, "MASTER_CLAIM relay(id=%d seq=%u hop=%u) → %s",
+             master_id, (unsigned)seq, (unsigned)hop, ip);
+}
+
+
+/* ============================================================
    comm_send_obstaculo  (NOVO v3.2)
    ──────────────────────────────────────────────────────────
    Envia notificação de obstáculo ao vizinho direito.

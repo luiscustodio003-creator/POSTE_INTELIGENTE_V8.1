@@ -10,6 +10,7 @@
 #include "fsm_core.h"
 #include "fsm_events.h"
 #include "comm_manager.h"
+#include "udp_manager.h"
 #include "system_config.h"
 #include "wifi_manager.h"
 #include "esp_log.h"
@@ -17,10 +18,11 @@
 
 static const char *TAG = "FSM_NET";
 
-static int      s_master_id_conhecido  = 0;
-static uint64_t s_master_claim_last_ms = 0;
-static bool     s_wifi_was_disabled    = false;
-static uint64_t s_master_isolado_ms    = 0;
+static int      s_master_id_conhecido    = 0;
+static uint64_t s_master_claim_last_ms   = 0;
+static bool     s_wifi_was_disabled      = false;
+static uint64_t s_master_isolado_ms      = 0;
+static uint64_t s_safe_recovery_since_ms = 0;  /* handshake SAFE_MODE recovery */
 
 
 /* ── fsm_network_master_claim_relay ──────────────────────────
@@ -45,8 +47,12 @@ void fsm_network_master_claim_relay(int from_id, int master_id)
     }
 
     if (comm_right_known()) {
-        comm_send_master_claim_id(master_id);
-        ESP_LOGD(TAG, "[MASTER_CLAIM] Relay → vizinho direito (master=%d)", master_id);
+        /* Preserva seq e hop+1 calculados pelo udp_manager no momento da recepção. */
+        uint16_t seq = udp_manager_get_relay_seq();
+        uint8_t  hop = udp_manager_get_relay_hop();
+        comm_send_master_claim_relay(master_id, seq, hop);
+        ESP_LOGD(TAG, "[MASTER_CLAIM] Relay → direito (master=%d seq=%u hop=%u)",
+                 master_id, (unsigned)seq, (unsigned)hop);
     }
 }
 
@@ -181,19 +187,44 @@ void fsm_network_estados_degradados(bool comm_ok, bool is_master)
                 s_wifi_was_disabled = true;
             }
         }
+        s_safe_recovery_since_ms = 0;  /* reset: nova entrada em SAFE_MODE */
         return;
     }
 
     if (g_fsm_state == STATE_SAFE_MODE && g_fsm_radar_ok) {
-        ESP_LOGI(TAG, "[REDE] Saída SAFE_MODE → radar recuperado");
-
+        /* Passo 1: Re-activar WiFi (executado uma única vez, guardado por s_wifi_was_disabled). */
         if (s_wifi_was_disabled) {
             wifi_manager_enable();
-            s_wifi_was_disabled = false;
+            s_wifi_was_disabled      = false;
+            s_safe_recovery_since_ms = fsm_agora_ms();
+            ESP_LOGI(TAG, "[SAFE] Radar OK — WiFi reactivado, aguarda topologia (max 5s)");
+            return;  /* Permanece em SAFE_MODE até handshake concluir */
         }
 
-        g_fsm_state = STATE_IDLE;
-        ESP_LOGI(TAG, "[REDE] Estado: IDLE (aguarda discovery de vizinhos)");
+        /* Passo 2: Aguarda confirmação de topologia ou timeout de 5 segundos.
+           Propósito: evitar split-brain — se um MASTER temporário já foi eleito
+           durante o SAFE_MODE, um heartbeat recente em s_master_claim_last_ms
+           confirma quem é o master. Assim este poste cede imediatamente em vez
+           de competir durante o período de descoberta de vizinhos. */
+        uint64_t agora_rec = fsm_agora_ms();
+
+        bool topologia_ok = (s_master_claim_last_ms > 0 &&
+                             (agora_rec - s_master_claim_last_ms) <
+                             (uint64_t)MASTER_CLAIM_TIMEOUT_MS);
+
+        bool timeout = (s_safe_recovery_since_ms > 0 &&
+                        (agora_rec - s_safe_recovery_since_ms) > 5000ULL);
+
+        /* P0 é master permanente — não precisa de esperar heartbeat externo. */
+        if (topologia_ok || timeout || POST_POSITION == 0) {
+            s_safe_recovery_since_ms = 0;
+            bool vai_ser_master = (POST_POSITION == 0) || comm_is_master();
+            g_fsm_state = vai_ser_master ? STATE_MASTER : STATE_IDLE;
+            ESP_LOGI(TAG, "[SAFE] → %s (%s)",
+                     state_machine_get_state_name(),
+                     topologia_ok      ? "topologia confirmada" :
+                     (POST_POSITION == 0) ? "master permanente"  : "timeout handshake");
+        }
         return;
     }
 
