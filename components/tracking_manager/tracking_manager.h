@@ -76,8 +76,12 @@
 /* Janela de média móvel para suavização de velocidade */
 #define TRK_SPEED_WINDOW        5
 
-/* Máximo de veículos rastreados simultaneamente */
-#define TRK_MAX_VEHICLES        MAX_RADAR_TARGETS
+/* Máximo de slots de tracking simultâneos.
+   HLK-LD2450 reporta max 3 targets/frame. 8 slots cobrem os 3 activos
+   mais slots em COASTING/EXITED ainda não libertados.
+   NÃO usar MAX_RADAR_TARGETS aqui — isso causaria arrays de 5200B na
+   stack da fsm_task (6144B total) → stack overflow após ~3 ciclos. */
+#define TRK_MAX_VEHICLES        8
 
 
 

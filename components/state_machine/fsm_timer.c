@@ -95,8 +95,9 @@ static void _passo8_limpeza_obstaculo(uint64_t agora, bool is_master)
 
 
 /* ── Passo 9: Timeout de segurança UDP ────────────────────────
-   Limpa env_dir e Tc quando UDP perdido após todos os retries.
-   NÃO toca em T — veículo está na estrada, não desapareceu. */
+   Limpa Tc, env_dir e T quando UDP perdido após todos os retries.
+   T é decrementado por env_dir: veículo saiu da zona local mas o
+   vizinho direito nunca confirmou (UDP perdido ou lab sem reach). */
 static void _passo9_timeout_seguranca_tc(uint64_t agora)
 {
     uint64_t tc_deadline = fsm_tc_timeout_ms_get();
@@ -113,7 +114,13 @@ static void _passo9_timeout_seguranca_tc(uint64_t agora)
     }
 
     if (g_fsm_enviados_dir > 0) {
-        ESP_LOGW(TAG, "[TMR] env_dir timeout — limpeza UDP (env_dir=%d) — T mantém-se=%d",
+        /* T é decrementado por env_dir: cada TC_INC enviado sem confirmação
+           corresponde a um veículo que saiu da zona local mas nunca chegou ao
+           vizinho direito (UDP perdido ou lab com mão que não viaja até Pi+1).
+           Sem este decremento, T fica positivo indefinidamente e a luz nunca apaga. */
+        if (g_fsm_T >= g_fsm_enviados_dir) g_fsm_T -= g_fsm_enviados_dir;
+        else                               g_fsm_T  = 0;
+        ESP_LOGW(TAG, "[TMR] env_dir timeout — UDP sem confirmação (env_dir=%d) → T=%d",
                  g_fsm_enviados_dir, g_fsm_T);
         g_fsm_enviados_dir = 0;
         algo_resetado = true;
@@ -123,6 +130,8 @@ static void _passo9_timeout_seguranca_tc(uint64_t agora)
         fsm_tc_timeout_ms_set(0);
         ESP_LOGI(TAG, "[TMR] Após limpeza UDP: T=%d Tc=%d env_dir=%d",
                  g_fsm_T, g_fsm_Tc, g_fsm_enviados_dir);
+        if (g_fsm_T == 0 && g_fsm_Tc == 0)
+            fsm_agendar_apagar();
     }
 }
 

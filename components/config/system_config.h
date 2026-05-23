@@ -173,15 +173,17 @@
 #define DETECTION_TIMEOUT_MS    1000
 #define MARGEM_ACENDER_MS        500
 
+/* TC_TIMEOUT_MS: tempo máximo de espera por confirmação UDP do vizinho direito.
+   Deve ser > OBSTACULO_REMOVE_MS (8s) para não interferir com obstáculos activos. */
 #if MODO_LABORATORIO
-  #define TC_TIMEOUT_MS  60000ULL
+  #define TC_TIMEOUT_MS  12000ULL   /* 12s — aguarda chain reaction em bancada */
 #else
   #if TIMEOUT_PROFILE == PROFILE_CONSERVADOR
-    #define TC_TIMEOUT_MS  (TRAFIC_TIMEOUT_MS * 2)
+    #define TC_TIMEOUT_MS  (TRAFIC_TIMEOUT_MS * 2)   /* 10s */
   #elif TIMEOUT_PROFILE == PROFILE_BALANCEADO
-    #define TC_TIMEOUT_MS  8000ULL
+    #define TC_TIMEOUT_MS  12000ULL  /* 12s > OBSTACULO_REMOVE_MS (8s) */
   #else
-    #define TC_TIMEOUT_MS  6000ULL
+    #define TC_TIMEOUT_MS  10000ULL  /* 10s */
   #endif
 #endif
 
@@ -230,6 +232,10 @@
 
 #if !MODO_LABORATORIO && TC_TIMEOUT_MS < 5000ULL
   #warning "TC_TIMEOUT_MS muito curto para veículos reais!"
+#endif
+
+#if TC_TIMEOUT_MS <= OBSTACULO_REMOVE_MS
+  #error "TC_TIMEOUT_MS deve ser > OBSTACULO_REMOVE_MS (8000ms) para nao interferir com obstaculos activos"
 #endif
 
 /* Anti-colisão AP: garante que P(n) encontra AP de P(n-1) antes de se promover.
