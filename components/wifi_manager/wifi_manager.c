@@ -395,6 +395,12 @@ void wifi_manager_disable(void)
 
     ESP_LOGW(TAG, "DESLIGANDO WiFi (SAFE MODE)");
 
+    /* Se demoção estava em curso (modo APSTA activo), repõe AP antes de parar.
+       Garante que o próximo esp_wifi_start() (em enable()) arranca em modo AP
+       e não em APSTA, evitando conflito de DHCP com P0. */
+    if (s_demoting)
+        esp_wifi_set_mode(WIFI_MODE_AP);
+
     if (s_reconect_timer) esp_timer_stop(s_reconect_timer);
     esp_wifi_stop();
 
@@ -422,6 +428,11 @@ void wifi_manager_enable(void)
     }
 
     ESP_LOGI(TAG, "RELIGANDO WiFi (radar recuperado)");
+
+    /* Defesa em profundidade: garante modo AP antes de start,
+       caso disable() tenha sido chamado antes do reset de modo ocorrer. */
+    if (s_modo_ap)
+        esp_wifi_set_mode(WIFI_MODE_AP);
 
     esp_wifi_start();
     s_wifi_enabled = true;

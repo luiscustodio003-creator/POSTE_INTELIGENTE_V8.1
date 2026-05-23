@@ -421,7 +421,11 @@ void tracking_manager_clear_events(uint16_t vehicle_id)
 {
     if (!s_mutex) return;
 
+    /* Ambos os buffers limpos sob o mesmo mutex: evita race cross-core entre
+       esta função (Core 1 / FSM) e _copiar_para_publico (Core 0 / radar)
+       que lê s_slots enquanto copia para s_pub. */
     xSemaphoreTake(s_mutex, portMAX_DELAY);
+
     for (int i = 0; i < s_pub_count; i++) {
         if (s_pub[i].id == vehicle_id) {
             s_pub[i].event_detected_pending  = false;
@@ -432,7 +436,6 @@ void tracking_manager_clear_events(uint16_t vehicle_id)
             break;
         }
     }
-    xSemaphoreGive(s_mutex);
 
     for (int s = 0; s < TRK_MAX_VEHICLES; s++) {
         if (s_slots[s].occupied && s_slots[s].pub.id == vehicle_id) {
@@ -444,6 +447,8 @@ void tracking_manager_clear_events(uint16_t vehicle_id)
             break;
         }
     }
+
+    xSemaphoreGive(s_mutex);
 }
 
 
