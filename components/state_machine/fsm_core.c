@@ -37,6 +37,10 @@ uint64_t g_fsm_master_claim_ms   = 0;
 uint64_t g_fsm_sem_vizinho_ms    = 0;
 uint64_t g_fsm_obstaculo_last_ms = 0;
 
+/* g_fsm_counters_mux: partilhado por fsm_events.c e fsm_timer.c.
+   Protege ++ e -- sobre g_fsm_T, g_fsm_Tc, g_fsm_enviados_dir entre Core 0/1. */
+portMUX_TYPE g_fsm_counters_mux = portMUX_INITIALIZER_UNLOCKED;
+
 /* g_fsm_acender_em_ms e g_fsm_tc_timeout_ms: escritos de Core 0 (UDP task) e
    lidos de Core 1 (FSM task). uint64_t não é atómico em Xtensa LX6 (32-bit). */
 static portMUX_TYPE   s_acender_mux   = portMUX_INITIALIZER_UNLOCKED;

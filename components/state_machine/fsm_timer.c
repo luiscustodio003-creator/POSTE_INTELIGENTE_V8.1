@@ -11,6 +11,8 @@
 #include "comm_manager.h"
 #include "system_config.h"
 #include "esp_log.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/portmacro.h"
 
 static const char *TAG = "FSM_TMR";
 
@@ -20,7 +22,9 @@ static void _passo5_verificar_t_estagnado(uint64_t agora)
 {
     if (g_fsm_left_was_offline && g_fsm_T > 0) {
         if ((agora - g_fsm_left_offline_ms) > T_STUCK_TIMEOUT_MS) {
+            portENTER_CRITICAL(&g_fsm_counters_mux);
             g_fsm_T = 0;
+            portEXIT_CRITICAL(&g_fsm_counters_mux);
             ESP_LOGW(TAG, "T resetado: vizinho esquerdo offline há muito tempo.");
         }
     }
@@ -82,9 +86,12 @@ static void _passo8_limpeza_obstaculo(uint64_t agora, bool is_master)
         ESP_LOGI(TAG, "[OBSTÁCULO] Removido — sem detecção há %llums",
                  (unsigned long long)OBSTACULO_REMOVE_MS);
 
+        portENTER_CRITICAL(&g_fsm_counters_mux);
         if (g_fsm_T > 0) g_fsm_T--;
+        bool obs_all_clear = (g_fsm_T == 0 && g_fsm_Tc == 0);
+        portEXIT_CRITICAL(&g_fsm_counters_mux);
 
-        if (g_fsm_T == 0 && g_fsm_Tc == 0) {
+        if (obs_all_clear) {
             fsm_agendar_apagar();
         } else {
             g_fsm_state = STATE_LIGHT_ON;
@@ -104,33 +111,34 @@ static void _passo9_timeout_seguranca_tc(uint64_t agora)
     if (tc_deadline == 0) return;
     if (agora <= tc_deadline) return;
 
-    bool algo_resetado = false;
-
-    if (g_fsm_Tc > 0) {
-        ESP_LOGW(TAG, "[TMR] Tc timeout — limpeza UDP (Tc=%d) — T mantém-se=%d",
-                 g_fsm_Tc, g_fsm_T);
-        g_fsm_Tc    = 0;
-        algo_resetado = true;
-    }
-
-    if (g_fsm_enviados_dir > 0) {
-        /* T é decrementado por env_dir: cada TC_INC enviado sem confirmação
-           corresponde a um veículo que saiu da zona local mas nunca chegou ao
-           vizinho direito (UDP perdido ou lab com mão que não viaja até Pi+1).
+    portENTER_CRITICAL(&g_fsm_counters_mux);
+    int  snap_tc  = g_fsm_Tc;
+    int  snap_env = g_fsm_enviados_dir;
+    if (snap_tc  > 0) g_fsm_Tc = 0;
+    if (snap_env > 0) {
+        /* T decrementado por env_dir: cada TC_INC sem confirmação corresponde a
+           um veículo que saiu da zona local sem confirmação UDP do vizinho direito.
            Sem este decremento, T fica positivo indefinidamente e a luz nunca apaga. */
-        if (g_fsm_T >= g_fsm_enviados_dir) g_fsm_T -= g_fsm_enviados_dir;
-        else                               g_fsm_T  = 0;
-        ESP_LOGW(TAG, "[TMR] env_dir timeout — UDP sem confirmação (env_dir=%d) → T=%d",
-                 g_fsm_enviados_dir, g_fsm_T);
+        if (g_fsm_T >= snap_env) g_fsm_T -= snap_env;
+        else                     g_fsm_T  = 0;
         g_fsm_enviados_dir = 0;
-        algo_resetado = true;
     }
+    bool tmr_all_clear = (g_fsm_T == 0 && g_fsm_Tc == 0);
+    portEXIT_CRITICAL(&g_fsm_counters_mux);
+
+    bool algo_resetado = (snap_tc > 0 || snap_env > 0);
+
+    if (snap_tc > 0)
+        ESP_LOGW(TAG, "[TMR] Tc timeout — limpeza UDP (Tc=%d) — T=%d", snap_tc, g_fsm_T);
+    if (snap_env > 0)
+        ESP_LOGW(TAG, "[TMR] env_dir timeout — UDP sem confirmação (env_dir=%d) → T=%d",
+                 snap_env, g_fsm_T);
 
     if (algo_resetado) {
         fsm_tc_timeout_ms_set(0);
         ESP_LOGI(TAG, "[TMR] Após limpeza UDP: T=%d Tc=%d env_dir=%d",
                  g_fsm_T, g_fsm_Tc, g_fsm_enviados_dir);
-        if (g_fsm_T == 0 && g_fsm_Tc == 0)
+        if (tmr_all_clear)
             fsm_agendar_apagar();
     }
 }

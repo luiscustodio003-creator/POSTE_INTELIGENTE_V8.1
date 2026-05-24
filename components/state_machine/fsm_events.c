@@ -12,6 +12,8 @@
 #include "comm_manager.h"
 #include "system_config.h"
 #include "esp_log.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/portmacro.h"
 
 static const char *TAG = "FSM_EVT";
 
@@ -25,12 +27,13 @@ void on_tc_inc_received(float speed, int16_t x_mm)
     g_fsm_last_detect_ms = fsm_agora_ms();
     fsm_tc_timeout_ms_set(fsm_agora_ms() + TC_TIMEOUT_MS);
 
-    if (g_fsm_Tc < MAX_RADAR_TARGETS) {
-        g_fsm_Tc++;
-    } else {
-        ESP_LOGW(TAG, "[UDP] TC_INC ignorado — Tc no máximo (%d)", g_fsm_Tc);
-    }
+    portENTER_CRITICAL(&g_fsm_counters_mux);
+    bool tc_overflow = (g_fsm_Tc >= MAX_RADAR_TARGETS);
+    if (!tc_overflow) g_fsm_Tc++;
+    portEXIT_CRITICAL(&g_fsm_counters_mux);
 
+    if (tc_overflow)
+        ESP_LOGW(TAG, "[UDP] TC_INC ignorado — Tc no máximo (%d)", g_fsm_Tc);
     ESP_LOGI(TAG, "[UDP] TC_INC | vel=%.0f | T=%d Tc=%d", speed, g_fsm_T, g_fsm_Tc);
 }
 
@@ -38,24 +41,27 @@ void on_prev_passed_received(float speed)
 {
     (void)speed;
 
-    if (g_fsm_enviados_dir == 0) {
+    portENTER_CRITICAL(&g_fsm_counters_mux);
+    bool tardio    = (g_fsm_enviados_dir == 0);
+    bool env_zero  = false;
+    bool all_clear = false;
+    if (!tardio) {
+        g_fsm_enviados_dir--;
+        if (g_fsm_T > 0) g_fsm_T--;
+        env_zero  = (g_fsm_enviados_dir == 0);
+        all_clear = (g_fsm_T == 0 && g_fsm_Tc == 0);
+    }
+    portEXIT_CRITICAL(&g_fsm_counters_mux);
+
+    if (tardio) {
         ESP_LOGW(TAG, "[UDP] PASSED tardio ignorado — timeout já actuou (T=%d Tc=%d)",
                  g_fsm_T, g_fsm_Tc);
         return;
     }
-
-    if (g_fsm_enviados_dir > 0) g_fsm_enviados_dir--;
-    if (g_fsm_T > 0)            g_fsm_T--;
-
-    if (g_fsm_enviados_dir == 0) {
-        fsm_tc_timeout_ms_set(0);
-    }
-
+    if (env_zero) fsm_tc_timeout_ms_set(0);
     ESP_LOGI(TAG, "[UDP] PASSED confirmado | T=%d Tc=%d env_dir=%d",
              g_fsm_T, g_fsm_Tc, g_fsm_enviados_dir);
-
-    if (g_fsm_T == 0 && g_fsm_Tc == 0)
-        fsm_agendar_apagar();
+    if (all_clear) fsm_agendar_apagar();
 }
 
 static uint32_t _fade_ms_para_velocidade(float vel_kmh)
@@ -135,14 +141,15 @@ void sm_on_right_neighbor_offline(void)
     fsm_acender_em_ms_set(0);
     g_fsm_acender_instantaneo = false;
 
-    if (g_fsm_Tc > 0) {
-        g_fsm_Tc = 0;
-        ESP_LOGW(TAG, "Vizinho dir. OFFLINE — Tc resetado");
-    }
-    if (g_fsm_enviados_dir > 0) {
-        g_fsm_enviados_dir = 0;
-        ESP_LOGW(TAG, "Vizinho dir. OFFLINE — env_dir resetado");
-    }
+    portENTER_CRITICAL(&g_fsm_counters_mux);
+    bool had_tc  = (g_fsm_Tc > 0);
+    bool had_env = (g_fsm_enviados_dir > 0);
+    g_fsm_Tc           = 0;
+    g_fsm_enviados_dir = 0;
+    portEXIT_CRITICAL(&g_fsm_counters_mux);
+
+    if (had_tc)  ESP_LOGW(TAG, "Vizinho dir. OFFLINE — Tc resetado");
+    if (had_env) ESP_LOGW(TAG, "Vizinho dir. OFFLINE — env_dir resetado");
     g_fsm_tc_last_vehicle_id = 0;
 
     fsm_agendar_apagar();
@@ -194,15 +201,18 @@ void sm_process_event(sm_event_type_t type, uint16_t vehicle_id,
             g_fsm_last_speed     = vel;
             g_fsm_last_detect_ms = fsm_agora_ms();
 
-            if (g_fsm_Tc > 0) {
-                g_fsm_Tc--;
+            portENTER_CRITICAL(&g_fsm_counters_mux);
+            bool local_tc_dec = (g_fsm_Tc > 0);
+            if (local_tc_dec) g_fsm_Tc--;
+            if (g_fsm_T < MAX_RADAR_TARGETS) g_fsm_T++;
+            portEXIT_CRITICAL(&g_fsm_counters_mux);
+
+            if (local_tc_dec) {
                 comm_notify_prev_passed(vel);
                 ESP_LOGI(TAG, "[T/Tc] ID=%u vindo da esq. — PASSED enviado", vehicle_id);
             } else {
                 ESP_LOGI(TAG, "[T/Tc] ID=%u local directo — sem PASSED", vehicle_id);
             }
-
-            if (g_fsm_T < MAX_RADAR_TARGETS) g_fsm_T++;
 
             if (g_fsm_state != STATE_LIGHT_ON &&
                 g_fsm_state != STATE_OBSTACULO) {
@@ -214,7 +224,9 @@ void sm_process_event(sm_event_type_t type, uint16_t vehicle_id,
                     g_fsm_enviados_dir == 0) {
                     comm_send_tc_inc(vel, x_mm);
                     comm_send_spd(vel, x_mm);
+                    portENTER_CRITICAL(&g_fsm_counters_mux);
                     g_fsm_enviados_dir++;
+                    portEXIT_CRITICAL(&g_fsm_counters_mux);
                     g_fsm_tc_last_vehicle_id = vehicle_id;
                     fsm_tc_timeout_ms_set(fsm_agora_ms() + TC_TIMEOUT_MS);
                     ESP_LOGI(TAG, "[T/Tc] TC_INC → B | ID=%u env_dir=%d",
@@ -241,10 +253,12 @@ void sm_process_event(sm_event_type_t type, uint16_t vehicle_id,
             if (g_fsm_right_online && g_fsm_enviados_dir > 0) {
                 comm_send_spd(vel, x_mm);
             } else {
+                portENTER_CRITICAL(&g_fsm_counters_mux);
                 if (g_fsm_T > 0) g_fsm_T--;
+                bool passed_all_clear = (g_fsm_T == 0 && g_fsm_Tc == 0);
+                portEXIT_CRITICAL(&g_fsm_counters_mux);
                 if (g_fsm_right_online) comm_send_spd(vel, x_mm);
-                if (g_fsm_T == 0 && g_fsm_Tc == 0)
-                    fsm_agendar_apagar();
+                if (passed_all_clear) fsm_agendar_apagar();
             }
             break;
 
@@ -263,18 +277,21 @@ void sm_process_event(sm_event_type_t type, uint16_t vehicle_id,
             g_fsm_last_detect_ms    = fsm_agora_ms();
 
             bool is_new_vehicle = (vehicle_id != g_fsm_tc_last_vehicle_id);
+
+            portENTER_CRITICAL(&g_fsm_counters_mux);
+            if (is_new_vehicle && g_fsm_T < MAX_RADAR_TARGETS) g_fsm_T++;
+            bool obs_tc_dec = (g_fsm_Tc > 0);
+            if (obs_tc_dec) g_fsm_Tc--;
+            portEXIT_CRITICAL(&g_fsm_counters_mux);
+
             if (is_new_vehicle) {
-                if (g_fsm_T < MAX_RADAR_TARGETS) {
-                    g_fsm_T++;
-                    ESP_LOGW(TAG, "  T++ → %d (veículo parado contado)", g_fsm_T);
-                }
                 g_fsm_tc_last_vehicle_id = vehicle_id;
+                ESP_LOGW(TAG, "  T++ → %d (veículo parado contado)", g_fsm_T);
             } else {
                 ESP_LOGD(TAG, "  T mantém-se (ID=%u já contado)", vehicle_id);
             }
 
-            if (g_fsm_Tc > 0) {
-                g_fsm_Tc--;
+            if (obs_tc_dec) {
                 comm_notify_prev_passed(vel);
                 ESP_LOGW(TAG, "  Tc-- → %d | PASSED enviado à esquerda", g_fsm_Tc);
             } else {
@@ -284,7 +301,9 @@ void sm_process_event(sm_event_type_t type, uint16_t vehicle_id,
             if (g_fsm_right_online) {
                 if (is_new_vehicle || g_fsm_enviados_dir == 0) {
                     comm_send_tc_inc(vel, x_mm);
+                    portENTER_CRITICAL(&g_fsm_counters_mux);
                     g_fsm_enviados_dir++;
+                    portEXIT_CRITICAL(&g_fsm_counters_mux);
                     fsm_tc_timeout_ms_set(fsm_agora_ms() + TC_TIMEOUT_MS);
                     ESP_LOGW(TAG, "  TC_INC enviado → B (env_dir=%d)", g_fsm_enviados_dir);
 

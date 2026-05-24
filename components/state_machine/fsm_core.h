@@ -1,4 +1,4 @@
-/* fsm_core.h — v1.3 | 2026-05-21 | Poste Inteligente v8
+/* fsm_core.h — v1.4 | 2026-05-24 | Poste Inteligente v8
    Variáveis de estado partilhadas entre sub-módulos da FSM. */
 
 #ifndef FSM_CORE_H
@@ -6,6 +6,8 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/portmacro.h"
 #include "state_machine.h"
 
 /* ── Variáveis de estado ──────────────────────────────────── */
@@ -26,6 +28,11 @@ extern bool      g_fsm_left_was_offline;
 extern uint64_t  g_fsm_master_claim_ms;
 extern uint64_t  g_fsm_sem_vizinho_ms;
 extern uint64_t  g_fsm_obstaculo_last_ms;
+
+/* g_fsm_counters_mux: protege RMW sobre g_fsm_T, g_fsm_Tc, g_fsm_enviados_dir.
+   Core 0 (UDP task) e Core 1 (FSM task) modificam estes contadores em simultâneo.
+   int é 32-bit (load/store atómico em LX6) mas ++ e -- são load+add+store — não atómicos. */
+extern portMUX_TYPE g_fsm_counters_mux;
 
 /* g_fsm_acender_em_ms e g_fsm_tc_timeout_ms são privados — aceder via accessors.
    Spinlocks internos protegem escritas de Core 0 (UDP) vs leituras de Core 1 (FSM).
