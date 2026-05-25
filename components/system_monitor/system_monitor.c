@@ -30,6 +30,7 @@ static const char *TAG = "SYS_MON";
 
 static uint64_t s_hb_ms[MOD_COUNT] = {0};
 static bool     s_comm_ok          = false;
+static bool     s_sntp_ok          = false;
 
 /* timestamps do supervisor de estados (0 = inactivo) */
 static uint64_t s_sup_autonomo_ms = 0;
@@ -173,11 +174,24 @@ static void _monitor_task(void *arg)
         _supervisao(agora);
 
         if (wifi_manager_is_connected()) {
+            if (!s_sntp_ok) {
+                setenv("TZ", POSTE_TIMEZONE, 1);
+                tzset();
+                esp_sntp_config_t sntp_cfg = ESP_NETIF_SNTP_DEFAULT_CONFIG("pool.ntp.org");
+                esp_netif_sntp_init(&sntp_cfg);
+                s_sntp_ok = true;
+                ESP_LOGI(TAG, "[MON] SNTP iniciado após reconexão WiFi | TZ=%s", POSTE_TIMEZONE);
+            }
             if (!s_comm_ok) {
                 if (comm_init()) {
                     s_comm_ok = true;
                     ESP_LOGI(TAG, "UDP activo");
                 }
+            }
+            if (!web_manager_is_running()) {
+                web_data_provider_init();
+                if (web_manager_init() == ESP_OK)
+                    ESP_LOGI(TAG, "[MON] Servidor web iniciado — http://%s/", wifi_manager_get_ip());
             }
         } else {
             if (s_comm_ok) {
@@ -272,6 +286,7 @@ void system_monitor_start(void)
         tzset();
         esp_sntp_config_t sntp_cfg = ESP_NETIF_SNTP_DEFAULT_CONFIG("pool.ntp.org");
         esp_netif_sntp_init(&sntp_cfg);
+        s_sntp_ok = true;
         ESP_LOGI(TAG, "SNTP iniciado | TZ=%s", POSTE_TIMEZONE);
 
         /* Inicializar agregador de dados */
@@ -327,5 +342,5 @@ void system_monitor_start(void)
     printf("╘═══════════════════════════════════════╛\n");
     printf("\n");
 
-    xTaskCreatePinnedToCore(_monitor_task, "monitor_task",3072, NULL, 7, NULL, 1);
+    xTaskCreatePinnedToCore(_monitor_task, "monitor_task", 4096, NULL, 7, NULL, 1);
 }

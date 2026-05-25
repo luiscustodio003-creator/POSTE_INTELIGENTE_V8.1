@@ -209,6 +209,12 @@ void tracking_manager_update(const radar_data_t *data)
             if (slot_associado[s])                         continue;
             if (s_slots[s].pub.state == TRK_STATE_EXITED) continue;
 
+            /* Speed gate: rejeita associação se diferença de velocidade excede
+               TRK_SPEED_GATE_KMH. Evita swap de tracks entre veículos com
+               posições próximas mas velocidades distintas (ex: ultrapassagem). */
+            float speed_diff = fabsf(s_slots[s].pub.speed_kmh - alvo->speed);
+            if (speed_diff > TRK_SPEED_GATE_KMH) continue;
+
             float d = _distancia_alvos(&s_slots[s], alvo);
             if (d < melhor_dist) {
                 melhor_dist = d;
@@ -317,8 +323,6 @@ void tracking_manager_update(const radar_data_t *data)
                 break;
 
             case TRK_STATE_CONFIRMED:
-                _verificar_obstaculo(sl);
-
                 if (sl->pub.speed_signed <= AFASTAR_THRESHOLD_KMH) {
                     sl->pub.state = TRK_STATE_APPROACHING;
                     sl->pub.event_approach_pending = true;

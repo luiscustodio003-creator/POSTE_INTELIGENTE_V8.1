@@ -25,7 +25,7 @@
      (Wi-Fi stack  prio 22-23 — gerido pelo ESP-IDF)
 
    Core 1 (APP_CPU):
-     monitor_task  prio 7  3072B  200ms  ← alimenta WDT
+     monitor_task  prio 7  4096B  200ms  ← alimenta WDT
      fsm_task      prio 6  6144B  100ms  ← controlo principal
 
    HARDWARE WATCHDOG:

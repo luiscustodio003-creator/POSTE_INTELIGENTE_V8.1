@@ -105,8 +105,12 @@ void on_master_claim_received(int from_id)
 
 
 /* ── on_obstaculo_received ────────────────────────────────────
-   Cancela TC_TIMEOUT quando vizinho esquerdo notifica obstáculo.
-   Sem este callback, B expirava Tc após 8s mesmo com veículo parado em A. */
+   Estende TC_TIMEOUT quando vizinho esquerdo notifica obstáculo.
+   Sem este callback, B expirava Tc prematuramente mesmo com veículo parado em A.
+   TC_TIMEOUT mantém-se activo (não é cancelado) para que, se o veículo
+   desaparecer sem chegar a B, o timer expire e limpe Tc correctamente.
+   O heartbeat periódico em fsm_timer._passo11b mantém o timeout renovado
+   enquanto o obstáculo persistir em A. */
 void on_obstaculo_received(uint16_t vehicle_id, float speed, int16_t x_mm)
 {
     ESP_LOGW(TAG, "═══════════════════════════════════════");
@@ -119,15 +123,16 @@ void on_obstaculo_received(uint16_t vehicle_id, float speed, int16_t x_mm)
     g_fsm_last_speed     = speed;
     g_fsm_last_detect_ms = fsm_agora_ms();
 
-    if (fsm_tc_timeout_ms_get() > 0) {
-        ESP_LOGW(TAG, "  TC_TIMEOUT cancelado (veículo parado em A)");
-        fsm_tc_timeout_ms_set(0);
-    } else {
-        ESP_LOGD(TAG, "  TC_TIMEOUT já estava inactivo");
-    }
+    /* Estende TC_TIMEOUT (não cancela) — se o veículo recuar/desaparecer sem chegar
+       a este poste, o timeout estendido limpa Tc após TC_TIMEOUT_MS.
+       Heartbeat periódico em fsm_timer.c mantém o timeout vivo enquanto o
+       obstáculo persistir no poste anterior. */
+    fsm_tc_timeout_ms_set(fsm_agora_ms() + TC_TIMEOUT_MS);
+    ESP_LOGW(TAG, "  TC_TIMEOUT estendido +%llus (veículo parado em A)",
+             (unsigned long long)(TC_TIMEOUT_MS / 1000ULL));
 
-    ESP_LOGW(TAG, "  Tc mantém-se=%d (aguarda PASSED quando sair)", g_fsm_Tc);
-    ESP_LOGW(TAG, "  Luz mantém ACESA até obstáculo sair");
+    ESP_LOGW(TAG, "  Tc mantém-se=%d (aguarda chegada ou TC_TIMEOUT)", g_fsm_Tc);
+    ESP_LOGW(TAG, "  Luz ACESA — apaga quando veículo chegar ou timeout expirar");
     ESP_LOGW(TAG, "═══════════════════════════════════════");
 }
 
@@ -142,14 +147,22 @@ void sm_on_right_neighbor_offline(void)
     g_fsm_acender_instantaneo = false;
 
     portENTER_CRITICAL(&g_fsm_counters_mux);
-    bool had_tc  = (g_fsm_Tc > 0);
-    bool had_env = (g_fsm_enviados_dir > 0);
+    bool had_tc   = (g_fsm_Tc > 0);
+    bool had_env  = (g_fsm_enviados_dir > 0);
+    int  snap_env = g_fsm_enviados_dir;
     g_fsm_Tc           = 0;
     g_fsm_enviados_dir = 0;
+    /* Decrementa T pelo nº de TC_INC sem confirmação: veículos que saíram da zona
+       local mas o vizinho direito não confirmou (PASSED nunca chegou).
+       Sem isto, _passo9 vê env_dir=0 e não decrementa T → luz acesa indefinidamente. */
+    if (had_env) {
+        if (g_fsm_T >= snap_env) g_fsm_T -= snap_env;
+        else                     g_fsm_T  = 0;
+    }
     portEXIT_CRITICAL(&g_fsm_counters_mux);
 
     if (had_tc)  ESP_LOGW(TAG, "Vizinho dir. OFFLINE — Tc resetado");
-    if (had_env) ESP_LOGW(TAG, "Vizinho dir. OFFLINE — env_dir resetado");
+    if (had_env) ESP_LOGW(TAG, "Vizinho dir. OFFLINE — env_dir resetado (T-=%d)", snap_env);
     g_fsm_tc_last_vehicle_id = 0;
 
     fsm_agendar_apagar();

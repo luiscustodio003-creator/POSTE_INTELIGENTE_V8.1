@@ -144,6 +144,53 @@ static void _passo9_timeout_seguranca_tc(uint64_t agora)
 }
 
 
+/* ── Passo 5b: T preso com vizinho direito offline ─────────── */
+static uint64_t s_right_offline_since_ms = 0;
+
+static void _passo5b_verificar_t_estagnado_dir(uint64_t agora)
+{
+    if (!g_fsm_right_online && g_fsm_T > 0) {
+        if (s_right_offline_since_ms == 0)
+            s_right_offline_since_ms = agora;
+        if ((agora - s_right_offline_since_ms) > T_STUCK_TIMEOUT_MS) {
+            portENTER_CRITICAL(&g_fsm_counters_mux);
+            g_fsm_T = 0;
+            portEXIT_CRITICAL(&g_fsm_counters_mux);
+            s_right_offline_since_ms = 0;
+            ESP_LOGW(TAG, "T resetado: vizinho dir. offline há muito (safety net).");
+            fsm_agendar_apagar();
+        }
+    } else {
+        s_right_offline_since_ms = 0;
+    }
+}
+
+
+/* ── Passo 11b: Heartbeat de obstáculo → vizinho direito ──────
+   Enquanto em STATE_OBSTACULO, reenvia OBSTACULO a cada TC_TIMEOUT_MS/2.
+   Mantém o TC_TIMEOUT do vizinho direito renovado — sem isto, se o veículo
+   desaparecer sem chegar ao poste seguinte, o vizinho fica com Tc=1 e
+   TC_TIMEOUT=0 → luz acesa indefinidamente (bug fix v5.4). */
+static uint64_t s_obstaculo_hb_ms = 0;
+
+static void _passo11b_obstaculo_heartbeat(uint64_t agora)
+{
+    if (g_fsm_state != STATE_OBSTACULO) {
+        s_obstaculo_hb_ms = 0;
+        return;
+    }
+    if (!g_fsm_right_online) return;
+
+    if (s_obstaculo_hb_ms > 0 &&
+        (agora - s_obstaculo_hb_ms) < (TC_TIMEOUT_MS / 2)) return;
+
+    s_obstaculo_hb_ms = agora;
+    comm_send_obstaculo(g_fsm_tc_last_vehicle_id, g_fsm_last_speed, 0);
+    ESP_LOGD(TAG, "[OBST] heartbeat → vizinho direito (id=%u vel=%.1f)",
+             (unsigned)g_fsm_tc_last_vehicle_id, g_fsm_last_speed);
+}
+
+
 /* ── Passo 12: Heartbeat de master (qualquer MASTER) ─────────
    Correcção: MASTER temporário (pos>0) também envia heartbeat.
    Sem isto, o cluster à direita perde autoridade após 15s e
@@ -165,10 +212,12 @@ void fsm_timer_update(bool comm_ok, bool is_master)
     uint64_t agora = fsm_agora_ms();
 
     _passo5_verificar_t_estagnado(agora);
+    _passo5b_verificar_t_estagnado_dir(agora);
     _passo6_processar_eta(agora);
     _passo7_gestao_apagamento(agora, is_master);
     _passo8_limpeza_obstaculo(agora, is_master);
     _passo9_timeout_seguranca_tc(agora);
+    _passo11b_obstaculo_heartbeat(agora);
     _passo12_master_heartbeat(agora, is_master);
 
     (void)comm_ok;

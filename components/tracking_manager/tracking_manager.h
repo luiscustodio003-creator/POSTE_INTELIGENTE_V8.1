@@ -76,6 +76,10 @@
 /* Janela de média móvel para suavização de velocidade */
 #define TRK_SPEED_WINDOW        5
 
+/* Speed gate: diferença máxima de velocidade (km/h) para associação nearest-neighbour.
+   Evita swap de tracks entre veículos com posições próximas mas velocidades distintas. */
+#define TRK_SPEED_GATE_KMH      30.0f
+
 /* Máximo de slots de tracking simultâneos.
    HLK-LD2450 reporta max 3 targets/frame. 8 slots cobrem os 3 activos
    mais slots em COASTING/EXITED ainda não libertados.
