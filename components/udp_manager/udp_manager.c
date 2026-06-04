@@ -648,8 +648,8 @@ int udp_manager_get_socket(void)
 /* ============================================================
    CALLBACKS WEAK — substituídos pela state_machine (fsm_events.c)
 ============================================================ */
-__attribute__((weak)) void on_tc_inc_received(float speed, int16_t x_mm)
-{ (void)speed; (void)x_mm; }
+__attribute__((weak)) void on_tc_inc_received(uint16_t vehicle_id, float speed, int16_t x_mm)
+{ (void)vehicle_id; (void)speed; (void)x_mm; }
 
 __attribute__((weak)) void on_prev_passed_received(float speed)
 { (void)speed; }

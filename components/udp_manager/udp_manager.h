@@ -134,7 +134,7 @@ void        udp_manager_get_stats(udp_stats_t *out);
    CALLBACKS — implementados em fsm_events.c
    Versões weak definidas em udp_manager.c
 ============================================================ */
-void on_tc_inc_received(float speed, int16_t x_mm);
+void on_tc_inc_received(uint16_t vehicle_id, float speed, int16_t x_mm);
 void on_prev_passed_received(float speed);
 void on_spd_received(float speed, uint32_t eta_ms, int16_t x_mm);
 void on_master_claim_received(int from_id);
