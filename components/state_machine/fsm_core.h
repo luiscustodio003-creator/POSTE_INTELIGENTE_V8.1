@@ -43,6 +43,9 @@ void     fsm_acender_em_ms_set(uint64_t v);
 uint64_t fsm_tc_timeout_ms_get(void);
 void     fsm_tc_timeout_ms_set(uint64_t v);
 
+uint64_t fsm_spd_fallback_ms_get(void);
+void     fsm_spd_fallback_ms_set(uint64_t v);
+
 /* ID do último veículo que gerou TC_INC — guarda contra TC_INC duplicado. */
 extern uint16_t g_fsm_tc_last_vehicle_id;
 

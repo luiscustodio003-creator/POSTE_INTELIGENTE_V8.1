@@ -172,6 +172,7 @@
 #define LIGHT_ON_TIMEOUT_MS     5000
 #define DETECTION_TIMEOUT_MS    1000
 #define MARGEM_ACENDER_MS        500
+#define SPD_FALLBACK_MS         1000   /* TC_INC recebido sem SPD → acende ao fim de 1s */
 
 /* TC_TIMEOUT_MS: tempo máximo de espera por confirmação UDP do vizinho direito.
    Deve ser > OBSTACULO_REMOVE_MS (8s) para não interferir com obstáculos activos. */

@@ -219,7 +219,7 @@ static void _processar_mensagem(const char *msg, const char *ip)
 
         ESP_LOGD(TAG, "[RX] TC_INC ID=%d vel=%.0f x=%d", id, vel, x_mm);
         s_stats.tc_inc_recebidos++;
-        on_tc_inc_received(vel, (int16_t)x_mm);
+        on_tc_inc_received((uint16_t)id, vel, (int16_t)x_mm);
         return;
     }
 

@@ -37,8 +37,8 @@ void sm_process_event(sm_event_type_t type,uint16_t vehicle_id,float vel,uint32_
 
 /* ── Callbacks UDP ────────────────────────────────────────── */
 
-/** Recebe TC_INC do poste esquerdo → Tc++ */
-void on_tc_inc_received(float speed, int16_t x_mm);
+/** Recebe TC_INC do poste esquerdo → Tc++ (vehicle_id para dedup de duplicados) */
+void on_tc_inc_received(uint16_t vehicle_id, float speed, int16_t x_mm);
 
 /** Recebe PASSED do poste direito → T-- */
 void on_prev_passed_received(float speed);

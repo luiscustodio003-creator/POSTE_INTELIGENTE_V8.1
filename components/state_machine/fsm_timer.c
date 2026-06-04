@@ -31,6 +31,25 @@ static void _passo5_verificar_t_estagnado(uint64_t agora)
 }
 
 
+/* ── Passo 5c: Fallback de acendimento quando SPD não chega ───
+   Quando TC_INC é recebido mas o SPD correspondente se perde na
+   rede WiFi, o fallback garante que a luz acende ao fim de
+   SPD_FALLBACK_MS (1s) em vez de ficar à espera indefinidamente.
+   on_spd_received() cancela este timer se o SPD chegar a tempo. */
+static void _passo5c_spd_fallback(uint64_t agora)
+{
+    uint64_t fb = fsm_spd_fallback_ms_get();
+    if (fb == 0 || agora < fb) return;
+
+    fsm_spd_fallback_ms_set(0);
+
+    if (g_fsm_Tc > 0 && fsm_acender_em_ms_get() == 0) {
+        fsm_acender_em_ms_set(agora);
+        ESP_LOGW(TAG, "[SPD_FALLBACK] SPD perdido — acende imediatamente (Tc=%d)", g_fsm_Tc);
+    }
+}
+
+
 /* ── Passo 6: Pré-acendimento por ETA ─────────────────────── */
 static void _passo6_processar_eta(uint64_t agora)
 {
@@ -213,6 +232,7 @@ void fsm_timer_update(bool comm_ok, bool is_master)
 
     _passo5_verificar_t_estagnado(agora);
     _passo5b_verificar_t_estagnado_dir(agora);
+    _passo5c_spd_fallback(agora);
     _passo6_processar_eta(agora);
     _passo7_gestao_apagamento(agora, is_master);
     _passo8_limpeza_obstaculo(agora, is_master);

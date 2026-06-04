@@ -210,7 +210,8 @@ void comm_send_tc_inc(float speed, int16_t x_mm)
         return;
     }
     udp_manager_send_tc_inc(ip, speed, x_mm);
-    ESP_LOGD(TAG, "TC_INC → %s | %.0f km/h | x=%dmm", ip, speed, (int)x_mm);
+    udp_manager_send_tc_inc(ip, speed, x_mm); /* double-send: dedup no receptor previne Tc duplo */
+    ESP_LOGD(TAG, "TC_INC x2 → %s | %.0f km/h | x=%dmm", ip, speed, (int)x_mm);
 }
 
 
@@ -226,7 +227,8 @@ void comm_send_spd(float speed, int16_t x_mm)
     }
     uint32_t eta_ms = _calcular_eta_ms(speed);
     udp_manager_send_spd(ip, speed, eta_ms, POSTE_DIST_M, x_mm);
-    ESP_LOGD(TAG, "SPD → %s | %.0f km/h | ETA=%lums",
+    udp_manager_send_spd(ip, speed, eta_ms, POSTE_DIST_M, x_mm); /* double-send: SPD é idempotente */
+    ESP_LOGD(TAG, "SPD x2 → %s | %.0f km/h | ETA=%lums",
              ip, speed, (unsigned long)eta_ms);
 }
 

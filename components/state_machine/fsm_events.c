@@ -20,12 +20,21 @@ static const char *TAG = "FSM_EVT";
 
 /* ── Callbacks UDP ────────────────────────────────────────── */
 
-void on_tc_inc_received(float speed, int16_t x_mm)
+static uint16_t s_last_tc_inc_id = 0;  /* dedup receptor: evita duplo Tc++ no double-send */
+
+void on_tc_inc_received(uint16_t vehicle_id, float speed, int16_t x_mm)
 {
+    if (vehicle_id != 0 && vehicle_id == s_last_tc_inc_id) {
+        ESP_LOGD(TAG, "[UDP] TC_INC dedup — ID=%u já processado", vehicle_id);
+        return;
+    }
+    s_last_tc_inc_id = vehicle_id;
+
     g_fsm_apagar_pend    = false;
     g_fsm_last_speed     = speed;
     g_fsm_last_detect_ms = fsm_agora_ms();
     fsm_tc_timeout_ms_set(fsm_agora_ms() + TC_TIMEOUT_MS);
+    fsm_spd_fallback_ms_set(fsm_agora_ms() + SPD_FALLBACK_MS);
 
     portENTER_CRITICAL(&g_fsm_counters_mux);
     bool tc_overflow = (g_fsm_Tc >= MAX_RADAR_TARGETS);
@@ -34,7 +43,7 @@ void on_tc_inc_received(float speed, int16_t x_mm)
 
     if (tc_overflow)
         ESP_LOGW(TAG, "[UDP] TC_INC ignorado — Tc no máximo (%d)", g_fsm_Tc);
-    ESP_LOGI(TAG, "[UDP] TC_INC | vel=%.0f | T=%d Tc=%d", speed, g_fsm_T, g_fsm_Tc);
+    ESP_LOGI(TAG, "[UDP] TC_INC | ID=%u vel=%.0f | T=%d Tc=%d", vehicle_id, speed, g_fsm_T, g_fsm_Tc);
 }
 
 void on_prev_passed_received(float speed)
@@ -75,6 +84,7 @@ static uint32_t _fade_ms_para_velocidade(float vel_kmh)
 void on_spd_received(float speed, uint32_t eta_ms, int16_t x_mm)
 {
     (void)x_mm;
+    fsm_spd_fallback_ms_set(0);   /* SPD chegou — cancela fallback */
     g_fsm_last_speed = speed;
 
     uint32_t fade_ms = _fade_ms_para_velocidade(speed);
