@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "PowerShell(C:\\\\Users\\\\DELL\\\\AppData\\\\Local\\\\Programs\\\\Python\\\\Python312\\\\python.exe \"d:\\\\Dev\\\\C\\\\POSTE_INTELIGENTE_V8\\\\stress_analysis\\\\graficos_stress.py\" 2>&1)",
+      "PowerShell(Get-ChildItem \"d:\\\\Dev\\\\C\\\\POSTE_INTELIGENTE_V8\\\\stress_analysis\\\\\" | Select-Object Name, @{N='KB';E={[int]\\($_.Length/1KB\\)}})"
+    ]
+  }
+}

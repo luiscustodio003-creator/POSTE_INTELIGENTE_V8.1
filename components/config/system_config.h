@@ -144,7 +144,7 @@
 
 
 /* ── Iluminação DALI/PWM ──────────────────────────────────── */
-#define LIGHT_MIN             2
+#define LIGHT_MIN             15   /* mínimo legal EN 13201 — baseline de vigilância */
 #define LIGHT_MAX             100
 #define LIGHT_SAFE_MODE       50
 
@@ -172,7 +172,7 @@
 #define LIGHT_ON_TIMEOUT_MS     5000
 #define DETECTION_TIMEOUT_MS    1000
 #define MARGEM_ACENDER_MS        500
-#define SPD_FALLBACK_MS         1000   /* TC_INC recebido sem SPD → acende ao fim de 1s */
+#define SPD_FALLBACK_MS          500   /* TC_INC recebido sem SPD → acende ao fim de 500ms (cobre até 225 km/h) */
 
 /* TC_TIMEOUT_MS: tempo máximo de espera por confirmação UDP do vizinho direito.
    Deve ser > OBSTACULO_REMOVE_MS (8s) para não interferir com obstáculos activos. */
