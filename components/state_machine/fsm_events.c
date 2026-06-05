@@ -89,17 +89,19 @@ void on_spd_received(float speed, uint32_t eta_ms, int16_t x_mm)
 
     uint32_t fade_ms = _fade_ms_para_velocidade(speed);
 
-    if (eta_ms == 0 || eta_ms < fade_ms) {
-        /* Sem margem para fade gradual — acender instantâneo ao atingir ETA. */
+    if (eta_ms == 0 || eta_ms <= fade_ms) {
+        /* ETA demasiado curto para fade gradual — acende instantaneamente */
         g_fsm_acender_instantaneo = true;
         fsm_acender_em_ms_set(fsm_agora_ms() + eta_ms);
         ESP_LOGD(TAG, "[UDP] SPD | vel=%.0f ETA=%" PRIu32 "ms fade=%" PRIu32 "ms → INSTANTÂNEO",
                  speed, eta_ms, fade_ms);
     } else {
+        /* Inicia fade com fade_ms de antecedência: completa exactamente na chegada */
         g_fsm_acender_instantaneo = false;
-        fsm_acender_em_ms_set(fsm_agora_ms() + eta_ms);
-        ESP_LOGD(TAG, "[UDP] SPD | vel=%.0f ETA=%" PRIu32 "ms fade=%" PRIu32 "ms → FADE GRADUAL",
-                 speed, eta_ms, fade_ms);
+        uint32_t arranque_ms = eta_ms - fade_ms;
+        fsm_acender_em_ms_set(fsm_agora_ms() + arranque_ms);
+        ESP_LOGD(TAG, "[UDP] SPD | vel=%.0f ETA=%" PRIu32 "ms fade=%" PRIu32 "ms arranque=%" PRIu32 "ms → FADE GRADUAL",
+                 speed, eta_ms, fade_ms, arranque_ms);
     }
 }
 
