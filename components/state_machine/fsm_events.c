@@ -50,21 +50,21 @@ void on_prev_passed_received(float speed)
 {
     (void)speed;
 
+    /* T-- já foi feito em EVT_PASSED. Aqui apenas gere enviados_dir e
+       verifica all_clear para agenda de apagamento. */
     portENTER_CRITICAL(&g_fsm_counters_mux);
     bool tardio    = (g_fsm_enviados_dir == 0);
     bool env_zero  = false;
     bool all_clear = false;
     if (!tardio) {
         g_fsm_enviados_dir--;
-        if (g_fsm_T > 0) g_fsm_T--;
         env_zero  = (g_fsm_enviados_dir == 0);
         all_clear = (g_fsm_T == 0 && g_fsm_Tc == 0);
     }
     portEXIT_CRITICAL(&g_fsm_counters_mux);
 
     if (tardio) {
-        ESP_LOGW(TAG, "[UDP] PASSED tardio ignorado — timeout já actuou (T=%d Tc=%d)",
-                 g_fsm_T, g_fsm_Tc);
+        ESP_LOGW(TAG, "[UDP] PASSED tardio ignorado (T=%d Tc=%d)", g_fsm_T, g_fsm_Tc);
         return;
     }
     if (env_zero) fsm_tc_timeout_ms_set(0);
@@ -275,16 +275,16 @@ void sm_process_event(sm_event_type_t type, uint16_t vehicle_id,
                 g_fsm_tc_last_vehicle_id = 0;
             }
 
-            if (g_fsm_right_online && g_fsm_enviados_dir > 0) {
-                comm_send_spd(vel, x_mm);
-            } else {
-                portENTER_CRITICAL(&g_fsm_counters_mux);
-                if (g_fsm_T > 0) g_fsm_T--;
-                bool passed_all_clear = (g_fsm_T == 0 && g_fsm_Tc == 0);
-                portEXIT_CRITICAL(&g_fsm_counters_mux);
-                if (g_fsm_right_online) comm_send_spd(vel, x_mm);
-                if (passed_all_clear) fsm_agendar_apagar();
-            }
+            /* T-- imediato em todos os casos — evita T preso se PASSED do vizinho
+               direito nunca chegar (Tc=0 no direito quando veículo chega rápido).
+               on_prev_passed_received gere enviados_dir mas já não faz T--. */
+            portENTER_CRITICAL(&g_fsm_counters_mux);
+            if (g_fsm_T > 0) g_fsm_T--;
+            bool passed_all_clear = (g_fsm_T == 0 && g_fsm_Tc == 0);
+            portEXIT_CRITICAL(&g_fsm_counters_mux);
+
+            if (g_fsm_right_online) comm_send_spd(vel, x_mm);
+            if (passed_all_clear) fsm_agendar_apagar();
             break;
 
 
