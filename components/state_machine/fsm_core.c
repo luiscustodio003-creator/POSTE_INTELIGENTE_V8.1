@@ -207,6 +207,7 @@ void state_machine_update(bool comm_ok, bool is_master, bool radar_teve_frame)
 system_state_t state_machine_get_state(void) { return g_fsm_state; }
 int   state_machine_get_T(void)         { return g_fsm_T; }
 int   state_machine_get_Tc(void)        { return g_fsm_Tc; }
+int   state_machine_get_enviados_dir(void) { return g_fsm_enviados_dir; }
 float state_machine_get_last_speed(void){ return g_fsm_last_speed; }
 bool  state_machine_radar_ok(void)      { return g_fsm_radar_ok; }
 bool  sm_is_obstaculo(void)             { return g_fsm_state == STATE_OBSTACULO; }

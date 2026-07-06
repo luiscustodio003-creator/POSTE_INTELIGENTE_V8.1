@@ -13,8 +13,51 @@
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/portmacro.h"
+#include <stdio.h>
+#include <stdarg.h>
 
 static const char *TAG = "FSM_TMR";
+
+
+/* ── _box_* — desenho de caixa auto-alinhada (ver fsm_events.c) ── */
+#define BOX_W 48
+
+static void _box_top(void)
+{
+    printf("\n┌");
+    for (int i = 0; i < BOX_W; i++) printf("─");
+    printf("┐\n");
+}
+
+static void _box_bottom(void)
+{
+    printf("└");
+    for (int i = 0; i < BOX_W; i++) printf("─");
+    printf("┘\n\n");
+}
+
+static void _box_line(const char *fmt, ...)
+{
+    char buf[160];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    printf("│%-*s│\n", BOX_W, buf);
+}
+
+
+/* ── _print_fadedown_box ─────────────────────────────────────
+   Destaque visual no log no momento exacto em que o fade-down
+   é accionado (T=0 Tc=0 env_dir=0 confirmados há TRAFIC_TIMEOUT_MS). */
+static void _print_fadedown_box(const char *estado_novo)
+{
+    _box_top();
+    _box_line(" FADE DOWN INICIADO   P%-2d", POST_POSITION);
+    _box_line(" T=0 Tc=0 env_dir=0 confirmados");
+    _box_line(" Novo estado: %s", estado_novo);
+    _box_bottom();
+}
 
 
 /* ── Passo 5: T preso com vizinho esquerdo offline ─────────── */
@@ -86,12 +129,15 @@ static void _passo7_gestao_apagamento(uint64_t agora, bool is_master)
     if (is_master && POST_POSITION == 0) {
         g_fsm_state = STATE_MASTER;
         ESP_LOGI(TAG, "Apagamento → STATE_MASTER (pos=0).");
+        _print_fadedown_box("MASTER (pos=0)");
     } else if (!comm_right_online() && !comm_left_online()) {
         g_fsm_state = STATE_AUTONOMO;
         ESP_LOGI(TAG, "Apagamento → AUTONOMO (sem vizinhos).");
+        _print_fadedown_box("AUTONOMO (sem vizinhos)");
     } else {
         g_fsm_state = STATE_IDLE;
         ESP_LOGI(TAG, "Apagamento → IDLE.");
+        _print_fadedown_box("IDLE");
     }
 }
 
@@ -107,7 +153,7 @@ static void _passo8_limpeza_obstaculo(uint64_t agora, bool is_master)
 
         portENTER_CRITICAL(&g_fsm_counters_mux);
         if (g_fsm_T > 0) g_fsm_T--;
-        bool obs_all_clear = (g_fsm_T == 0 && g_fsm_Tc == 0);
+        bool obs_all_clear = (g_fsm_T == 0 && g_fsm_Tc == 0 && g_fsm_enviados_dir == 0);
         portEXIT_CRITICAL(&g_fsm_counters_mux);
 
         if (obs_all_clear) {
@@ -120,11 +166,20 @@ static void _passo8_limpeza_obstaculo(uint64_t agora, bool is_master)
 }
 
 
-/* ── Passo 9: Timeout de segurança UDP ────────────────────────
-   Limpa Tc, env_dir e T quando UDP perdido após todos os retries.
-   T é decrementado por env_dir: veículo saiu da zona local mas o
-   vizinho direito nunca confirmou (UDP perdido ou lab sem reach). */
-static void _passo9_timeout_seguranca_tc(uint64_t agora)
+/* ── Passo 5b: REMOVIDO ───────────────────────────────────────
+   T só se resolve por confirmação real (PASSED) ou detecção local
+   (EVT_LOCAL) — nunca por T_STUCK_TIMEOUT_MS. Risco aceite. */
+
+
+/* ── Passo 9: Rede de segurança de ÚLTIMO RECURSO ─────────────
+   NÃO faz parte do funcionamento normal do handoff — o T/Tc/env_dir
+   esperam indefinidamente pela confirmação real (PASSED). Isto só
+   dispara ao fim de TC_TIMEOUT_MS (60s, generoso de propósito) se
+   essa confirmação NUNCA chegar — pacote definitivamente perdido, ou
+   veículo que saiu da via sem nunca ser confirmado pelo poste
+   seguinte. Sem isto, esses dois casos deixavam a luz acesa para
+   sempre, sem qualquer forma de recuperação automática. */
+static void _passo9_seguranca_ultimo_recurso(uint64_t agora)
 {
     uint64_t tc_deadline = fsm_tc_timeout_ms_get();
     if (tc_deadline == 0) return;
@@ -135,9 +190,6 @@ static void _passo9_timeout_seguranca_tc(uint64_t agora)
     int  snap_env = g_fsm_enviados_dir;
     if (snap_tc  > 0) g_fsm_Tc = 0;
     if (snap_env > 0) {
-        /* T decrementado por env_dir: cada TC_INC sem confirmação corresponde a
-           um veículo que saiu da zona local sem confirmação UDP do vizinho direito.
-           Sem este decremento, T fica positivo indefinidamente e a luz nunca apaga. */
         if (g_fsm_T >= snap_env) g_fsm_T -= snap_env;
         else                     g_fsm_T  = 0;
         g_fsm_enviados_dir = 0;
@@ -146,42 +198,17 @@ static void _passo9_timeout_seguranca_tc(uint64_t agora)
     portEXIT_CRITICAL(&g_fsm_counters_mux);
 
     bool algo_resetado = (snap_tc > 0 || snap_env > 0);
-
-    if (snap_tc > 0)
-        ESP_LOGW(TAG, "[TMR] Tc timeout — limpeza UDP (Tc=%d) — T=%d", snap_tc, g_fsm_T);
-    if (snap_env > 0)
-        ESP_LOGW(TAG, "[TMR] env_dir timeout — UDP sem confirmação (env_dir=%d) → T=%d",
-                 snap_env, g_fsm_T);
-
-    if (algo_resetado) {
+    if (!algo_resetado) {
         fsm_tc_timeout_ms_set(0);
-        ESP_LOGI(TAG, "[TMR] Após limpeza UDP: T=%d Tc=%d env_dir=%d",
-                 g_fsm_T, g_fsm_Tc, g_fsm_enviados_dir);
-        if (tmr_all_clear)
-            fsm_agendar_apagar();
+        return;
     }
-}
 
+    ESP_LOGE(TAG, "[TMR] SEGURANÇA ÚLTIMO RECURSO — confirmação nunca chegou "
+                  "(Tc=%d env_dir=%d) → limpeza forçada após %llus",
+             snap_tc, snap_env, (unsigned long long)(TC_TIMEOUT_MS / 1000ULL));
 
-/* ── Passo 5b: T preso com vizinho direito offline ─────────── */
-static uint64_t s_right_offline_since_ms = 0;
-
-static void _passo5b_verificar_t_estagnado_dir(uint64_t agora)
-{
-    if (!g_fsm_right_online && g_fsm_T > 0) {
-        if (s_right_offline_since_ms == 0)
-            s_right_offline_since_ms = agora;
-        if ((agora - s_right_offline_since_ms) > T_STUCK_TIMEOUT_MS) {
-            portENTER_CRITICAL(&g_fsm_counters_mux);
-            g_fsm_T = 0;
-            portEXIT_CRITICAL(&g_fsm_counters_mux);
-            s_right_offline_since_ms = 0;
-            ESP_LOGW(TAG, "T resetado: vizinho dir. offline há muito (safety net).");
-            fsm_agendar_apagar();
-        }
-    } else {
-        s_right_offline_since_ms = 0;
-    }
+    fsm_tc_timeout_ms_set(0);
+    if (tmr_all_clear) fsm_agendar_apagar();
 }
 
 
@@ -231,12 +258,11 @@ void fsm_timer_update(bool comm_ok, bool is_master)
     uint64_t agora = fsm_agora_ms();
 
     _passo5_verificar_t_estagnado(agora);
-    _passo5b_verificar_t_estagnado_dir(agora);
     _passo5c_spd_fallback(agora);
     _passo6_processar_eta(agora);
     _passo7_gestao_apagamento(agora, is_master);
     _passo8_limpeza_obstaculo(agora, is_master);
-    _passo9_timeout_seguranca_tc(agora);
+    _passo9_seguranca_ultimo_recurso(agora);
     _passo11b_obstaculo_heartbeat(agora);
     _passo12_master_heartbeat(agora, is_master);
 

@@ -18,9 +18,9 @@
 
 
 /* ── Identidade do poste ──────────────────────────────────── */
-#define POSTE_ID              3
-#define POSTE_NAME            "POSTE 03"
-#define POST_POSITION         2
+#define POSTE_ID              2
+#define POSTE_NAME            "POSTE 02"
+#define POST_POSITION         1
 
 
 /* ── Display ──────────────────────────────────────────────── */
@@ -121,7 +121,7 @@
 /* ── Hardware do radar ────────────────────────────────────── */
 #define USE_RADAR             1
 #define NO_FRAME_LIMIT        20
-#define MAX_RADAR_TARGETS     100
+#define MAX_RADAR_TARGETS     3
 #define RADAR_MAX_OBJ         MAX_RADAR_TARGETS
 #define RADAR_TRAIL_MAX       8
 
@@ -174,19 +174,15 @@
 #define MARGEM_ACENDER_MS        500
 #define SPD_FALLBACK_MS          500   /* TC_INC recebido sem SPD → acende ao fim de 500ms (cobre até 225 km/h) */
 
-/* TC_TIMEOUT_MS: tempo máximo de espera por confirmação UDP do vizinho direito.
-   Deve ser > OBSTACULO_REMOVE_MS (8s) para não interferir com obstáculos activos. */
-#if MODO_LABORATORIO
-  #define TC_TIMEOUT_MS  12000ULL   /* 12s — aguarda chain reaction em bancada */
-#else
-  #if TIMEOUT_PROFILE == PROFILE_CONSERVADOR
-    #define TC_TIMEOUT_MS  (TRAFIC_TIMEOUT_MS * 2)   /* 10s */
-  #elif TIMEOUT_PROFILE == PROFILE_BALANCEADO
-    #define TC_TIMEOUT_MS  12000ULL  /* 12s > OBSTACULO_REMOVE_MS (8s) */
-  #else
-    #define TC_TIMEOUT_MS  10000ULL  /* 10s */
-  #endif
-#endif
+/* TC_TIMEOUT_MS: rede de segurança de ÚLTIMO RECURSO — não é usado para o
+   funcionamento normal do handoff T/Tc (esse agora espera indefinidamente
+   pela confirmação real, PASSED). Só entra em acção se essa confirmação
+   NUNCA chegar (pacote perdido definitivamente, ou veículo que sai da via
+   sem nunca ser confirmado pelo poste seguinte). Valor propositadamente
+   generoso — muito maior que qualquer atraso normal de confirmação (que
+   demora segundos, mesmo com reconexão WiFi) — para nunca cortar uma
+   confirmação legítima que só está a demorar um pouco mais. */
+#define TC_TIMEOUT_MS  60000ULL   /* 60s — só dispara em caso de falha real */
 
 #define T_STUCK_TIMEOUT_MS      (TRAFIC_TIMEOUT_MS * 3)
 #define OBSTACULO_REMOVE_MS     8000

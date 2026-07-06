@@ -68,6 +68,7 @@ system_state_t state_machine_get_state(void);
 const char    *state_machine_get_state_name(void);
 int            state_machine_get_T(void);
 int            state_machine_get_Tc(void);
+int            state_machine_get_enviados_dir(void);
 float          state_machine_get_last_speed(void);
 bool           state_machine_radar_ok(void);
 bool           sm_is_obstaculo(void);

@@ -195,6 +195,9 @@ int            state_machine_get_T(void);
 /** @brief Contador Tc — veículos anunciados via UDP */
 int            state_machine_get_Tc(void);
 
+/** @brief Envios de TC_INC ao vizinho direito ainda sem confirmação PASSED */
+int            state_machine_get_enviados_dir(void);
+
 /** @brief Última velocidade registada em km/h */
 float          state_machine_get_last_speed(void);
 

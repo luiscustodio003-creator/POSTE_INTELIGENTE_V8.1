@@ -214,7 +214,20 @@ static void _monitor_task(void *arg)
             (uint8_t)dali_get_brightness()
         );
         display_manager_set_status(state_machine_get_state_name());
-        display_manager_set_traffic(state_machine_get_T(), state_machine_get_Tc());
+
+        /* T mostrado no LCD: usa o maior entre T real (radar local) e
+           enviados_dir (TC_INC enviado ao vizinho, ainda sem confirmação
+           PASSED). O radar local perde o alvo bem antes de o vizinho
+           confirmar a chegada — sem isto, o "1" no ecrã apagava-se em
+           poucos frames em vez de se manter até à confirmação (ou até
+           o TC_TIMEOUT limpar enviados_dir de segurança).
+           NOTA: só afecta a apresentação — a luz continua a ser
+           controlada pelo T real da FSM (fsm_task.c), nunca por este
+           valor. */
+        int t_disp   = state_machine_get_T();
+        int env_dir  = state_machine_get_enviados_dir();
+        if (env_dir > t_disp) t_disp = env_dir;
+        display_manager_set_traffic(t_disp, state_machine_get_Tc());
 
         vTaskDelay(pdMS_TO_TICKS(200));
     }

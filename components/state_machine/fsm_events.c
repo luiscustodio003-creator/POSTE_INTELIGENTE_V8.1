@@ -10,25 +10,163 @@
 #include "fsm_core.h"
 #include "fsm_network.h"
 #include "comm_manager.h"
+#include "udp_manager.h"
 #include "system_config.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/portmacro.h"
+#include <stdio.h>
+#include <stdarg.h>
 
 static const char *TAG = "FSM_EVT";
 
 
+/* ── _box_* — desenho de caixa auto-alinhada ─────────────────
+   Em vez de alinhar espaços à mão (quebra sempre que um número
+   muda de nº de dígitos), cada linha é formatada para um buffer
+   e depois preenchida com %-*s até à largura fixa BOX_W — a
+   borda direita fica sempre alinhada, seja qual for o conteúdo. */
+#define BOX_W 48  /* largura interior da caixa, entre as duas bordas "│" */
+
+static void _box_top(void)
+{
+    printf("\n┌");
+    for (int i = 0; i < BOX_W; i++) printf("─");
+    printf("┐\n");
+}
+
+static void _box_bottom(void)
+{
+    printf("└");
+    for (int i = 0; i < BOX_W; i++) printf("─");
+    printf("┘\n\n");
+}
+
+static void _box_line(const char *fmt, ...)
+{
+    char buf[160];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    printf("│%-*s│\n", BOX_W, buf);
+}
+
+
+/* ── _print_deteccao_box ─────────────────────────────────────
+   Destaque visual no log sempre que o radar confirma um carro
+   localmente (EVT_LOCAL): mostra T/Tc deste poste e se o TC_INC
+   foi enviado ao poste seguinte (que fará Tc++ ao recebê-lo).
+   Puramente informativo — não afecta a lógica da FSM. */
+static void _print_deteccao_box(uint16_t vehicle_id, float vel, int T, int Tc,
+                                 bool tc_inc_enviado, const char *ip_dir)
+{
+    _box_top();
+    _box_line(" CARRO DETECTADO  ID=%-4u %.1f km/h", vehicle_id, vel);
+    _box_line(" Este poste  P%-2d   T=%-2d  Tc=%-2d", POST_POSITION, T, Tc);
+    if (tc_inc_enviado)
+        _box_line(" TC_INC -> P%-2d (%s) -> Tc=1 la", POST_POSITION + 1, ip_dir);
+    else
+        _box_line(" Sem vizinho direito -- TC_INC nao enviado");
+    _box_bottom();
+}
+
+/* ── _print_tc_inc_box ───────────────────────────────────────
+   Destaque visual no log sempre que este poste recebe um
+   TC_INC do vizinho esquerdo (Tc++). Ajuda a confirmar se o
+   Tc chega mesmo a subir e por quanto tempo se mantém, antes
+   de o radar local confirmar o alvo (EVT_LOCAL, Tc--). */
+static void _print_tc_inc_box(uint16_t vehicle_id, int T, int Tc)
+{
+    _box_top();
+    _box_line(" TC_INC RECEBIDO  ID=%-4u  P%-2d", vehicle_id, POST_POSITION);
+    _box_line(" Anunciado pelo poste anterior");
+    _box_line(" T=%-2d  Tc=%-2d", T, Tc);
+    _box_bottom();
+}
+
+/* ── _print_saida_box ────────────────────────────────────────
+   Destaque visual no log sempre que o T deste poste desce
+   (EVT_PASSED — radar local perdeu o alvo). Mostra se ainda há
+   um TC_INC por confirmar (env_dir>0) ou um Tc pendente, para
+   se perceber de imediato se falta alguma coisa a resolver. */
+static void _print_saida_box(uint16_t vehicle_id, int T, int Tc, int env_dir)
+{
+    _box_top();
+    _box_line(" T DECREMENTADO   ID=%-4u  P%-2d", vehicle_id, POST_POSITION);
+    _box_line(" Radar local perdeu o alvo");
+    _box_line(" T=%-2d  Tc=%-2d  env_dir=%-2d", T, Tc, env_dir);
+    if (env_dir > 0)
+        _box_line(" A aguardar confirmacao do poste seguinte");
+    else if (Tc > 0)
+        _box_line(" Tc pendente (carro anunciado a chegar)");
+    else
+        _box_line(" Tudo limpo (T=0 Tc=0)");
+    _box_bottom();
+}
+
+
+/* ── _print_passed_enviado_box ───────────────────────────────
+   Destaque visual no log sempre que este poste envia a
+   confirmação PASSED ao poste anterior (o carro chegou aqui,
+   vindo da esquerda). Simétrico com _print_confirmacao_box,
+   que mostra o mesmo evento do lado de quem recebe. */
+static void _print_passed_enviado_box(uint16_t vehicle_id, int T, int Tc)
+{
+    _box_top();
+    _box_line(" CONFIRMACAO ENVIADA   ID=%-4u  P%-2d", vehicle_id, POST_POSITION);
+    _box_line(" Carro chegou -> PASSED -> poste anterior");
+    _box_line(" T=%-2d  Tc=%-2d", T, Tc);
+    _box_bottom();
+}
+
+
+/* ── _print_confirmacao_box ──────────────────────────────────
+   Destaque visual no log sempre que este poste recebe a
+   confirmação PASSED do poste seguinte (o carro chegou lá).
+   Mostra se ainda falta confirmar mais algum carro (env_dir>0)
+   ou se já está tudo pronto para agendar o apagar. */
+static void _print_confirmacao_box(int T, int Tc, int env_dir, bool apagar_agendado)
+{
+    _box_top();
+    _box_line(" CONFIRMACAO RECEBIDA   P%-2d", POST_POSITION);
+    _box_line(" Poste seguinte confirmou a chegada");
+    _box_line(" T=%-2d  Tc=%-2d  env_dir=%-2d", T, Tc, env_dir);
+    if (apagar_agendado)
+        _box_line(" Tudo confirmado -> a apagar a luz");
+    else
+        _box_line(" Ainda falta confirmar outro carro");
+    _box_bottom();
+}
+
+
 /* ── Callbacks UDP ────────────────────────────────────────── */
 
-static uint16_t s_last_tc_inc_id = 0;  /* dedup receptor: evita duplo Tc++ no double-send */
+/* Dedup do double-send: comm_send_tc_inc() envia a mesma mensagem 2x seguidas
+   (sem atraso deliberado) para tolerar perda de pacote UDP. O "vehicle_id"
+   aqui recebido é, na prática, o POSTE_ID fixo de quem envia (ver
+   udp_manager.c: "TC_INC:<POSTE_ID>:<vel>:<x>") — nunca um identificador por
+   veículo. Por isso o dedup NÃO PODE comparar só o ID (ficaria preso para
+   sempre no primeiro carro do mesmo vizinho, ignorando todos os seguintes) —
+   tem de exigir também que a repetição chegue dentro de uma janela curta,
+   coerente com o double-send (que chega em poucos ms), não com o intervalo
+   real entre veículos distintos (segundos, no mínimo). */
+#define TC_INC_DEDUP_WINDOW_MS 500ULL
+
+static uint16_t s_last_tc_inc_id = 0;
+static uint64_t s_last_tc_inc_ms = 0;
 
 void on_tc_inc_received(uint16_t vehicle_id, float speed, int16_t x_mm)
 {
-    if (vehicle_id != 0 && vehicle_id == s_last_tc_inc_id) {
-        ESP_LOGD(TAG, "[UDP] TC_INC dedup — ID=%u já processado", vehicle_id);
+    uint64_t agora = fsm_agora_ms();
+    if (vehicle_id != 0 && vehicle_id == s_last_tc_inc_id &&
+        (agora - s_last_tc_inc_ms) < TC_INC_DEDUP_WINDOW_MS) {
+        ESP_LOGD(TAG, "[UDP] TC_INC dedup — ID=%u repetido em <%llums (double-send)",
+                 vehicle_id, (unsigned long long)TC_INC_DEDUP_WINDOW_MS);
         return;
     }
     s_last_tc_inc_id = vehicle_id;
+    s_last_tc_inc_ms = agora;
 
     g_fsm_apagar_pend    = false;
     g_fsm_last_speed     = speed;
@@ -41,8 +179,11 @@ void on_tc_inc_received(uint16_t vehicle_id, float speed, int16_t x_mm)
     if (!tc_overflow) g_fsm_Tc++;
     portEXIT_CRITICAL(&g_fsm_counters_mux);
 
-    if (tc_overflow)
+    if (tc_overflow) {
         ESP_LOGW(TAG, "[UDP] TC_INC ignorado — Tc no máximo (%d)", g_fsm_Tc);
+    } else {
+        _print_tc_inc_box(vehicle_id, g_fsm_T, g_fsm_Tc);
+    }
     ESP_LOGI(TAG, "[UDP] TC_INC | ID=%u vel=%.0f | T=%d Tc=%d", vehicle_id, speed, g_fsm_T, g_fsm_Tc);
 }
 
@@ -59,7 +200,9 @@ void on_prev_passed_received(float speed)
     if (!tardio) {
         g_fsm_enviados_dir--;
         env_zero  = (g_fsm_enviados_dir == 0);
-        all_clear = (g_fsm_T == 0 && g_fsm_Tc == 0);
+        /* env_zero incluído: só agenda apagar quando também não há mais
+           nenhum TC_INC por confirmar (consistente com EVT_PASSED/passo8). */
+        all_clear = (g_fsm_T == 0 && g_fsm_Tc == 0 && env_zero);
     }
     portEXIT_CRITICAL(&g_fsm_counters_mux);
 
@@ -71,6 +214,8 @@ void on_prev_passed_received(float speed)
     ESP_LOGI(TAG, "[UDP] PASSED confirmado | T=%d Tc=%d env_dir=%d",
              g_fsm_T, g_fsm_Tc, g_fsm_enviados_dir);
     if (all_clear) fsm_agendar_apagar();
+
+    _print_confirmacao_box(g_fsm_T, g_fsm_Tc, g_fsm_enviados_dir, all_clear);
 }
 
 static uint32_t _fade_ms_para_velocidade(float vel_kmh)
@@ -86,6 +231,18 @@ void on_spd_received(float speed, uint32_t eta_ms, int16_t x_mm)
     (void)x_mm;
     fsm_spd_fallback_ms_set(0);   /* SPD chegou — cancela fallback */
     g_fsm_last_speed = speed;
+
+    /* Pré-acendimento por ETA só se justifica quando a velocidade é alta
+       o suficiente para a deteção local (EVT_LOCAL, T=1) não ter tempo de
+       reagir antes do veículo chegar. Para velocidades normais/baixas há
+       tempo de sobra — a luz espera pela deteção local real, em vez de
+       acender antecipadamente com base numa previsão que pode nunca se
+       confirmar (carro que sai da via antes de chegar). */
+    if (speed < VEL_FADE_RAPIDO_KMH) {
+        ESP_LOGD(TAG, "[UDP] SPD | vel=%.0f km/h < %.0f — sem pré-acendimento, aguarda deteção local (T=1)",
+                 speed, VEL_FADE_RAPIDO_KMH);
+        return;
+    }
 
     uint32_t fade_ms = _fade_ms_para_velocidade(speed);
 
@@ -235,6 +392,7 @@ void sm_process_event(sm_event_type_t type, uint16_t vehicle_id,
             if (local_tc_dec) {
                 comm_notify_prev_passed(vel);
                 ESP_LOGI(TAG, "[T/Tc] ID=%u vindo da esq. — PASSED enviado", vehicle_id);
+                _print_passed_enviado_box(vehicle_id, g_fsm_T, g_fsm_Tc);
             } else {
                 ESP_LOGI(TAG, "[T/Tc] ID=%u local directo — sem PASSED", vehicle_id);
             }
@@ -244,9 +402,18 @@ void sm_process_event(sm_event_type_t type, uint16_t vehicle_id,
                 g_fsm_state = STATE_LIGHT_ON;
             }
 
+            bool tc_inc_enviado = false;
             if (g_fsm_right_online) {
-                if (vehicle_id != g_fsm_tc_last_vehicle_id ||
-                    g_fsm_enviados_dir == 0) {
+                if ((vehicle_id != g_fsm_tc_last_vehicle_id ||
+                     g_fsm_enviados_dir == 0) &&
+                    g_fsm_enviados_dir < MAX_RADAR_TARGETS) {
+                    /* env_dir nunca deve exceder MAX_RADAR_TARGETS: o vizinho
+                       direito rejeita Tc além desse limite (Tc no máximo,
+                       ver on_tc_inc_received) — sem este limite aqui, env_dir
+                       crescia sem parar e o valor mostrado no LCD (que usa
+                       max(T, env_dir) para reter o "1" até confirmação)
+                       mostrava um número maior do que o vizinho alguma vez
+                       poderia confirmar. */
                     comm_send_tc_inc(vel, x_mm);
                     comm_send_spd(vel, x_mm);
                     portENTER_CRITICAL(&g_fsm_counters_mux);
@@ -256,11 +423,16 @@ void sm_process_event(sm_event_type_t type, uint16_t vehicle_id,
                     fsm_tc_timeout_ms_set(fsm_agora_ms() + TC_TIMEOUT_MS);
                     ESP_LOGI(TAG, "[T/Tc] TC_INC → B | ID=%u env_dir=%d",
                             vehicle_id, g_fsm_enviados_dir);
+                    tc_inc_enviado = true;
                 } else {
                     ESP_LOGD(TAG, "[T/Tc] TC_INC suprimido — ID=%u ainda em transito (env_dir=%d)",
                             vehicle_id, g_fsm_enviados_dir);
                 }
             }
+
+            char nL_ip[MAX_IP_LEN] = {0}, nR_ip[MAX_IP_LEN] = {0};
+            udp_manager_get_neighbors(nL_ip, nR_ip);
+            _print_deteccao_box(vehicle_id, vel, g_fsm_T, g_fsm_Tc, tc_inc_enviado, nR_ip);
             break;
 
 
@@ -280,11 +452,18 @@ void sm_process_event(sm_event_type_t type, uint16_t vehicle_id,
                on_prev_passed_received gere enviados_dir mas já não faz T--. */
             portENTER_CRITICAL(&g_fsm_counters_mux);
             if (g_fsm_T > 0) g_fsm_T--;
-            bool passed_all_clear = (g_fsm_T == 0 && g_fsm_Tc == 0);
+            /* Só agenda apagar quando T=0, Tc=0 E não há TC_INC por confirmar
+               (env_dir=0). Decisão explícita: sem esta última condição, a luz
+               apagava mesmo sem o vizinho direito ter confirmado a chegada do
+               veículo — agora só apaga com confirmação real (PASSED) ou se
+               nunca chegou a enviar-se nada (env_dir já era 0). */
+            bool passed_all_clear = (g_fsm_T == 0 && g_fsm_Tc == 0 && g_fsm_enviados_dir == 0);
             portEXIT_CRITICAL(&g_fsm_counters_mux);
 
             if (g_fsm_right_online) comm_send_spd(vel, x_mm);
             if (passed_all_clear) fsm_agendar_apagar();
+
+            _print_saida_box(vehicle_id, g_fsm_T, g_fsm_Tc, g_fsm_enviados_dir);
             break;
 
 
@@ -324,7 +503,8 @@ void sm_process_event(sm_event_type_t type, uint16_t vehicle_id,
             }
 
             if (g_fsm_right_online) {
-                if (is_new_vehicle || g_fsm_enviados_dir == 0) {
+                if ((is_new_vehicle || g_fsm_enviados_dir == 0) &&
+                    g_fsm_enviados_dir < MAX_RADAR_TARGETS) {
                     comm_send_tc_inc(vel, x_mm);
                     portENTER_CRITICAL(&g_fsm_counters_mux);
                     g_fsm_enviados_dir++;
