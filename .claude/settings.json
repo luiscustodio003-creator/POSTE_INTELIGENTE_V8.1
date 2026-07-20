@@ -2,7 +2,22 @@
   "permissions": {
     "allow": [
       "PowerShell(C:\\\\Users\\\\DELL\\\\AppData\\\\Local\\\\Programs\\\\Python\\\\Python312\\\\python.exe \"d:\\\\Dev\\\\C\\\\POSTE_INTELIGENTE_V8\\\\stress_analysis\\\\graficos_stress.py\" 2>&1)",
-      "PowerShell(Get-ChildItem \"d:\\\\Dev\\\\C\\\\POSTE_INTELIGENTE_V8\\\\stress_analysis\\\\\" | Select-Object Name, @{N='KB';E={[int]\\($_.Length/1KB\\)}})"
+      "PowerShell(Get-ChildItem \"d:\\\\Dev\\\\C\\\\POSTE_INTELIGENTE_V8\\\\stress_analysis\\\\\" | Select-Object Name, @{N='KB';E={[int]\\($_.Length/1KB\\)}})",
+      "Bash(Get-ChildItem -Path \"C:\\\\Users\\\\DELL\" -Filter \"*.html\" -Recurse -ErrorAction SilentlyContinue)",
+      "Bash(Select-Object -First 10 FullName)",
+      "Bash(Get-ChildItem -Path \"d:\\\\Dev\\\\Python\\\\site\\\\luanegra\" -Recurse -Directory)",
+      "Bash(Select-Object -ExpandProperty FullName)",
+      "PowerShell(head -30)",
+      "PowerShell(cd \"d:\\\\Dev\\\\Python\\\\site\\\\luanegra\"; python -c \"from extensions import limiter; print\\('OK'\\)\" ; Write-Host \"Exit: $LASTEXITCODE\")",
+      "PowerShell(cd \"d:\\\\Dev\\\\Python\\\\site\\\\luanegra\"; $out = python app.py 2>&1; Write-Host \\($out | Select-Object -First 25 | Out-String\\))",
+      "Read(//mnt/d/Dev/Python/site/**)",
+      "Bash(python -c ' *)",
+      "PowerShell(Get-Content \"C:\\\\Users\\\\DELL\\\\lim_test2.txt\" | ForEach-Object { \"LINE: $_\" })",
+      "PowerShell(cd \"d:\\\\Dev\\\\Python\\\\site\\\\luanegra\"; [System.IO.File]::WriteAllText\\(\"C:\\\\Users\\\\DELL\\\\lim_test3.txt\", \\(& python -c \"from flask_limiter import Limiter; print\\('ok limiter v4'\\)\" 2>&1 | Out-String\\)\\))",
+      "PowerShell(cd \"d:\\\\Dev\\\\Python\\\\site\\\\luanegra\"; $p = \"C:\\\\Users\\\\DELL\\\\AppData\\\\Local\\\\Programs\\\\Python\\\\Python312\\\\python.exe\"; & $p -c \"from flask_limiter import Limiter; print\\('ok'\\)\")",
+      "Read(//d/Dev/Python/**)",
+      "Bash(./sim_test.exe)",
+      "Bash(gcc -w -I stubs -I __TRACKED_VAR__/config -I __TRACKED_VAR__/state_machine -I __TRACKED_VAR__/comm_manager -I __TRACKED_VAR__/udp_manager __TRACKED_VAR__/state_machine/fsm_core.c __TRACKED_VAR__/state_machine/fsm_events.c __TRACKED_VAR__/state_machine/fsm_timer.c mocks.c test_driver.c -o sim_test.exe)"
     ]
   }
 }
